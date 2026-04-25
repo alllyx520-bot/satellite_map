@@ -1,0 +1,705 @@
+html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background-color: #000;
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+.main-wrapper {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+}
+
+#map-container {
+    width: 100%;
+    height: 100%;
+    background-color: #1a1a1a;
+}
+
+#map {
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+}
+
+/* ========================================== */
+/* 侧边栏 — Apple Vision Pro 风格毛玻璃 */
+/* ========================================== */
+#sidebar {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    bottom: 16px;
+    width: 380px;
+    z-index: 2000;
+    display: flex;
+    flex-direction: column;
+
+    background: rgba(22, 22, 22, 0.78);
+    backdrop-filter: blur(50px) saturate(160%);
+    -webkit-backdrop-filter: blur(50px) saturate(160%);
+    border: 0.5px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.9);
+    overflow: hidden;
+}
+
+.sidebar-header {
+    padding: 18px 20px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    color: rgba(255, 255, 255, 0.55);
+    text-transform: uppercase;
+    border-bottom: 0.5px solid rgba(255, 255, 255, 0.06);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+#coords-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 14px;
+}
+
+#coords-list::-webkit-scrollbar { width: 4px; }
+#coords-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
+#coords-list::-webkit-scrollbar-track { background: transparent; }
+
+/* ========================================== */
+/* 记录卡片 — 简洁清爽 */
+/* ========================================== */
+.coord-item {
+    background: rgba(255, 255, 255, 0.04);
+    border: 0.5px solid rgba(255, 255, 255, 0.06);
+    padding: 14px 16px;
+    margin-bottom: 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    line-height: 1.6;
+    transition: all 0.3s cubic-bezier(0.25, 0.1, 0.25, 1);
+    position: relative;
+    animation: slideInRight 0.35s cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+.coord-item:hover {
+    background: rgba(255, 255, 255, 0.07);
+    transform: translateY(-1px);
+}
+
+@keyframes slideInRight {
+    from { opacity: 0; transform: translateX(24px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+
+.coord-item strong {
+    color: rgba(255, 255, 255, 0.9);
+    font-weight: 600;
+    font-size: 13px;
+}
+
+.preview-img {
+    width: 100%;
+    margin-top: 12px;
+    border-radius: 10px;
+    border: 0.5px solid rgba(255, 255, 255, 0.1);
+    display: none;
+    transition: opacity 0.4s ease;
+}
+
+/* ========================================== */
+/* 删除按钮 */
+/* ========================================== */
+.delete-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 22px;
+    height: 22px;
+    border: none;
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.35);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    opacity: 0;
+    line-height: 1;
+}
+.coord-item:hover .delete-btn { opacity: 1; }
+.delete-btn:hover {
+    background: rgba(255, 69, 58, 0.2);
+    color: #ff453a;
+}
+
+/* ========================================== */
+/* 加载状态 */
+/* ========================================== */
+.ai-status {
+    margin-top: 10px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.5);
+    padding: 6px 10px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+.spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 1.5px solid rgba(255, 255, 255, 0.15);
+    border-top-color: rgba(255, 255, 255, 0.6);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: middle;
+    margin-right: 4px;
+}
+
+/* ========================================== */
+/* 空状态 — 居中引导 */
+/* ========================================== */
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 60px 24px;
+    text-align: center;
+}
+.empty-state-icon {
+    font-size: 44px;
+    margin-bottom: 16px;
+    animation: float 3s cubic-bezier(0.25, 0.1, 0.25, 1) infinite;
+}
+@keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-6px); }
+}
+.empty-state-title {
+    font-size: 17px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.8);
+    margin-bottom: 6px;
+}
+.empty-state-desc {
+    font-size: 13px;
+    line-height: 1.5;
+    color: rgba(255, 255, 255, 0.35);
+}
+
+/* ========================================== */
+/* 搜索框 — Apple Maps 风格 */
+/* ========================================== */
+#search-box {
+    position: absolute;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1001;
+    width: 320px;
+    background: rgba(22, 22, 22, 0.78);
+    backdrop-filter: blur(50px) saturate(160%);
+    -webkit-backdrop-filter: blur(50px) saturate(160%);
+    border: 0.5px solid rgba(255, 255, 255, 0.08);
+    border-radius: 9999px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    transition: all 0.3s cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+#search-box:focus-within {
+    width: 360px;
+    border-color: rgba(0, 122, 255, 0.4);
+    box-shadow: 0 8px 40px rgba(0, 122, 255, 0.15);
+}
+#search-icon {
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.4);
+    margin-right: 8px;
+    flex-shrink: 0;
+}
+#search-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: rgba(255, 255, 255, 0.9);
+    font-size: 14px;
+    font-family: inherit;
+    padding: 10px 0;
+}
+#search-input::placeholder {
+    color: rgba(255, 255, 255, 0.3);
+}
+#search-results {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    background: rgba(22, 22, 22, 0.92);
+    backdrop-filter: blur(50px) saturate(160%);
+    -webkit-backdrop-filter: blur(50px) saturate(160%);
+    border: 0.5px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+    overflow: hidden;
+    display: none;
+    max-height: 260px;
+    overflow-y: auto;
+}
+.search-result-item {
+    padding: 12px 16px;
+    color: rgba(255, 255, 255, 0.8);
+    font-size: 13px;
+    cursor: pointer;
+    border-bottom: 0.5px solid rgba(255, 255, 255, 0.04);
+    transition: background 0.15s;
+}
+.search-result-item:last-child {
+    border-bottom: none;
+}
+.search-result-item:hover {
+    background: rgba(0, 122, 255, 0.15);
+}
+.search-result-item .name {
+    font-weight: 500;
+    margin-bottom: 2px;
+}
+.search-result-item .detail {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.35);
+}
+#search-results::-webkit-scrollbar { width: 3px; }
+#search-results::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+/* ========================================== */
+/* 地图浮层提示 */
+/* ========================================== */
+#map-hint {
+    position: absolute;
+    bottom: 28px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 999;
+    background: rgba(22, 22, 22, 0.7);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    color: rgba(255, 255, 255, 0.55);
+    padding: 8px 20px;
+    border-radius: 9999px;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.2px;
+    border: 0.5px solid rgba(255, 255, 255, 0.08);
+    pointer-events: none;
+    transition: opacity 0.5s ease;
+    animation: hintPulse 3s cubic-bezier(0.25, 0.1, 0.25, 1) infinite;
+}
+@keyframes hintPulse {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1; }
+}
+
+/* ========================================== */
+/* 返回按钮 — Apple Pill 风格 */
+/* ========================================== */
+#backButton {
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    z-index: 1000;
+    padding: 8px 18px;
+    background: rgba(22, 22, 22, 0.78);
+    color: rgba(255, 255, 255, 0.9);
+    border: 0.5px solid rgba(255, 255, 255, 0.1);
+    border-radius: 9999px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    display: none;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    transition: all 0.3s cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+#backButton:hover {
+    background: rgba(255, 255, 255, 0.15);
+    transform: translateY(-1px);
+}
+
+/* ========================================== */
+/* 自定义下拉框 */
+/* ========================================== */
+.custom-select {
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.8);
+    border: 0.5px solid rgba(255, 255, 255, 0.1);
+    padding: 4px 10px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    outline: none;
+    backdrop-filter: blur(4px);
+    transition: all 0.2s ease;
+}
+.custom-select:hover {
+    border-color: rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.1);
+}
+.custom-select option {
+    background: #222;
+    color: white;
+}
+
+/* ========================================== */
+/* 计数徽章 */
+/* ========================================== */
+#record-count {
+    display: inline-block;
+    min-width: 22px;
+    text-align: center;
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.7);
+    border-radius: 9999px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-right: 4px;
+}
+
+/* ========================================== */
+/* 进入分析舱按钮 */
+/* ========================================== */
+.enter-cabin-btn {
+    transition: all 0.3s cubic-bezier(0.25, 0.1, 0.25, 1) !important;
+}
+.enter-cabin-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 25px rgba(99, 102, 241, 0.35) !important;
+}
+.enter-cabin-btn:active {
+    transform: translateY(0);
+}
+
+/* ========================================== */
+/* 对话舱 Modal — macOS 风格 */
+/* ========================================== */
+#chat-modal {
+    position: fixed;
+    top: 0; left: 0; width: 100vw; height: 100vh;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    z-index: 9999;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.chat-modal-content {
+    width: 82vw;
+    height: 84vh;
+    max-width: 1200px;
+    max-height: 900px;
+    background: rgba(26, 26, 26, 0.92);
+    border: 0.5px solid rgba(255, 255, 255, 0.1);
+    border-radius: 18px;
+    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: modalIn 0.35s cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+@keyframes modalIn {
+    from { opacity: 0; transform: scale(0.94) translateY(12px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.chat-modal-header {
+    padding: 16px 24px;
+    background: rgba(255, 255, 255, 0.03);
+    border-bottom: 0.5px solid rgba(255, 255, 255, 0.06);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: white;
+}
+.chat-modal-header h3 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0;
+    color: rgba(255, 255, 255, 0.9);
+}
+#chat-modal-id {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.35);
+    font-weight: 400;
+}
+
+#close-chat-btn {
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.7);
+    border: 0.5px solid rgba(255, 255, 255, 0.1);
+    padding: 6px 16px;
+    border-radius: 9999px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 500;
+    transition: all 0.2s ease;
+}
+#close-chat-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: white;
+}
+
+.chat-modal-body {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+}
+
+.chat-modal-left {
+    flex: 0.9;
+    border-right: 0.5px solid rgba(255, 255, 255, 0.06);
+    padding: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(ellipse at center, rgba(255, 255, 255, 0.04) 0%, transparent 70%);
+}
+
+#chat-modal-img {
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 10px;
+    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
+    border: 0.5px solid rgba(255, 255, 255, 0.06);
+}
+
+.chat-modal-right {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+
+#chat-message-box {
+    flex: 1;
+    padding: 20px 24px;
+    overflow-y: auto;
+    color: white;
+    display: flex;
+    flex-direction: column;
+}
+#chat-message-box::-webkit-scrollbar { width: 4px; }
+#chat-message-box::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+/* ========================================== */
+/* Markdown 渲染 */
+/* ========================================== */
+.chat-bubble.chat-ai { line-height: 1.7; }
+.chat-bubble .md-h3 {
+    font-size: 15px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.95);
+    margin: 14px 0 6px;
+}
+.chat-bubble .md-h4 {
+    font-size: 14px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.85);
+    margin: 10px 0 4px;
+}
+.chat-bubble strong {
+    color: rgba(255, 255, 255, 0.95);
+    font-weight: 600;
+}
+.chat-bubble .md-ul, .chat-bubble .md-ol {
+    margin: 4px 0;
+    padding-left: 20px;
+}
+.chat-bubble .md-ul li, .chat-bubble .md-ol li {
+    margin-bottom: 3px;
+    list-style: disc;
+}
+.chat-bubble .md-ol li {
+    list-style: decimal;
+}
+
+/* ========================================== */
+/* 对话气泡 — iMessage 风格 */
+/* ========================================== */
+.chat-bubble {
+    margin-bottom: 12px;
+    padding: 10px 16px;
+    max-width: 85%;
+    line-height: 1.5;
+    font-size: 14px;
+    animation: bubbleIn 0.25s cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+@keyframes bubbleIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.chat-user {
+    background: #007aff;
+    align-self: flex-end;
+    margin-left: auto;
+    border-radius: 18px 18px 4px 18px;
+    color: white;
+}
+
+.chat-ai {
+    background: rgba(255, 255, 255, 0.07);
+    align-self: flex-start;
+    border-radius: 18px 18px 18px 4px;
+    color: rgba(255, 255, 255, 0.9);
+}
+
+/* ========================================== */
+/* 输入区域 */
+/* ========================================== */
+.chat-input-area {
+    padding: 14px 16px;
+    border-top: 0.5px solid rgba(255, 255, 255, 0.06);
+    display: flex;
+    gap: 10px;
+    background: rgba(0, 0, 0, 0.15);
+}
+
+#chat-textarea {
+    flex: 1;
+    background: rgba(255, 255, 255, 0.06);
+    border: 0.5px solid rgba(255, 255, 255, 0.1);
+    color: white;
+    border-radius: 10px;
+    padding: 10px 14px;
+    resize: none;
+    height: 40px;
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    transition: border 0.2s;
+}
+#chat-textarea:focus {
+    border-color: #007aff;
+}
+#chat-textarea::placeholder {
+    color: rgba(255, 255, 255, 0.25);
+}
+
+#chat-send-btn {
+    background: #007aff;
+    color: white;
+    border: none;
+    padding: 0 22px;
+    border-radius: 9999px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 14px;
+    transition: all 0.2s cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+#chat-send-btn:hover {
+    background: #0062cc;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 16px rgba(0, 122, 255, 0.35);
+}
+#chat-send-btn:active {
+    transform: translateY(0);
+}
+
+/* ========================================== */
+/* Toast — 系统通知风格 */
+/* ========================================== */
+#toast-container {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10001;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: none;
+}
+.toast {
+    padding: 10px 24px;
+    border-radius: 9999px;
+    color: white;
+    font-size: 13px;
+    font-weight: 500;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+    animation: toastIn 0.35s cubic-bezier(0.25, 0.1, 0.25, 1), toastOut 0.35s ease 2.7s forwards;
+    pointer-events: auto;
+    text-align: center;
+    white-space: nowrap;
+    border: 0.5px solid rgba(255, 255, 255, 0.1);
+}
+.toast-success { background: rgba(52, 199, 89, 0.85); }
+.toast-error { background: rgba(255, 69, 58, 0.85); }
+.toast-info { background: rgba(0, 122, 255, 0.85); }
+.toast-warning { background: rgba(255, 149, 0, 0.85); }
+@keyframes toastIn {
+    from { opacity: 0; transform: translateY(-16px) scale(0.95); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes toastOut {
+    from { opacity: 1; }
+    to { opacity: 0; transform: scale(0.95); }
+}
+
+/* ========================================== */
+/* 响应式 */
+/* ========================================== */
+@media (max-width: 768px) {
+    #sidebar {
+        width: 100%;
+        top: auto;
+        bottom: 0;
+        right: 0;
+        left: 0;
+        height: 50vh;
+        border-radius: 14px 14px 0 0;
+        border-bottom: none;
+    }
+    .chat-modal-content {
+        width: 96vw;
+        height: 92vh;
+        border-radius: 14px;
+    }
+    .chat-modal-body {
+        flex-direction: column;
+    }
+    .chat-modal-left {
+        flex: none;
+        border-right: none;
+        border-bottom: 0.5px solid rgba(255,255,255,0.06);
+        padding: 12px;
+        max-height: 35%;
+    }
+    #map-hint {
+        bottom: calc(50vh + 20px);
+        font-size: 11px;
+        padding: 6px 16px;
+    }
+}

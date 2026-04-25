@@ -1,0 +1,7 @@
+.idea/
+.vscode/
+*.pyc
+__pycache__/
+db.sqlite3
+media/satellite_imgs/
+.env

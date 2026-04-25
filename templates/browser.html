@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SatelliteSense · 遥感分析</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <link rel="stylesheet" href="/static/browser.css?v=2">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛰️</text></svg>">
+</head>
+<body>
+    <div class="main-wrapper">
+        <div id="map-container">
+            <div id="map"></div>
+            <div id="search-box">
+                <span id="search-icon">🔍</span>
+                <input id="search-input" type="text" placeholder="搜索地点..." autocomplete="off">
+                <div id="search-results"></div>
+            </div>
+            <div id="map-hint">长按拖拽框选 · 右键取消</div>
+            <button id="backButton">← 返回全国</button>
+        </div>
+
+        <div id="sidebar">
+            <div class="sidebar-header">
+                <span><span id="record-count">0</span> 个区域 <span id="compare-toggle" style="font-size:12px;font-weight:400;color:rgba(255,255,255,0.4);cursor:pointer;margin-left:8px;">对比</span></span>
+                <select id="map-style-toggle" class="custom-select">
+                    <option value="normal">🗺️ 街道图</option>
+                    <option value="satellite">🌍 卫星图</option>
+                </select>
+            </div>
+            <div id="compare-bar" style="display:none; padding:8px 14px; border-bottom:0.5px solid rgba(255,255,255,0.06);">
+                <button id="compare-btn" style="width:100%; padding:8px; background:#007aff; color:white; border:none; border-radius:8px; cursor:pointer; font-weight:600; font-size:13px;">对比所选区域</button>
+            </div>
+            <div id="coords-list">
+                <div class="empty-state" id="empty-state">
+                    <div class="empty-state-icon">🛰️</div>
+                    <div class="empty-state-title">选择区域开始分析</div>
+                    <div class="empty-state-desc">在地图上长按并拖动，框选区域<br>获取高清卫星影像</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <script src="/static/browser.js?v=2"></script>
+<div id="chat-modal" style="display: none;">
+        <div class="chat-modal-content">
+            <div class="chat-modal-header">
+                <h3>🛰️ SatelliteSense <span id="chat-modal-id"></span></h3>
+                <div>
+                    <button id="zoom-btn" style="background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.7);border:0.5px solid rgba(255,255,255,0.1);padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;margin-right:8px;transition:all 0.2s;">🔍 放大</button>
+                    <button id="close-chat-btn">关闭</button>
+                </div>
+            </div>
+            <div class="chat-modal-body">
+                <div class="chat-modal-left">
+                    <img id="chat-modal-img" src="" alt="卫星图放大版" draggable="false">
+                </div>
+                <div class="chat-modal-right">
+                    <div id="chat-message-box">
+                        </div>
+                    <div class="chat-input-area">
+                        <textarea id="chat-textarea" placeholder="追问该区域... 例如：这片区域的主要特征是什么？"></textarea>
+                        <button id="chat-send-btn">发送</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

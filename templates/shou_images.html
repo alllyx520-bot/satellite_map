@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>卫星图展示</title>
+    <style>
+        img{max-width:100%;margin-top:20px;border:1px solid #ddd;}
+    </style>
+</head>
+<body>
+    <h2>卫星图像展示</h2>
+    <button onclick="getSat()">获取卫星图</button>
+    <br>
+    <img id="img" src="">
+
+    <script>
+        async function getSat(){
+            let res = await fetch("http://127.0.0.1:8000/api/satellite/get-img/", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    "min_lng": 116.395,
+                    "min_lat": 39.905,
+                    "max_lng": 116.405,
+                    "max_lat": 39.915,
+                    "target_resolution": 1280
+                })
+            })
+            let data = await res.json()
+            if(data.code === 200){
+                alert("获取成功！")
+                document.getElementById("img").src = data.data.img_url
+            }else{
+                alert("失败："+data.msg)
+            }
+        }
+    </script>
+</body>
+</html>
