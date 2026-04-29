@@ -6,7 +6,11 @@
     <title>SatelliteSense · 遥感分析</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     
-    <link rel="stylesheet" href="/static/browser.css?v=2">
+    <link rel="stylesheet" href="/static/browser.css?v=6">
+
+
+
+
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛰️</text></svg>">
 </head>
 <body>
@@ -40,6 +44,22 @@
                     <div class="empty-state-desc">在地图上长按并拖动，框选区域<br>获取高清卫星影像</div>
                 </div>
             </div>
+            <div id="layer-toggles" style="padding:10px 14px; border-top:0.5px solid rgba(255,255,255,0.06);">
+                <div style="font-size:11px; color:rgba(255,255,255,0.4); margin-bottom:6px;">图层控制</div>
+                <label style="display:flex; align-items:center; gap:6px; font-size:12px; color:rgba(255,255,255,0.7); cursor:pointer; margin-bottom:4px;">
+                    <input type="checkbox" id="layer-admin" checked> 🗺️ 行政区划
+                </label>
+                <label style="display:flex; align-items:center; gap:6px; font-size:12px; color:rgba(255,255,255,0.7); cursor:pointer;">
+                    <input type="checkbox" id="layer-roads"> 🛣️ 道路标注
+                </label>
+            </div>
+            <div id="history-panel" style="border-top:0.5px solid rgba(255,255,255,0.06);">
+                <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 14px 4px;">
+                    <span style="font-size:11px; color:rgba(255,255,255,0.4);">历史记录</span>
+                    <button id="refresh-history-btn" style="background:none; border:none; color:rgba(255,255,255,0.3); cursor:pointer; font-size:14px;" title="刷新">↻</button>
+                </div>
+                <div id="history-list" style="max-height:180px; overflow-y:auto; padding:0 14px 10px;"></div>
+            </div>
         </div>
     </div>
 
@@ -47,12 +67,19 @@
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     
-    <script src="/static/browser.js?v=2"></script>
+    <script src="/static/browser.js?v=6"></script>
 <div id="chat-modal" style="display: none;">
         <div class="chat-modal-content">
             <div class="chat-modal-header">
                 <h3>🛰️ SatelliteSense <span id="chat-modal-id"></span></h3>
                 <div>
+                    <select id="model-select" style="background:rgba(18,18,20,0.85);color:rgba(255,255,255,0.65);border:0.5px solid rgba(255,255,255,0.08);padding:5px 8px;border-radius:6px;cursor:pointer;font-size:11px;margin-right:6px;color-scheme:dark;">
+                        <option value="qwen3-vl-plus" selected>Qwen3-VL-Plus</option>
+                        <option value="qwen3.6-plus">Qwen3.6-Plus</option>
+                        <option value="qwen3.5-plus">Qwen3.5-Plus</option>
+                        <option value="qwen3-vl-flash">Qwen3-VL-Flash</option>
+                    </select>
+                    <button id="report-btn" style="background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.7);border:0.5px solid rgba(255,255,255,0.1);padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;margin-right:6px;transition:all 0.2s;">报告</button>
                     <button id="zoom-btn" style="background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.7);border:0.5px solid rgba(255,255,255,0.1);padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;margin-right:8px;transition:all 0.2s;">🔍 放大</button>
                     <button id="close-chat-btn">关闭</button>
                 </div>
@@ -64,8 +91,40 @@
                 <div class="chat-modal-right">
                     <div id="chat-message-box">
                         </div>
+                    <div class="chat-prompts-area">
+                        <div class="prompt-group" data-scene="single,multi">
+                            <div class="prompt-category-header">土地与建筑</div>
+                            <span class="chat-prompt-tag" data-detail="请作为资深遥感解译专家，对该区域进行全面的土地利用分析：&#10;&#10;1. **用地类型识别**：依据国土资源调查分类体系，逐一识别影像中可见的用地类型（建设用地、耕地、林地、草地、水域、未利用地等），标注其在影像中的空间分布位置与纹理特征。&#10;&#10;2. **面积占比估算**：目视解译估算各类用地的面积百分比，给出主要用地类型的排序。&#10;&#10;3. **空间格局分析**：分析用地类型的空间集聚/分散特征，识别是否存在城市-农业-生态的过渡梯度，标注人工与自然地物的边界特征。&#10;&#10;4. **异常识别**：指出影像中是否存在不规整、零散或疑似违规的建设用地斑块。&#10;&#10;请用表格汇总用地类型及其估算占比、空间特征后，再进行文字论述。" onclick="pickPrompt(this)">用地类型</span>
+                            <span class="chat-prompt-tag" data-detail="请对该区域的**建筑物与人工地表**进行专项解译：&#10;&#10;1. **建筑密度分级**：将影像划分为高密度（>50%）、中密度（20-50%）、低密度（<20%）三级，标注各区域的空间范围。&#10;&#10;2. **建筑集聚形态**：分析建筑群的排布模式——行列式/围合式/散点式/沿路带状等，判断其对应的城市肌理类型（老旧街区/现代小区/城中村/工业厂房）。&#10;&#10;3. **单体尺度估计**：根据影像分辨率估算典型建筑的屋顶面积和大致高度范围（低层/多层/高层），推断所在区域的主导建筑类型。&#10;&#10;4. **开发强度评估**：结合容积率感官判断，评估该区域的城市开发强度和紧凑度。&#10;&#10;请分点论述，并给出综合判定结论。" onclick="pickPrompt(this)">建筑分布</span>
+                        </div>
+                        <div class="prompt-group" data-scene="single,multi">
+                            <div class="prompt-category-header">植被与水体</div>
+                            <span class="chat-prompt-tag" data-detail="请对该区域进行专业的**植被覆盖遥感分析**：&#10;&#10;1. **覆盖度估算**：基于影像的绿色调幅和纹理特征，估算总体植被覆盖度（%），划分高覆盖（>60%）、中覆盖（30-60%）、低覆盖（<30%）区域。&#10;&#10;2. **植被类型判读**：区分林地（针叶/阔叶/混交）、草地（天然/人工）、农田（水浇地/旱地/设施农业）等类型，标注其在影像上的光谱和纹理指示特征。&#10;&#10;3. **空间分布格局**：分析植被的连续性/破碎化程度，判断植被斑块的形状复杂度，说明是否受人类活动显著影响。&#10;&#10;4. **季节状态推断**：根据影像时相和植被色调，推断当前季节的植被生长状态（旺盛期/衰退期/休眠期）。&#10;&#10;5. **生态功能初评**：结合植被覆盖与分布格局，简要评估该区域的碳汇潜力与生物多样性支撑能力。&#10;&#10;请用表格汇总各类植被的面积占比和分布特征。" onclick="pickPrompt(this)">植被覆盖</span>
+                            <span class="chat-prompt-tag" data-detail="请对该区域的**水体资源**进行系统遥感解译：&#10;&#10;1. **水体类型识别**：区分河流（自然河道/人工渠道）、湖泊、水库/坑塘、湿地、养殖水面等类型，标注各自的光谱特征（色调、镜面反射特征）。&#10;&#10;2. **水系结构分析**：描述水系的连通性——树枝状/网状/向心状等水系格局，判断是否存在断流、改道或人工渠化痕迹。&#10;&#10;3. **水体面积与岸线**：估算各类水体的面积占比，观察岸线的自然度（曲率、缓冲带植被状况），判断是否受人工硬化改造。&#10;&#10;4. **水质与富营养化初判**：根据水体色调均一性和色度差异，初步判断是否存在富营养化（藻华特征）、悬浮泥沙（浑水色调）或污染迹象。&#10;&#10;5. **洪涝风险初评**：结合地形和下垫面不透水率，简要评价该区域的水系调蓄能力和潜在洪涝风险。&#10;&#10;请用表格汇总水体类型、面积占比和主要特征。" onclick="pickPrompt(this)">水体识别</span>
+                            <span class="chat-prompt-tag" data-detail="请综合以上植被和水体分析结果，对该区域进行**生态系统服务与生态敏感性综合评价**：&#10;&#10;1. **生态源地识别**：指出影像中生态价值最高的核心斑块（大面积林地、天然湿地等），分析其在区域生态网络中的枢纽作用。&#10;&#10;2. **生态廊道评估**：识别沿河流、林带的生态廊道，判断其连续性和宽度是否满足物种迁徙需求。&#10;&#10;3. **人地关系分析**：评估人类活动对自然生态系统的侵占程度——建设用地的扩张方向、农田对林地的蚕食、水体岸线的硬化比例等。&#10;&#10;4. **生态风险提示**：指出生态敏感区域（陡坡垦殖、滨水建设、生态孤岛等），给出保护优先级建议。&#10;&#10;5. **改善建议**：基于分析结果，提出3-5条具体的生态保护和修复策略。" onclick="pickPrompt(this)">生态评估</span>
+                        </div>
+                        <div class="prompt-group" data-scene="single,multi">
+                            <div class="prompt-category-header">城市与交通</div>
+                            <span class="chat-prompt-tag" data-detail="请对该区域进行**城市化水平与空间形态**专业评估：&#10;&#10;1. **建成区识别与规模**：根据人工地表的光谱和纹理特征，划定建成区边界，估算建成区总面积和占比。&#10;&#10;2. **城市蔓延分析**：分析建成区的空间形态——紧凑型/蔓延型/跳跃型，判断是否存在低密度无序扩张（城市蔓延）的特征。&#10;&#10;3. **城镇体系结构**：如果影像覆盖多个聚落，分析其规模等级体系——中心城区/卫星镇/村庄等层级关系。&#10;&#10;4. **城市扩张方向**：根据建成区边缘形态和新开发地块的分布，推断城市的主要扩张方向和扩张速度。&#10;&#10;5. **土地城市化与人口城市化匹配**：结合建筑密度和用地结构，定性判断是否存在"鬼城"或过度开发风险。&#10;&#10;请给出城市化阶段判定和发展趋势预判。" onclick="pickPrompt(this)">城市发展</span>
+                            <span class="chat-prompt-tag" data-detail="请对该区域的**交通基础设施**进行遥感解译：&#10;&#10;1. **路网等级识别**：区分高速公路/国道/省道（宽阔线型、立交节点）、城市主干道（规整线型、交叉口信号化）、次干道、支路和乡村道路，估算各级道路的密度。&#10;&#10;2. **路网结构分析**：判断路网形态（方格网式/放射环式/自由式/混合式），分析其对城市空间结构的引导作用。&#10;&#10;3. **交通枢纽识别**：标注火车站、汽车站、大型立交、跨江跨河桥梁等关键交通节点。&#10;&#10;4. **连通性与可达性**：评估路网的连通度，观察是否存在断头路、瓶颈路段等交通短板。&#10;&#10;5. **港口/机场**：如果影像覆盖范围内存在，识别其跑道/泊位规模并简要评述。&#10;&#10;请用表格汇总道路等级、估算长度/密度和空间特征。" onclick="pickPrompt(this)">路网分析</span>
+                            <span class="chat-prompt-tag" data-detail="请对该区域的**城市功能分区**进行遥感识别与空间分析：&#10;&#10;1. **功能区识别**：根据建筑形态、布局模式、纹理特征和空间关系，识别以下功能区——居住区（行列式/围合式居住建筑群）、商业商务区（大体量单体建筑+高密度路网）、工业仓储区（大体量厂房+规整排列+远离居住区）、公共服务区（大型公建特征）、绿地开放空间等。&#10;&#10;2. **空间组织分析**：绘制功能区的空间分布格局，分析居住-就业-服务的空间匹配关系，判断是否存在明显的职住分离。&#10;&#10;3. **功能混合度**：评估各片区的用地功能混合程度——单一功能/适度混合/高度混合，分析其对城市活力的影响。&#10;&#10;4. **公共服务设施覆盖**：如果可识别学校、医院等大型公共服务设施，评估其空间分布的均衡性和可达性。&#10;&#10;请用表格汇总各功能区的面积占比、主导特征和空间关系。" onclick="pickPrompt(this)">功能区划</span>
+                        </div>
+                        <div class="prompt-group" data-scene="single,multi">
+                            <div class="prompt-category-header">地形地貌</div>
+                            <span class="chat-prompt-tag" data-detail="请根据地形的色调、阴影和纹理特征，对该区域进行**地貌类型遥感解译**：&#10;&#10;1. **宏观地貌判定**：判断区域所属的主要地貌单元——平原/丘陵/低山/中山/盆地/河谷等，描述各类地形的空间范围和过渡关系。&#10;&#10;2. **关键地形特征标注**：识别并标注山脊线、山谷线、冲积扇、河流阶地、陡坎、洼地等关键地形要素在影像中的表现特征。&#10;&#10;3. **地形对土地利用的约束分析**：分析地形坡度、坡向对城市建设、农田分布、交通选线的约束和引导作用。&#10;&#10;4. **地表侵蚀状态**：根据沟谷密度和色调差异，判断是否存在水土流失、沟壑发育等侵蚀迹象，评估侵蚀强度。&#10;&#10;5. **地形优势区识别**：指出地势平坦、工程地质条件良好的适宜建设区，以及风景优美、视野开阔的景观资源区。&#10;&#10;请给出该区域的工程地质条件总体评价。" onclick="pickPrompt(this)">地形特征</span>
+                            <span class="chat-prompt-tag" data-detail="请对该区域进行**地质灾害隐患遥感识别**：&#10;&#10;1. **滑坡识别**：寻找影像中的滑坡后壁（弧形陡坎）、滑坡体（舌状堆积地形）、滑坡舌等典型滑坡地貌特征，标注可疑滑坡体的位置和规模。&#10;&#10;2. **崩塌与泥石流迹象**：识别陡崖下方的不规则堆积体（崩塌堆积）、沟口的扇形堆积（泥石流堆积扇），判断其活动性。&#10;&#10;3. **地面沉降与地裂缝**：如果影像分辨率允许，观察是否有地裂缝线、不均匀沉降导致的建筑物倾斜等迹象。&#10;&#10;4. **灾害风险分区**：结合地形、岩性和人类工程活动，将区域划分为高/中/低三级地质灾害风险区。&#10;&#10;5. **防灾建议**：针对高风险区提出简要的监测预警和工程治理建议。&#10;&#10;请用表格汇总可疑地质灾害点的类型、位置和风险等级。" onclick="pickPrompt(this)">灾害隐患</span>
+                            <span class="chat-prompt-tag" data-detail="请从水文地质角度对该区域进行分析：&#10;&#10;1. **流域划分**：基于地形特征识别主要的分水岭线，划分子流域单元，标注主要汇水方向。&#10;&#10;2. **水系格局与水系密度**：分析水系发育程度——树枝状/平行状/放射状等水系类型，计算影像范围内的水系密度（沟谷总长度/面积比）。&#10;&#10;3. **河流地貌特征**：识别曲流（蜿蜒河段）、牛轭湖、天然堤、河漫滩等河流地貌，分析河道的稳定性。&#10;&#10;4. **地下水赋存条件初判**：根据地貌单元和岩性色调推断地下水可能的赋存条件——孔隙水（平原/河谷区）、裂隙水（丘陵山区）、岩溶水（如有溶蚀地貌）。&#10;&#10;5. **水文地质风险**：指出可能的土壤盐渍化区（色调发白区域）、沼泽化区或地下水污染风险区。&#10;&#10;请分流域单元进行论述。" onclick="pickPrompt(this)">水文地形</span>
+                        </div>
+                        <div class="prompt-group" data-scene="multi">
+                            <div class="prompt-category-header">区域对比</div>
+                            <span class="chat-prompt-tag" data-detail="请对各区域进行系统的**用地结构对比分析**：&#10;&#10;1. 分别统计各区域的用地类型构成，用表格给出各区域的建设用地、耕地、林地、草地、水体等的面积占比估算值。&#10;&#10;2. 对比各区域的用地结构差异——哪个区域城市化程度最高？哪个区域生态本底最好？哪个区域农用地占比最大？&#10;&#10;3. 分析各区域的空间结构特征——用地紧凑度、破碎化程度、功能混合度的差异。&#10;&#10;4. 指出各区域在土地利用方面的优势和短板。&#10;&#10;5. 给出各区域未来土地利用优化的差异化建议。&#10;&#10;请先以对比表格呈现，再进行逐区评述。" onclick="pickPrompt(this)">用地对比</span>
+                            <span class="chat-prompt-tag" data-detail="请对各区域进行**开发程度与城市化水平对比**：&#10;&#10;1. 对比各区域的建成区规模、建筑密度和建筑高度分布，估算各区域的城市化率差异。&#10;&#10;2. 对比各区域的路网密度、交通设施完备度和对外通达性。&#10;&#10;3. 对比城市形态和空间拓展模式——紧凑型vs蔓延型，跳跃式vs连续式扩张。&#10;&#10;4. 对比公共服务设施（学校/医院/商业等可识别设施）的空间配置差异。&#10;&#10;5. 综合评判各区域的城市发展成熟度和可持续发展潜力。&#10;&#10;请用表格对比各区域的开发指标，再进行分析论述。" onclick="pickPrompt(this)">开发对比</span>
+                            <span class="chat-prompt-tag" data-detail="请对各区域进行**多维度全面综合对比**，涵盖以下维度，每个维度按1-5分评级并给出判定依据：&#10;&#10;1. **土地利用效率**——用地紧凑度、闲置土地占比、混合利用程度&#10;&#10;2. **生态本底质量**——植被覆盖度、水体面积占比、生态廊道完整性&#10;&#10;3. **交通与基础设施**——路网密度、交通可达性、枢纽节点配置&#10;&#10;4. **城市品质与宜居性**——建筑形态多样性、绿地开放空间可达性、城市肌理美感&#10;&#10;5. **发展潜力与风险**——可开发土地储备、地形约束、地质灾害风险、水资源承载能力&#10;&#10;请首先以综合评分表呈现各区域在各维度的得分（含简要理由），然后按区域逐一给出"优势-劣势-机遇-挑战"（SWOT）分析，最后给出各区域的差异化发展建议。" onclick="pickPrompt(this)">综合对比</span>
+                        </div>
+                    </div>
                     <div class="chat-input-area">
                         <textarea id="chat-textarea" placeholder="追问该区域... 例如：这片区域的主要特征是什么？"></textarea>
+                        <button id="chat-prompt-toggle" title="预设提示词" onclick="togglePrompts()">⌃</button>
                         <button id="chat-send-btn">发送</button>
                     </div>
                 </div>

@@ -542,6 +542,35 @@ html, body {
 .chat-bubble .md-ol li {
     list-style: decimal;
 }
+.chat-bubble .md-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0 12px;
+    font-size: 12px;
+}
+.chat-bubble .md-table th,
+.chat-bubble .md-table td {
+    padding: 6px 10px;
+    border: 0.5px solid rgba(255, 255, 255, 0.12);
+    text-align: left;
+    vertical-align: top;
+}
+.chat-bubble .md-table th {
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.9);
+    font-weight: 600;
+    white-space: nowrap;
+}
+.chat-bubble .md-table td {
+    color: rgba(255, 255, 255, 0.75);
+}
+.chat-bubble .md-code {
+    background: rgba(255, 255, 255, 0.08);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: 'SF Mono', Consolas, monospace;
+}
 
 /* ========================================== */
 /* 对话气泡 — iMessage 风格 */
@@ -581,6 +610,7 @@ html, body {
     padding: 14px 16px;
     border-top: 0.5px solid rgba(255, 255, 255, 0.06);
     display: flex;
+    align-items: flex-end;
     gap: 10px;
     background: rgba(0, 0, 0, 0.15);
 }
@@ -593,11 +623,13 @@ html, body {
     border-radius: 10px;
     padding: 10px 14px;
     resize: none;
-    height: 40px;
+    min-height: 40px;
+    max-height: 200px;
+    overflow-y: auto;
     font-size: 14px;
     font-family: inherit;
     outline: none;
-    transition: border 0.2s;
+    transition: border 0.2s, height 0.1s;
 }
 #chat-textarea:focus {
     border-color: #007aff;
@@ -626,6 +658,104 @@ html, body {
     transform: translateY(0);
 }
 
+/* 预设提示词面板 */
+.chat-prompts-area {
+    overflow: hidden;
+    max-height: 0;
+    padding: 0 16px;
+    transition: max-height 0.3s ease, padding 0.3s ease;
+    display: flex !important;
+    flex-direction: column;
+    gap: 10px;
+}
+.chat-prompts-area.show {
+    max-height: 580px;
+    padding: 8px 16px 12px;
+}
+
+.prompt-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.prompt-group[data-scene] {
+    display: none;
+}
+.prompt-group[data-scene].visible {
+    display: flex;
+}
+
+.prompt-category-header {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.2);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 0 2px;
+    margin-bottom: 2px;
+}
+
+/* 预设提示词标签 */
+.chat-prompt-tag {
+    display: block;
+    padding: 7px 12px;
+    font-size: 12px;
+    color: #fff;
+    background: rgba(255, 255, 255, 0.06);
+    border: 0.5px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+    transition: all 0.12s;
+}
+.chat-prompt-tag:hover {
+    color: #fff;
+    background: rgba(0, 122, 255, 0.14);
+    border-color: rgba(0, 122, 255, 0.28);
+}
+.chat-prompt-tag:active {
+    background: rgba(0, 122, 255, 0.25);
+    transform: scale(0.98);
+}
+
+/* 点击反馈闪烁 */
+.chat-prompt-tag.flash {
+    animation: promptFlash 0.4s ease;
+}
+@keyframes promptFlash {
+    0%, 100% { background: rgba(255, 255, 255, 0.06); }
+    50% { background: rgba(0, 122, 255, 0.35); border-color: rgba(0, 122, 255, 0.5); }
+}
+
+#chat-prompt-toggle {
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.4);
+    border: 0.5px solid rgba(255, 255, 255, 0.08);
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    flex-shrink: 0;
+    transition: all 0.2s;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+#chat-prompt-toggle:hover {
+    color: rgba(255, 255, 255, 0.8);
+    background: rgba(0, 122, 255, 0.15);
+    border-color: rgba(0, 122, 255, 0.25);
+}
+#chat-prompt-toggle.active {
+    color: #fff;
+    background: rgba(0, 122, 255, 0.22);
+    transform: rotate(180deg);
+}
+
+/* ========================================== */
+/* Toast — 系统通知风格 */
 /* ========================================== */
 /* Toast — 系统通知风格 */
 /* ========================================== */

@@ -21,6 +21,6 @@ from map_api import views
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/', include('map_api.urls')),  # 👈 这一行必须加
+    path('api/', include('map_api.urls')),
     path('', views.index_view, name='index'),
 ]

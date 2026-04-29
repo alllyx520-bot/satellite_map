@@ -1,12 +1,20 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import os
 import math
+import time
 from PIL import Image
 from io import BytesIO
 
 MAPBOX_TOKEN = os.environ.get('MAPBOX_TOKEN', '')
 CELL_MAX = 1280
 MAX_TOTAL = 4096
+
+_download_progress = {}
+
+def get_download_progress(file_name):
+    return _download_progress.get(file_name)
 
 def haversine_distance(lon1, lat1, lon2, lat2):
     R = 6371000
@@ -17,17 +25,35 @@ def haversine_distance(lon1, lat1, lon2, lat2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def _fetch_tile(url, proxies):
-    resp = requests.get(url, timeout=30, proxies=proxies)
-    if resp.status_code == 200:
-        img = Image.open(BytesIO(resp.content))
-        if img.mode in ('RGBA', 'P'):
-            img = img.convert('RGB')
-        return img
-    raise Exception(f"tile fetch failed: {resp.status_code}")
+def _fetch_tile(url, proxies, retries=5):
+    last_err = None
+    for attempt in range(retries):
+        if attempt > 0:
+            time.sleep(2.0 * attempt)
+        try:
+            session = requests.Session()
+            retry_strategy = Retry(total=1, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            session.mount("https://", adapter)
+            resp = session.get(url, timeout=60, proxies=proxies)
+            session.close()
+            if resp.status_code == 200:
+                img = Image.open(BytesIO(resp.content))
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+                return img
+            raise Exception(f"tile fetch failed: {resp.status_code}")
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
+            last_err = str(e)[:120]
+            continue
+        except Exception as e:
+            last_err = str(e)[:120]
+            continue
+    raise Exception(f"tile fetch failed after {retries} attempts: {last_err}")
 
 def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_name="satellite_result.jpg",
                           target_resolution=1024, ultra_hd=False):
+    global _download_progress
     target_resolution = min(MAX_TOTAL, max(1, target_resolution))
 
     lon_diff = max_lon - min_lon
@@ -52,13 +78,16 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
     if total_w <= CELL_MAX and total_h <= CELL_MAX:
         actual_w = total_w * 2 if ultra_hd else total_w
         actual_h = total_h * 2 if ultra_hd else total_h
+        _download_progress[file_name] = {"total": 1, "done": 0, "status": "downloading"}
         url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{min_lon},{min_lat},{max_lon},{max_lat}]/{actual_w}x{actual_h}{retina}?access_token={MAPBOX_TOKEN}"
         try:
             img = _fetch_tile(url, proxies)
             img.save(full_save_path, 'JPEG', quality=95)
+            _download_progress[file_name] = {"total": 1, "done": 1, "status": "done"}
             print(f"[Mapbox] ✅ {full_save_path}")
             return full_save_path
         except Exception as e:
+            _download_progress[file_name]["status"] = "error"
             print(f"[Mapbox] ❌ {e}")
             return None
 
@@ -67,6 +96,9 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
     rows = math.ceil(total_h / CELL_MAX)
     cell_w = math.ceil(total_w / cols)
     cell_h = math.ceil(total_h / rows)
+
+    total_tiles = cols * rows
+    _download_progress[file_name] = {"total": total_tiles, "done": 0, "status": "downloading"}
 
     canvas = Image.new('RGB', (total_w, total_h))
 
@@ -88,10 +120,12 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
                 print(f"[Mapbox] tile ({r+1}/{rows},{c+1}/{cols}) OK")
             except Exception as e:
                 print(f"[Mapbox] tile ({r+1}/{rows},{c+1}/{cols}) ❌ {e}")
-                # Fill failed tile with dark gray
                 fill = Image.new('RGB', (cw, ch), (40, 40, 40))
                 canvas.paste(fill, (c * cell_w, r * cell_h))
+            _download_progress[file_name]["done"] += 1
+            time.sleep(0.6)
 
+    _download_progress[file_name]["status"] = "done"
     canvas.save(full_save_path, 'JPEG', quality=92)
     print(f"[Mapbox] ✅ stitched {total_w}x{total_h} → {full_save_path}")
     return full_save_path

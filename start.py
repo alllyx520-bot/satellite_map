@@ -12,6 +12,8 @@ def open_browser():
     webbrowser.open('http://127.0.0.1:8000/')
 
 if __name__ == '__main__':
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
     # 1. 指定 Django 的配置路径
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'satellite_map.settings')
     

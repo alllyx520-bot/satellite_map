@@ -147,6 +147,7 @@ document.addEventListener('DOMContentLoaded', () => {
         };
         renderChatHistory();
         modal.style.display = 'flex';
+        updatePromptScene();
         setTimeout(() => textarea.focus(), 100);
     }
 
@@ -217,7 +218,7 @@ document.addEventListener('DOMContentLoaded', () => {
             isSelecting = true;
             startLatLng = e.latlng;
             map.dragging.disable();
-        }, 500);
+        }, 200);
     });
 
     map.on('dragstart', () => {
@@ -288,7 +289,7 @@ document.addEventListener('DOMContentLoaded', () => {
             startLatLng = touchStartPos;
             map.dragging.disable();
             if (selectionRect) { map.removeLayer(selectionRect); selectionRect = null; }
-        }, 500);
+        }, 200);
     });
     map.on('touchmove', (e) => {
         if (touchTimer) {
@@ -335,6 +336,12 @@ document.addEventListener('DOMContentLoaded', () => {
             <strong><span style="color:#3b82f6">●</span> 区域 #${c}</strong><br>
             <span style="color:#aaa">${nw.lat.toFixed(4)}, ${nw.lng.toFixed(4)}  →  ${se.lat.toFixed(4)}, ${se.lng.toFixed(4)}</span>
             <img class="preview-img" alt="卫星图预览" style="cursor:pointer;" title="点击进入分析舱">
+            <div class="tile-progress" style="display:none; margin-top:8px;">
+                <div class="progress-bar-bg" style="width:100%; height:4px; background:rgba(255,255,255,0.08); border-radius:2px; overflow:hidden;">
+                    <div class="progress-bar-fill" style="width:0%; height:100%; background:linear-gradient(90deg, #007aff, #34c759); border-radius:2px; transition:width 0.3s;"></div>
+                </div>
+                <span class="progress-text" style="font-size:11px; color:rgba(255,255,255,0.4);">0/0</span>
+            </div>
             <div class="ai-status">
                 <span class="spinner"></span> 正在抓取高清卫星图...
             </div>
@@ -389,6 +396,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const previewImg = itemEl.querySelector('.preview-img');
         const questionBox = itemEl.querySelector('.ai-question');
         const enterBtn = itemEl.querySelector('.enter-cabin-btn');
+        const progressBar = itemEl.querySelector('.tile-progress');
+        const fill = progressBar.querySelector('.progress-bar-fill');
+        const progressText = progressBar.querySelector('.progress-text');
+        let pollTimer = null;
 
         try {
             const r = await fetch("http://127.0.0.1:8000/api/satellite/get-img/", {
@@ -399,35 +410,61 @@ document.addEventListener('DOMContentLoaded', () => {
             const d = await r.json();
 
             if (d.code === 200) {
-                status.style.display = "none";
                 const fileName = d.data.file_name;
+                const totalTiles = d.data.total_tiles || 1;
                 const imgUrl = `http://127.0.0.1:8000/api/satellite/show-img/?file=${fileName}`;
-
-                previewImg.src = imgUrl;
-                previewImg.dataset.filename = fileName;
-                previewImg.style.display = "block";
-                previewImg.style.animation = 'none';
-                void previewImg.offsetHeight;
-                previewImg.style.animation = 'fadeIn 0.4s ease';
-
                 const spatialCtx = d.data.gsd_m
-                    ? `范围: ${d.data.area_km2} km² | 分辨率: ${d.data.gsd_m} m/像素`
+                    ? `范围: ${d.data.area_km2} km\u00B2 | 分辨率: ${d.data.gsd_m} m/像素`
                     : "";
+
                 chatMemories[fileName] = { history: [], spatial: spatialCtx, bbox: { min_lng, max_lng, min_lat, max_lat } };
-                questionBox.style.display = "block";
 
-                enterBtn.onclick = () => {
-                    map.fitBounds([[se.lat, nw.lng], [nw.lat, se.lng]]);
-                    openChatModal(fileName, imgUrl, spatialCtx);
-                };
+                status.style.display = 'block';
+                status.innerHTML = '<span class="spinner"></span> 正在下载瓦片...';
+                progressBar.style.display = 'block';
+                progressText.textContent = `0/${totalTiles}`;
 
-                showToast('卫星图抓取成功 ✓', 'success');
+                pollTimer = setInterval(async () => {
+                    try {
+                        const pr = await fetch(`http://127.0.0.1:8000/api/satellite/progress/?file=${fileName}`);
+                        const pd = await pr.json();
+                        if (pd.code === 200 && pd.data) {
+                            const done = pd.data.done || 0;
+                            const pct = Math.round((done / totalTiles) * 100);
+                            fill.style.width = pct + '%';
+                            progressText.textContent = `${done}/${totalTiles}`;
+                            if (pd.data.status === 'done') {
+                                clearInterval(pollTimer);
+                                progressBar.style.display = 'none';
+                                status.style.display = 'none';
+                                previewImg.src = imgUrl + '&t=' + Date.now();
+                                previewImg.dataset.filename = fileName;
+                                previewImg.style.display = 'block';
+                                previewImg.style.animation = 'none';
+                                void previewImg.offsetHeight;
+                                previewImg.style.animation = 'fadeIn 0.4s ease';
+                                questionBox.style.display = 'block';
+                                enterBtn.onclick = () => {
+                                    map.fitBounds([[se.lat, nw.lng], [nw.lat, se.lng]]);
+                                    openChatModal(fileName, imgUrl, spatialCtx);
+                                };
+                                showToast('卫星图抓取成功', 'success');
+                            } else if (pd.data.status === 'error') {
+                                clearInterval(pollTimer);
+                                progressBar.style.display = 'none';
+                                status.innerHTML = '抓取失败，请重试';
+                                showToast('抓取失败', 'error');
+                            }
+                        }
+                    } catch (e) {}
+                }, 500);
             } else {
-                status.innerHTML = '❌ 抓取失败：' + d.msg;
+                status.innerHTML = '抓取失败：' + d.msg;
                 showToast('抓取失败：' + d.msg, 'error');
             }
         } catch (e) {
-            status.innerHTML = '❌ 网络错误，请检查后端';
+            if (pollTimer) clearInterval(pollTimer);
+            status.innerHTML = '网络错误，请检查后端';
             showToast('网络请求失败，请确认后端运行中', 'error');
         }
     }
@@ -450,6 +487,7 @@ document.addEventListener('DOMContentLoaded', () => {
         modalIdSpan.innerText = currentSpatialCtx ? ` · ${currentSpatialCtx}` : '';
         renderChatHistory();
         modal.style.display = 'flex';
+        updatePromptScene();
         setTimeout(() => textarea.focus(), 100);
     }
 
@@ -468,12 +506,57 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // 输入框自适应高度
+    function autoResize() {
+        textarea.style.height = 'auto';
+        textarea.style.height = textarea.scrollHeight + 'px';
+    }
+    textarea.addEventListener('input', autoResize);
+
     // Esc 关闭
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && modal.style.display === 'flex') {
             modal.style.display = 'none';
         }
     });
+
+    // 预设提示词：根据单图/多图模式显示对应分组
+    function updatePromptScene() {
+        const isMulti = currentActiveImage === '__compare__';
+        document.querySelectorAll('.prompt-group[data-scene]').forEach(g => {
+            const scenes = g.dataset.scene.split(',');
+            g.classList.toggle('visible', scenes.includes(isMulti ? 'multi' : 'single'));
+        });
+    }
+
+    // 全局函数：展开/收起预设提示词面板
+    window.togglePrompts = function() {
+        const area = document.querySelector('.chat-prompts-area');
+        const btn = document.getElementById('chat-prompt-toggle');
+        const isOpen = area.classList.toggle('show');
+        if (isOpen) {
+            btn.classList.add('active');
+            updatePromptScene();
+        } else {
+            btn.classList.remove('active');
+        }
+    };
+
+    // 全局函数：选中预设提示词
+    window.pickPrompt = function(tag) {
+        const detail = tag.getAttribute('data-detail');
+        if (detail) {
+            const ta = document.getElementById('chat-textarea');
+            ta.value = detail;
+            ta.focus();
+            ta.style.height = 'auto';
+            ta.style.height = ta.scrollHeight + 'px';
+        }
+        document.querySelector('.chat-prompts-area').classList.remove('show');
+        document.getElementById('chat-prompt-toggle').classList.remove('active');
+        tag.classList.add('flash');
+        setTimeout(() => tag.classList.remove('flash'), 400);
+    };
 
     function getChatData(fileName) {
         const entry = chatMemories[fileName];
@@ -486,12 +569,38 @@ document.addEventListener('DOMContentLoaded', () => {
             .replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;');
+
+        // 表格处理（先做，内部单元格再补内联格式化）
+        html = html.replace(/(\|[^\n]+\|\n\|[-:|\s]+\|\n(?:\|[^\n]+\|\n?)*)/gm, (match) => {
+            const rows = match.trim().split('\n');
+            let tableHtml = '<table class="md-table">';
+            rows.forEach((row, i) => {
+                const cells = row.split('|').filter(c => c.trim() !== '');
+                const tag = i === 1 ? '' : (i === 0 ? 'th' : 'td');
+                if (tag) {
+                    tableHtml += '<tr>';
+                    cells.forEach(c => {
+                        let cellHtml = c.trim();
+                        cellHtml = cellHtml.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+                        cellHtml = cellHtml.replace(/\*(.+?)\*/g, '<em>$1</em>');
+                        cellHtml = cellHtml.replace(/`([^`]+)`/g, '<code class="md-code">$1</code>');
+                        tableHtml += `<${tag}>${cellHtml}</${tag}>`;
+                    });
+                    tableHtml += '</tr>';
+                }
+            });
+            tableHtml += '</table>';
+            return tableHtml;
+        });
+
         html = html.replace(/^#### (.+)$/gm, '<div class="md-h4">$1</div>');
         html = html.replace(/^### (.+)$/gm, '<div class="md-h3">$1</div>');
         html = html.replace(/^## (.+)$/gm, '<div class="md-h2">$1</div>');
         html = html.replace(/^# (.+)$/gm, '<div class="md-h1">$1</div>');
+
         html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
         html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+        html = html.replace(/`([^`]+)`/g, '<code class="md-code">$1</code>');
 
         const lines = html.split('\n');
         let result = [], inUl = false, inOl = false;
@@ -509,7 +618,13 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 if (inUl) { result.push('</ul>'); inUl = false; }
                 if (inOl) { result.push('</ol>'); inOl = false; }
-                result.push(line);
+                if (line.trim() === '') {
+                    result.push('<br>');
+                } else if (!line.startsWith('<table') && !line.startsWith('<tr') && !line.startsWith('<td') && !line.startsWith('<th') && !line.startsWith('</table') && !line.startsWith('</tr') && !line.startsWith('</td') && !line.startsWith('</th') && !line.startsWith('<div') && !line.startsWith('<ul') && !line.startsWith('<ol') && !line.startsWith('<li') && !line.startsWith('</ul') && !line.startsWith('</ol') && !line.startsWith('</div') && !line.startsWith('<strong') && !line.startsWith('<em') && !line.startsWith('<br') && !line.startsWith('<code')) {
+                    result.push(`<p>${line}</p>`);
+                } else {
+                    result.push(line);
+                }
             }
         }
         if (inUl) result.push('</ul>');
@@ -559,9 +674,11 @@ document.addEventListener('DOMContentLoaded', () => {
         const data = getChatData(currentActiveImage);
         data.history.push({ role: 'user', content: text });
         textarea.value = '';
+        autoResize();
         renderChatHistory();
 
         const isCompare = currentActiveImage === '__compare__';
+        const currentModel = document.getElementById('model-select').value || 'qwen3.5-plus';
         const loadingDiv = document.createElement('div');
         loadingDiv.className = 'chat-bubble chat-ai';
         loadingDiv.innerHTML = `<span class="spinner"></span> SatelliteSense ${isCompare ? '正在对比分析' : '正在分析'}...`;
@@ -570,8 +687,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
         try {
             const body = isCompare
-                ? { file_names: data.compareFiles, question: text, history: data.history.slice(0, -1) }
-                : { file_name: currentActiveImage, question: text, history: data.history.slice(0, -1), spatial_context: currentSpatialCtx };
+                ? { file_names: data.compareFiles, question: text, history: data.history.slice(0, -1), model: currentModel }
+                : { file_name: currentActiveImage, question: text, history: data.history.slice(0, -1), spatial_context: currentSpatialCtx, model: currentModel };
             const res = await fetch("http://127.0.0.1:8000/api/ai/query-region/", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -593,6 +710,7 @@ document.addEventListener('DOMContentLoaded', () => {
             showToast('网络请求异常', 'error');
         }
         renderChatHistory();
+        if (currentActiveImage) saveHistory(currentActiveImage);
         textarea.focus();
     };
 
@@ -774,6 +892,166 @@ document.addEventListener('DOMContentLoaded', () => {
     searchInput.addEventListener('focus', () => {
         if (searchInput.value.trim().length > 0) searchResults.style.display = 'block';
     });
+
+    // ==========================================
+    // 图层切换
+    // ==========================================
+    const adminToggle = document.getElementById('layer-admin');
+    const roadsToggle = document.getElementById('layer-roads');
+    const labelLayer = L.tileLayer('https://a.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}.png', {
+        maxZoom: 18, attribution: '&copy; <a href="https://carto.com/">CARTO</a>'
+    });
+
+    adminToggle.addEventListener('change', () => {
+        if (provinceLayer) {
+            adminToggle.checked ? provinceLayer.addTo(map) : map.removeLayer(provinceLayer);
+        }
+    });
+
+    function applyRoadLabels() {
+        if (roadsToggle.checked) {
+            if (!map.hasLayer(labelLayer)) labelLayer.addTo(map);
+        } else {
+            if (map.hasLayer(labelLayer)) map.removeLayer(labelLayer);
+        }
+    }
+
+    roadsToggle.addEventListener('change', applyRoadLabels);
+
+    const origStyleChange = styleToggle.onchange;
+    styleToggle.addEventListener('change', (e) => {
+        if (origStyleChange) origStyleChange.call(styleToggle, e);
+        applyRoadLabels();
+    });
+
+    // ==========================================
+    // 快捷键
+    // ==========================================
+    document.addEventListener('keydown', (e) => {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+            if (e.key === 'Enter' && e.ctrlKey) {
+                e.preventDefault();
+                sendBtn.click();
+            }
+            return;
+        }
+        if (e.key === 'Escape') {
+            if (selectionRect) { map.removeLayer(selectionRect); selectionRect = null; }
+            if (isSelecting) { isSelecting = false; map.dragging.enable(); }
+            if (modal.style.display === 'flex') { modal.style.display = 'none'; }
+            showToast('已取消', 'info');
+        }
+    });
+
+    // ==========================================
+    // 聊天历史
+    // ==========================================
+    const historyList = document.getElementById('history-list');
+    const refreshHistoryBtn = document.getElementById('refresh-history-btn');
+
+    async function loadHistories() {
+        try {
+            const r = await fetch('http://127.0.0.1:8000/api/ai/history/');
+            const d = await r.json();
+            if (d.code !== 200 || !d.data.length) {
+                historyList.innerHTML = '<div style="font-size:11px;color:rgba(255,255,255,0.25);text-align:center;padding:10px 0;">暂无历史记录</div>';
+                return;
+            }
+            historyList.innerHTML = '';
+            d.data.forEach(h => {
+                const item = document.createElement('div');
+                item.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:4px 0; font-size:11px; color:rgba(255,255,255,0.6); cursor:pointer;';
+                const label = document.createElement('span');
+                label.textContent = (h.spatial_context || h.image_file).substring(0, 30);
+                label.title = '点击加载';
+                label.addEventListener('click', async () => {
+                    const rr = await fetch(`http://127.0.0.1:8000/api/ai/history/${h.id}/`);
+                    const dd = await rr.json();
+                    if (dd.code === 200) {
+                        const fileName = dd.data.image_file;
+                        const imgUrl = `http://127.0.0.1:8000/api/satellite/show-img/?file=${fileName}`;
+                        currentActiveImage = fileName;
+                        currentSpatialCtx = dd.data.spatial_context || '';
+                        chatMemories[fileName] = { history: dd.data.messages || [], spatial: dd.data.spatial_context || '', bbox: dd.data.bbox };
+                        modalImg.src = imgUrl;
+                        modalIdSpan.innerText = currentSpatialCtx ? ' · ' + currentSpatialCtx : '';
+                        renderChatHistory();
+                        modal.style.display = 'flex';
+                        if (dd.data.bbox) {
+                            const b = dd.data.bbox;
+                            map.fitBounds([[b.min_lat, b.min_lng], [b.max_lat, b.max_lng]]);
+                        }
+                        showToast('已加载历史对话', 'info');
+                    }
+                });
+                const delBtn = document.createElement('button');
+                delBtn.textContent = '✕';
+                delBtn.style.cssText = 'background:none;border:none;color:rgba(255,255,255,0.2);cursor:pointer;font-size:10px;';
+                delBtn.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    await fetch(`http://127.0.0.1:8000/api/ai/history/${h.id}/`, { method: 'DELETE' });
+                    loadHistories();
+                });
+                item.appendChild(label);
+                item.appendChild(delBtn);
+                historyList.appendChild(item);
+            });
+        } catch (e) {}
+    }
+    refreshHistoryBtn.addEventListener('click', loadHistories);
+
+    async function saveHistory(fileName) {
+        const mem = chatMemories[fileName] || {};
+        const bbox = mem.bbox ? mem.bbox : {};
+        try {
+            await fetch('http://127.0.0.1:8000/api/ai/history/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    image_file: fileName,
+                    messages: mem.history || [],
+                    spatial_context: mem.spatial || '',
+                    bbox: bbox
+                })
+            });
+            loadHistories();
+        } catch (e) {}
+    }
+
+    // ==========================================
+    // 报告导出
+    // ==========================================
+    document.getElementById('report-btn').addEventListener('click', async () => {
+        if (!currentActiveImage) return;
+        const mem = chatMemories[currentActiveImage] || {};
+        showToast('正在生成报告...', 'info');
+        try {
+            const r = await fetch('http://127.0.0.1:8000/api/report/generate/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    file_name: currentActiveImage,
+                    title: 'SatelliteSense 遥感分析报告',
+                    messages: mem.history || [],
+                    spatial_context: mem.spatial || '',
+                    bbox: mem.bbox || {}
+                })
+            });
+            const d = await r.json();
+            if (d.code === 200) {
+                window.open('http://127.0.0.1:8000' + d.data.download_url);
+                showToast('报告已生成，正在下载', 'success');
+            } else {
+                showToast('报告生成失败：' + d.msg, 'error');
+            }
+        } catch (e) {
+            showToast('报告生成失败', 'error');
+        }
+    });
+
+    // 聊天发送后自动保存（sendBtn.onclick 里 AI 回复后调用）
+
+    loadHistories();
 
     initMapLayers();
 });
