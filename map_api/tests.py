@@ -14,6 +14,7 @@ from map_api.utils.active_perception import (
     map_bbox_to_original
 )
 from map_api.utils.get_satellite_image import haversine_distance
+from map_api.utils.analysis_strategy import build_analysis_strategy
 from map_api.models import ChatHistory, DownloadTask, ImageryScene
 from map_api.imagery_sources.mapbox import MapboxProvider
 from map_api.imagery_sources.earth_search import EarthSearchProvider, score_candidate
@@ -259,6 +260,29 @@ class ImageryMetadataTests(SimpleTestCase):
                     256,
                     256,
                 )
+
+
+class AnalysisStrategyTests(SimpleTestCase):
+    def test_sentinel_detail_question_disables_active_perception(self):
+        class Scene:
+            source = "sentinel2"
+            gsd_m = 10
+
+        strategy = build_analysis_strategy("数一下停车场有多少辆车", scene=Scene(), requested_active=True)
+        self.assertFalse(strategy["active_perception"])
+        self.assertEqual(strategy["source"], "sentinel2")
+        self.assertIn("不适合识别小建筑", strategy["prompt"])
+        self.assertIn("不可可靠判断", strategy["prompt"])
+
+    def test_mapbox_detail_question_keeps_active_perception(self):
+        class Scene:
+            source = "mapbox"
+            gsd_m = 1.2
+
+        strategy = build_analysis_strategy("分析建筑屋顶和道路细节", scene=Scene(), requested_active=True)
+        self.assertTrue(strategy["active_perception"])
+        self.assertEqual(strategy["source"], "mapbox")
+        self.assertIn("建议启用主动感知", strategy["prompt"])
 
 
 class HistoryApiTests(TestCase):

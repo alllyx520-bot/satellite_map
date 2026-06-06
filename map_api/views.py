@@ -19,6 +19,7 @@ from django.db import close_old_connections
 
 from .utils.get_satellite_image import fetch_satellite_image, haversine_distance, get_download_progress, prune_progress, _download_progress
 from .utils.image_preprocessor import smart_prepare_image_v2, MAX_DIM_MAP
+from .utils.analysis_strategy import build_analysis_strategy
 from .utils.active_perception import (
     build_stage1_prompt, extract_bbox_from_response,
     cut_image_geom, map_bbox_to_original, resize_image, build_stage2_prompt,
@@ -545,6 +546,7 @@ def ai_query_region(request):
         ap_scale = 1.0           # stage1 缩略图 → 原图的 bbox 缩放比
         targets = []             # AI 定位到的目标(含 GSD 测量 + 经纬度),回传前端标点
         preprocess = None        # 单图/分块预处理结果(compare 路径为 None)
+        strategy = None
 
         # 多图对比
         if file_names and isinstance(file_names, list) and len(file_names) >= 2:
@@ -575,7 +577,10 @@ def ai_query_region(request):
                 scene = ImageryScene.objects.filter(file_name=os.path.basename(file_name)).first()
 
             spatial_ctx = data.get("spatial_context", "")
+            requested_active = _as_bool(data.get("active_perception", mode_cfg["active_perception"]))
+            strategy = build_analysis_strategy(question, scene=scene, gsd=gsd, requested_active=requested_active)
             context_bits = []
+            context_bits.append(strategy["prompt"])
             scene_context = imagery_context_text(scene)
             if scene_context:
                 context_bits.append(scene_context)
@@ -589,7 +594,7 @@ def ai_query_region(request):
                 )
             if context_bits:
                 spatial_ctx = (spatial_ctx + "\n" if spatial_ctx else "") + "\n".join(context_bits)
-            use_active_perception = _as_bool(data.get("active_perception", mode_cfg["active_perception"]))
+            use_active_perception = strategy["active_perception"]
 
             preprocess = smart_prepare_image_v2(target_path, max_dim=max_dim, question=question)
             if not preprocess:
@@ -745,6 +750,7 @@ def ai_query_region(request):
                 "active_stages": active_stages,
                 "targets": targets,
                 "scene": scene_payload(scene) if scene else None,
+                "analysis_strategy": strategy,
             }
         })
 
