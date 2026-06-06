@@ -481,9 +481,20 @@ html, body {
     border-right: 0.5px solid rgba(255, 255, 255, 0.06);
     padding: 20px;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
     background: radial-gradient(ellipse at center, rgba(255, 255, 255, 0.04) 0%, transparent 70%);
+    min-width: 0;
+}
+
+.imagery-preview-wrap {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
 }
 
 #chat-modal-img {
@@ -492,6 +503,82 @@ html, body {
     border-radius: 10px;
     box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
     border: 0.5px solid rgba(255, 255, 255, 0.06);
+}
+
+.scene-brief {
+    margin-top: 8px;
+    padding: 5px 8px;
+    background: rgba(255, 149, 0, 0.1);
+    border: 0.5px solid rgba(255, 149, 0, 0.22);
+    border-radius: 6px;
+    color: rgba(255, 214, 153, 0.9);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.imagery-scene-panel {
+    width: 100%;
+    margin-top: 12px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.045);
+    border: 0.5px solid rgba(255, 255, 255, 0.08);
+    box-sizing: border-box;
+    color: rgba(255, 255, 255, 0.68);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.scene-panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.scene-panel-head span {
+    color: rgba(255, 255, 255, 0.82);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.scene-panel-head strong {
+    flex: none;
+    padding: 2px 7px;
+    border-radius: 9999px;
+    background: rgba(255, 149, 0, 0.14);
+    color: rgba(255, 214, 153, 0.95);
+    border: 0.5px solid rgba(255, 149, 0, 0.24);
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.scene-panel-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 12px;
+}
+
+.scene-panel-grid span {
+    display: block;
+    color: rgba(255, 255, 255, 0.34);
+}
+
+.scene-panel-grid b {
+    display: block;
+    margin-top: 1px;
+    color: rgba(255, 255, 255, 0.74);
+    font-weight: 500;
+    overflow-wrap: anywhere;
+}
+
+.scene-panel-note {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 0.5px solid rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.52);
+    overflow-wrap: anywhere;
 }
 
 .chat-modal-right {

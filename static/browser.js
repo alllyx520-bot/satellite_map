@@ -51,6 +51,37 @@ document.addEventListener('DOMContentLoaded', () => {
         setTimeout(() => { if (toast.parentNode) toast.remove(); }, 3000);
     }
 
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function formatSceneDate(value) {
+        if (!value) return '未知';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return '未知';
+        return date.toLocaleString('zh-CN', { hour12: false });
+    }
+
+    function sceneGradeText(grade) {
+        const map = {
+            reference: '参考级',
+            screening: '筛查级',
+            decision_support: '决策辅助级',
+            evidence: '证据级'
+        };
+        return map[grade] || grade || '未知';
+    }
+
+    function sceneBrief(scene) {
+        if (!scene) return '';
+        return `${scene.source_label || scene.source || '影像源'} · ${sceneGradeText(scene.decision_grade)}`;
+    }
+
     // ==========================================
     // 返回全国按钮
     // ==========================================
@@ -119,6 +150,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function openCompareModal(items) {
         currentActiveImage = '__compare__';
         currentSpatialCtx = '';
+        renderScenePanel(null);
         modalImg.style.display = 'none';
         modalIdSpan.innerText = ` · 对比 ${items.length} 个区域`;
         chatBox.innerHTML = `<div style="color:#aaa;text-align:center;margin:20px 0;">加载 ${items.length} 张影像...</div>`;
@@ -126,6 +158,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const container = document.querySelector('.chat-modal-left');
         container.innerHTML = '';
         container.style.position = '';
+        container.style.flexDirection = 'row';
         container.style.flexWrap = 'wrap';
         container.style.gap = '8px';
         container.style.alignContent = 'flex-start';
@@ -335,6 +368,7 @@ document.addEventListener('DOMContentLoaded', () => {
             <input type="checkbox" class="select-cb" style="position:absolute;top:8px;left:8px;width:16px;height:16px;accent-color:#007aff;cursor:pointer;display:none;">
             <strong><span style="color:#3b82f6">●</span> 区域 #${c}</strong><br>
             <span style="color:#aaa">${nw.lat.toFixed(4)}, ${nw.lng.toFixed(4)}  →  ${se.lat.toFixed(4)}, ${se.lng.toFixed(4)}</span>
+            <div class="scene-brief" hidden></div>
             <img class="preview-img" alt="卫星图预览" style="cursor:pointer;" title="点击进入分析舱">
             <div class="tile-progress" style="display:none; margin-top:8px;">
                 <div class="progress-bar-bg" style="width:100%; height:4px; background:rgba(255,255,255,0.08); border-radius:2px; overflow:hidden;">
@@ -504,7 +538,19 @@ document.addEventListener('DOMContentLoaded', () => {
                     ? `范围: ${d.data.area_km2} km\u00B2 | 分辨率: ${d.data.gsd_m} m/像素`
                     : "";
 
-                chatMemories[fileName] = { history: [], spatial: spatialCtx, bbox: { min_lng, max_lng, min_lat, max_lat }, gsd: d.data.gsd_m };
+                chatMemories[fileName] = {
+                    history: [],
+                    spatial: spatialCtx,
+                    bbox: { min_lng, max_lng, min_lat, max_lat },
+                    gsd: d.data.gsd_m,
+                    sceneId: d.data.scene_id,
+                    scene: d.data.scene
+                };
+                const sceneBriefEl = itemEl.querySelector('.scene-brief');
+                if (sceneBriefEl && d.data.scene) {
+                    sceneBriefEl.textContent = sceneBrief(d.data.scene);
+                    sceneBriefEl.hidden = false;
+                }
 
                 status.style.display = 'block';
                 status.innerHTML = '<span class="spinner"></span> 正在下载瓦片...';
@@ -553,6 +599,38 @@ document.addEventListener('DOMContentLoaded', () => {
     let modalImg = document.getElementById('chat-modal-img');
     const modalIdSpan = document.getElementById('chat-modal-id');
 
+    function renderScenePanel(scene) {
+        const panel = document.getElementById('imagery-scene-panel');
+        if (!panel) return;
+        if (!scene) {
+            panel.hidden = true;
+            panel.innerHTML = '';
+            return;
+        }
+
+        const gsd = scene.gsd_m ? `约 ${scene.gsd_m} m/像素` : '未知';
+        const cloud = scene.cloud_percent != null ? `${scene.cloud_percent}%` : '未知';
+        const acquiredAt = formatSceneDate(scene.acquired_at);
+        const fetchedAt = formatSceneDate(scene.fetched_at);
+        const limitations = scene.limitations || '暂无限制说明';
+        panel.innerHTML = `
+            <div class="scene-panel-head">
+                <span>影像档案</span>
+                <strong>${escapeHtml(sceneGradeText(scene.decision_grade))}</strong>
+            </div>
+            <div class="scene-panel-grid">
+                <div><span>来源</span><b>${escapeHtml(scene.source_label || scene.source || '未知')}</b></div>
+                <div><span>拍摄</span><b>${escapeHtml(acquiredAt)}</b></div>
+                <div><span>获取</span><b>${escapeHtml(fetchedAt)}</b></div>
+                <div><span>分辨率</span><b>${escapeHtml(gsd)}</b></div>
+                <div><span>云量</span><b>${escapeHtml(cloud)}</b></div>
+                <div><span>处理级别</span><b>${escapeHtml(scene.processing_level || '未知')}</b></div>
+            </div>
+            <div class="scene-panel-note">${escapeHtml(limitations)}</div>
+        `;
+        panel.hidden = false;
+    }
+
     function openChatModal(fileName, imgUrl, spatialCtx) {
         currentActiveImage = fileName;
         currentSpatialCtx = spatialCtx || "";
@@ -560,6 +638,7 @@ document.addEventListener('DOMContentLoaded', () => {
         restoreChatModalLayout();        // 若上次是对比模式,重建单图布局,避免白屏
         modalImg.src = imgUrl;
         modalIdSpan.innerText = currentSpatialCtx ? ` · ${currentSpatialCtx}` : '';
+        renderScenePanel(getChatData(fileName).scene);
         renderChatHistory();
         modal.style.display = 'flex';
         updatePromptScene();
@@ -733,9 +812,17 @@ document.addEventListener('DOMContentLoaded', () => {
     function restoreChatModalLayout() {
         const left = document.querySelector('.chat-modal-left');
         if (!document.getElementById('chat-modal-img')) {
-            left.innerHTML = '<img id="chat-modal-img" src="" alt="卫星图放大版" draggable="false">';
+            left.innerHTML = `
+                <div class="imagery-preview-wrap">
+                    <img id="chat-modal-img" src="" alt="卫星图放大版" draggable="false">
+                </div>
+                <div id="imagery-scene-panel" class="imagery-scene-panel" hidden></div>
+            `;
+        } else if (!document.getElementById('imagery-scene-panel')) {
+            left.insertAdjacentHTML('beforeend', '<div id="imagery-scene-panel" class="imagery-scene-panel" hidden></div>');
         }
         left.style.flexWrap = '';
+        left.style.flexDirection = '';
         left.style.gap = '';
         left.style.alignContent = '';
         modalImg = document.getElementById('chat-modal-img');   // 重新捕获引用
@@ -816,7 +903,7 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const body = isCompare
                 ? { file_names: data.compareFiles, question: text, history: data.history.slice(0, -1), model: analysisMode.model, mode: analysisMode.mode }
-                : { file_name: currentActiveImage, question: text, history: data.history.slice(0, -1), spatial_context: currentSpatialCtx, model: analysisMode.model, mode: analysisMode.mode, active_perception: analysisMode.activePerception, gsd: data.gsd, bbox: data.bbox };
+                : { file_name: currentActiveImage, scene_id: data.sceneId, question: text, history: data.history.slice(0, -1), spatial_context: currentSpatialCtx, model: analysisMode.model, mode: analysisMode.mode, active_perception: analysisMode.activePerception, gsd: data.gsd, bbox: data.bbox };
             const res = await fetch("/api/ai/query-region/", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -831,6 +918,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (result.data.active_stages >= 2) {
                     aiContent = `🔍 主动感知（${result.data.active_stages}级分析）\n\n` + aiContent;
                 }
+                if (result.data.scene) data.scene = result.data.scene;
                 data.history.push({ role: 'ai', content: aiContent });
                 if (!isCompare) placeTargetMarkers(result.data.targets);  // 把 AI 定位目标标到地图
             } else {
@@ -946,10 +1034,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 const totalTiles = d.data.total_tiles || 1;
                 const imgUrl = `/api/satellite/show-img/?file=${fileName}`;
                 const spatialCtx = d.data.gsd_m ? `范围: ${d.data.area_km2} km² | 分辨率: ${d.data.gsd_m} m/像素` : "";
-                chatMemories[fileName] = { history: [], spatial: spatialCtx, bbox: { min_lng: subMinLng, max_lng: subMaxLng, min_lat: subMinLat, max_lat: subMaxLat }, gsd: d.data.gsd_m };
+                chatMemories[fileName] = {
+                    history: [],
+                    spatial: spatialCtx,
+                    bbox: { min_lng: subMinLng, max_lng: subMaxLng, min_lat: subMinLat, max_lat: subMaxLat },
+                    gsd: d.data.gsd_m,
+                    sceneId: d.data.scene_id,
+                    scene: d.data.scene
+                };
                 modalIdSpan.innerText = spatialCtx ? ` · ${spatialCtx}` : '';
                 currentActiveImage = fileName;
                 currentSpatialCtx = spatialCtx;
+                renderScenePanel(d.data.scene);
                 await pollDownloadProgress(fileName, totalTiles, {
                     onReady: () => {
                         modalImg.src = imgUrl + '&t=' + Date.now();
@@ -1121,10 +1217,17 @@ document.addEventListener('DOMContentLoaded', () => {
                         const imgUrl = `/api/satellite/show-img/?file=${fileName}`;
                         currentActiveImage = fileName;
                         currentSpatialCtx = dd.data.spatial_context || '';
-                        chatMemories[fileName] = { history: dd.data.messages || [], spatial: dd.data.spatial_context || '', bbox: dd.data.bbox };
+                        chatMemories[fileName] = {
+                            history: dd.data.messages || [],
+                            spatial: dd.data.spatial_context || '',
+                            bbox: dd.data.bbox,
+                            sceneId: dd.data.scene_id,
+                            scene: dd.data.scene
+                        };
                         restoreChatModalLayout();        // 重建单图布局,避免对比模式残留导致白屏
                         modalImg.src = imgUrl;
                         modalIdSpan.innerText = currentSpatialCtx ? ' · ' + currentSpatialCtx : '';
+                        renderScenePanel(dd.data.scene);
                         renderChatHistory();
                         modal.style.display = 'flex';
                         if (dd.data.bbox) {
@@ -1161,6 +1264,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     image_file: fileName,
+                    scene_id: mem.sceneId,
                     messages: mem.history || [],
                     spatial_context: mem.spatial || '',
                     bbox: bbox
@@ -1183,6 +1287,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     file_name: currentActiveImage,
+                    scene_id: mem.sceneId,
                     title: 'SatelliteSense 遥感分析报告',
                     messages: mem.history || [],
                     spatial_context: mem.spatial || '',

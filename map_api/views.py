@@ -24,7 +24,8 @@ from .utils.active_perception import (
     cut_image_geom, map_bbox_to_original, resize_image, build_stage2_prompt,
     extract_answer_text, measure_bbox, pixel_bbox_to_geo
 )
-from .models import ChatHistory, DownloadTask
+from .models import ChatHistory, DownloadTask, ImageryScene
+from .imagery_sources.mapbox import MapboxProvider
 
 # 规范化保存目录
 SAVE_DIR = os.path.join(settings.MEDIA_ROOT, 'satellite_imgs')
@@ -87,13 +88,16 @@ def _json_body(request):
 
 
 def _task_progress(task):
-    return {
+    data = {
         "total": task.total,
         "done": task.done,
         "failed": task.failed,
         "status": task.status,
         "error": task.error_message,
     }
+    if task.scene_id:
+        data["scene_id"] = task.scene_id
+    return data
 
 
 def _persist_progress(file_name, info):
@@ -156,6 +160,51 @@ def compute_image_plan(min_lng, min_lat, max_lng, max_lat, resolution):
     }
 
 
+def scene_payload(scene):
+    return {
+        "id": scene.id,
+        "file_name": scene.file_name,
+        "source": scene.source,
+        "source_label": scene.source_label,
+        "product_id": scene.product_id,
+        "acquired_at": scene.acquired_at.isoformat() if scene.acquired_at else None,
+        "published_at": scene.published_at.isoformat() if scene.published_at else None,
+        "fetched_at": scene.fetched_at.isoformat() if scene.fetched_at else None,
+        "bbox": {
+            "min_lng": scene.min_lng,
+            "min_lat": scene.min_lat,
+            "max_lng": scene.max_lng,
+            "max_lat": scene.max_lat,
+        },
+        "gsd_m": scene.gsd_m,
+        "area_km2": scene.area_km2,
+        "cloud_percent": scene.cloud_percent,
+        "processing_level": scene.processing_level,
+        "license_type": scene.license_type,
+        "decision_grade": scene.decision_grade,
+        "limitations": scene.limitations,
+        "metadata": scene.metadata,
+    }
+
+
+def imagery_context_text(scene):
+    if not scene:
+        return ""
+    acquired = scene.acquired_at.strftime("%Y-%m-%d %H:%M") if scene.acquired_at else "未知"
+    cloud = f"{scene.cloud_percent}%" if scene.cloud_percent is not None else "未知"
+    return (
+        "## 影像元数据\n"
+        f"数据源：{scene.source_label}\n"
+        f"拍摄时间：{acquired}\n"
+        f"GSD：约 {scene.gsd_m} m/像素\n"
+        f"云量：{cloud}\n"
+        f"处理级别：{scene.processing_level}\n"
+        f"决策等级：{scene.decision_grade}\n"
+        f"数据限制：{scene.limitations}\n"
+        "回答时必须基于上述数据限制说明不确定性，不得把参考级底图结论表述为已复核证据。"
+    )
+
+
 def index_view(request):
     """负责展示前端地图页面"""
     return render(request, 'browser.html')
@@ -190,8 +239,21 @@ def get_satellite_img_api(request):
         file_name = f"sat_{uuid.uuid4().hex[:8]}.jpg"
         gsd = plan["gsd_m"]
         area_km2 = plan["area_km2"]
+        bbox_payload = {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat}
+        metadata = MapboxProvider().metadata_for_bbox(bbox_payload).as_dict()
+        scene = ImageryScene.objects.create(
+            file_name=file_name,
+            min_lng=min_lng,
+            min_lat=min_lat,
+            max_lng=max_lng,
+            max_lat=max_lat,
+            gsd_m=round(gsd, 2),
+            area_km2=round(area_km2, 4),
+            **metadata,
+        )
 
         task = DownloadTask.objects.create(
+            scene=scene,
             file_name=file_name,
             status="downloading",
             total=total_tiles,
@@ -237,6 +299,8 @@ def get_satellite_img_api(request):
             "data": {
                 "file_name": file_name,
                 "total_tiles": total_tiles,
+                "scene_id": scene.id,
+                "scene": scene_payload(scene),
                 "gsd_m": round(gsd, 2),
                 "area_km2": round(area_km2, 4),
                 "resolution_px": resolution,
@@ -349,6 +413,7 @@ def ai_query_region(request):
         model_name = mode_cfg["model"]
         gsd = data.get("gsd")              # 米/像素(用于 GSD 测量)
         geo_bbox = data.get("bbox")        # 图像地理范围 {min_lng,max_lng,min_lat,max_lat}(用于坐标接地)
+        scene = None
 
         dashscope.api_key = os.environ.get('DASHSCOPE_API_KEY', '')
         if not dashscope.api_key:
@@ -391,8 +456,17 @@ def ai_query_region(request):
             if not target_path or not os.path.exists(target_path):
                 return JsonResponse({"code": 404, "msg": "卫星图文件已丢失，请重新框选", "data": None})
 
+            scene_id = data.get("scene_id")
+            if scene_id:
+                scene = ImageryScene.objects.filter(id=scene_id, file_name=os.path.basename(file_name)).first()
+            if not scene:
+                scene = ImageryScene.objects.filter(file_name=os.path.basename(file_name)).first()
+
             spatial_ctx = data.get("spatial_context", "")
             context_bits = []
+            scene_context = imagery_context_text(scene)
+            if scene_context:
+                context_bits.append(scene_context)
             if gsd:
                 context_bits.append(f"GSD: {gsd} m/像素")
             if isinstance(geo_bbox, dict):
@@ -558,6 +632,7 @@ def ai_query_region(request):
                 "answer": real_answer,
                 "active_stages": active_stages,
                 "targets": targets,
+                "scene": scene_payload(scene) if scene else None,
             }
         })
 
@@ -649,6 +724,7 @@ def cleanup_cache(request):
 
         if clean_all:
             DownloadTask.objects.all().delete()
+            ImageryScene.objects.all().delete()
             _download_progress.clear()
         else:
             DownloadTask.objects.filter(updated_at__lt=cutoff).delete()
@@ -667,6 +743,20 @@ def cleanup_cache(request):
         return JsonResponse({"code": 400, "msg": str(e)}, status=400)
 
 
+def imagery_scene_list(request):
+    limit = min(100, max(1, int(request.GET.get("limit", 20))))
+    qs = ImageryScene.objects.all()[:limit]
+    return JsonResponse({"code": 200, "data": [scene_payload(scene) for scene in qs]})
+
+
+def imagery_scene_detail(request, scene_id):
+    try:
+        scene = ImageryScene.objects.get(id=scene_id)
+        return JsonResponse({"code": 200, "data": scene_payload(scene)})
+    except ImageryScene.DoesNotExist:
+        return JsonResponse({"code": 404, "msg": "not found"}, status=404)
+
+
 # ----------------------
 # 聊天历史 CRUD
 # ----------------------
@@ -674,7 +764,7 @@ def cleanup_cache(request):
 def chat_history_list(request):
     if request.method == "GET":
         histories = ChatHistory.objects.values(
-            "id", "image_file", "spatial_context", "bbox", "created_at", "updated_at"
+            "id", "scene_id", "image_file", "spatial_context", "bbox", "created_at", "updated_at"
         )[:20]
         return JsonResponse({"code": 200, "data": list(histories)})
     if request.method == "POST":
@@ -688,6 +778,11 @@ def chat_history_list(request):
             messages = data.get("messages", [])
             if not isinstance(messages, list):
                 return JsonResponse({"code": 400, "msg": "invalid messages"})
+            scene = None
+            if data.get("scene_id"):
+                scene = ImageryScene.objects.filter(id=data.get("scene_id"), file_name=image_file).first()
+            if not scene:
+                scene = ImageryScene.objects.filter(file_name=image_file).first()
 
             latest = ChatHistory.objects.filter(image_file=image_file).order_by("-updated_at").first()
             if latest:
@@ -695,6 +790,7 @@ def chat_history_list(request):
             obj, created = ChatHistory.objects.update_or_create(
                 image_file=image_file,
                 defaults={
+                    "scene": scene,
                     "messages": messages,
                     "spatial_context": data.get("spatial_context", ""),
                     "bbox": data.get("bbox", None),
@@ -714,7 +810,9 @@ def chat_history_detail(request, history_id):
             return JsonResponse({"code": 200, "data": {
                 "id": obj.id, "image_file": obj.image_file,
                 "messages": obj.messages, "spatial_context": obj.spatial_context,
-                "bbox": obj.bbox, "created_at": obj.created_at.isoformat(),
+                "bbox": obj.bbox, "scene_id": obj.scene_id,
+                "scene": scene_payload(obj.scene) if obj.scene else None,
+                "created_at": obj.created_at.isoformat(),
             }})
         except ChatHistory.DoesNotExist:
             return JsonResponse({"code": 404, "msg": "not found"}, status=404)
@@ -730,12 +828,17 @@ def chat_history_detail(request, history_id):
 @csrf_exempt
 def generate_report(request):
     try:
-        data = json.loads(request.body)
+        data = _json_body(request)
         file_name = data.get("file_name", "")
         title = data.get("title", "遥感分析报告")
         messages = data.get("messages", [])
         spatial_ctx = data.get("spatial_context", "")
         bbox = data.get("bbox", {})
+        scene = None
+        if data.get("scene_id"):
+            scene = ImageryScene.objects.filter(id=data.get("scene_id")).first()
+        if not scene and file_name:
+            scene = ImageryScene.objects.filter(file_name=os.path.basename(file_name)).first()
 
         from docx import Document
         from docx.shared import Inches, Pt, RGBColor, Cm
@@ -788,6 +891,23 @@ def generate_report(request):
         elif spatial_ctx:
             doc.add_heading("空间数据", level=2)
             doc.add_paragraph(spatial_ctx)
+
+        if scene:
+            doc.add_heading("影像数据说明", level=2)
+            acquired = scene.acquired_at.strftime("%Y-%m-%d %H:%M") if scene.acquired_at else "未知"
+            published = scene.published_at.strftime("%Y-%m-%d %H:%M") if scene.published_at else "未知"
+            cloud = f"{scene.cloud_percent}%" if scene.cloud_percent is not None else "未知"
+            doc.add_paragraph(
+                f"数据源：{scene.source_label}\n"
+                f"拍摄时间：{acquired}\n"
+                f"发布时间：{published}\n"
+                f"空间分辨率：约 {scene.gsd_m} m/像素\n"
+                f"云量：{cloud}\n"
+                f"处理级别：{scene.processing_level}\n"
+                f"授权类型：{scene.license_type}\n"
+                f"决策等级：{scene.decision_grade}\n"
+                f"数据限制：{scene.limitations}"
+            )
 
         if file_name:
             img_path = safe_media_path(SAVE_DIR, file_name, ('.jpg', '.jpeg', '.png'))

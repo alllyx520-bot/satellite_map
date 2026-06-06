@@ -68,7 +68,7 @@
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     
-    <script src="/static/browser.js?v=7"></script>
+    <script src="/static/browser.js?v=8"></script>
 <div id="chat-modal" style="display: none;">
         <div class="chat-modal-content">
             <div class="chat-modal-header">
@@ -85,7 +85,10 @@
             </div>
             <div class="chat-modal-body">
                 <div class="chat-modal-left">
-                    <img id="chat-modal-img" src="" alt="卫星图放大版" draggable="false">
+                    <div class="imagery-preview-wrap">
+                        <img id="chat-modal-img" src="" alt="卫星图放大版" draggable="false">
+                    </div>
+                    <div id="imagery-scene-panel" class="imagery-scene-panel" hidden></div>
                 </div>
                 <div class="chat-modal-right">
                     <div id="chat-message-box">

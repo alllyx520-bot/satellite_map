@@ -4,6 +4,8 @@
     python manage.py test map_api
 """
 from django.test import SimpleTestCase, TestCase
+from django.conf import settings
+import os
 
 from map_api.utils.smart_query_analyzer import analyze_query, adaptive_resolution, _build_clip_query
 from map_api.utils.active_perception import (
@@ -11,7 +13,8 @@ from map_api.utils.active_perception import (
     map_bbox_to_original
 )
 from map_api.utils.get_satellite_image import haversine_distance
-from map_api.models import ChatHistory, DownloadTask
+from map_api.models import ChatHistory, DownloadTask, ImageryScene
+from map_api.imagery_sources.mapbox import MapboxProvider
 from map_api.views import ANALYSIS_MODES, compute_image_plan, normalize_bbox, _download_progress
 
 
@@ -182,6 +185,14 @@ class AnalysisModeTests(SimpleTestCase):
         self.assertFalse(ANALYSIS_MODES["fast"]["active_perception"])
 
 
+class ImageryMetadataTests(SimpleTestCase):
+    def test_mapbox_provider_marks_scene_as_reference(self):
+        meta = MapboxProvider().metadata_for_bbox({"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4})
+        self.assertEqual(meta.source, "mapbox")
+        self.assertEqual(meta.decision_grade, "reference")
+        self.assertIn("不应作为单独行政决策", meta.limitations)
+
+
 class HistoryApiTests(TestCase):
     def test_rejects_compare_history(self):
         r = self.client.post(
@@ -193,12 +204,20 @@ class HistoryApiTests(TestCase):
         self.assertEqual(r.json()["code"], 400)
 
     def test_upserts_history_by_image_file(self):
-        payload = {"image_file": "sat_test.jpg", "messages": [{"role": "user", "content": "a"}]}
+        scene = ImageryScene.objects.create(
+            file_name="sat_test.jpg",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+        )
+        payload = {"image_file": "sat_test.jpg", "scene_id": scene.id, "messages": [{"role": "user", "content": "a"}]}
         r1 = self.client.post("/api/ai/history/", data=payload, content_type="application/json")
         r2 = self.client.post("/api/ai/history/", data=payload, content_type="application/json")
         self.assertEqual(r1.json()["code"], 200)
         self.assertEqual(r2.json()["code"], 200)
-        self.assertEqual(ChatHistory.objects.filter(image_file="sat_test.jpg").count(), 1)
+        obj = ChatHistory.objects.get(image_file="sat_test.jpg")
+        self.assertEqual(obj.scene_id, scene.id)
 
     def test_delete_history_without_csrf_token(self):
         obj = ChatHistory.objects.create(image_file="sat_delete.jpg", messages=[])
@@ -210,7 +229,15 @@ class HistoryApiTests(TestCase):
 class DownloadTaskTests(TestCase):
     def test_progress_falls_back_to_database(self):
         _download_progress.clear()
+        scene = ImageryScene.objects.create(
+            file_name="sat_db.jpg",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+        )
         DownloadTask.objects.create(
+            scene=scene,
             file_name="sat_db.jpg",
             status="done",
             total=2,
@@ -223,6 +250,7 @@ class DownloadTaskTests(TestCase):
         r = self.client.get("/api/satellite/progress/?file=sat_db.jpg")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["data"]["status"], "done")
+        self.assertEqual(r.json()["data"]["scene_id"], scene.id)
 
     def test_cleanup_removes_old_finished_progress_entries(self):
         _download_progress.clear()
@@ -230,3 +258,61 @@ class DownloadTaskTests(TestCase):
         r = self.client.post("/api/satellite/cleanup/", data={"days": 0}, content_type="application/json")
         self.assertEqual(r.status_code, 200)
         self.assertNotIn("sat_old.jpg", _download_progress)
+
+
+class ImagerySceneApiTests(TestCase):
+    def test_scene_detail_returns_metadata(self):
+        scene = ImageryScene.objects.create(
+            file_name="sat_scene.jpg",
+            source_label="Mapbox Satellite Basemap",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+            limitations="仅作参考",
+        )
+        r = self.client.get(f"/api/imagery/scenes/{scene.id}/")
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["decision_grade"], "reference")
+        self.assertEqual(data["limitations"], "仅作参考")
+
+    def test_scene_list_returns_scenes(self):
+        ImageryScene.objects.create(file_name="sat_list.jpg", min_lng=1, min_lat=2, max_lng=3, max_lat=4)
+        r = self.client.get("/api/imagery/scenes/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.json()["data"]), 1)
+
+
+class ReportSceneTests(TestCase):
+    def test_report_includes_imagery_data_section(self):
+        from PIL import Image
+        from docx import Document
+
+        save_dir = os.path.join(settings.MEDIA_ROOT, "satellite_imgs")
+        os.makedirs(save_dir, exist_ok=True)
+        img_path = os.path.join(save_dir, "sat_report_scene.jpg")
+        Image.new("RGB", (32, 32), (80, 120, 160)).save(img_path, "JPEG")
+        scene = ImageryScene.objects.create(
+            file_name="sat_report_scene.jpg",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+            gsd_m=1.2,
+            limitations="测试限制说明",
+        )
+        r = self.client.post(
+            "/api/report/generate/",
+            data={"file_name": scene.file_name, "scene_id": scene.id, "messages": []},
+            content_type="application/json",
+        )
+        self.assertEqual(r.status_code, 200)
+        report_name = r.json()["data"]["file_name"]
+        report_path = os.path.join(settings.MEDIA_ROOT, report_name)
+        doc = Document(report_path)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        self.assertIn("影像数据说明", text)
+        self.assertIn("测试限制说明", text)
+        os.remove(img_path)
+        os.remove(report_path)
