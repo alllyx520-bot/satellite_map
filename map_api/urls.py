@@ -6,6 +6,7 @@ urlpatterns = [
     path('satellite/show-img/', views.show_satellite_image, name='show_satellite_image'),
     path('satellite/progress/', views.get_progress, name='get_progress'),
     path('satellite/cleanup/', views.cleanup_cache, name='cleanup_cache'),
+    path('imagery/search/', views.imagery_search, name='imagery_search'),
     path('imagery/scenes/', views.imagery_scene_list, name='imagery_scene_list'),
     path('imagery/scenes/<int:scene_id>/', views.imagery_scene_detail, name='imagery_scene_detail'),
     path('ai/query-region/', views.ai_query_region, name='ai_query_region'),

@@ -6,6 +6,7 @@
 from django.test import SimpleTestCase, TestCase
 from django.conf import settings
 import os
+from unittest.mock import patch
 
 from map_api.utils.smart_query_analyzer import analyze_query, adaptive_resolution, _build_clip_query
 from map_api.utils.active_perception import (
@@ -15,6 +16,7 @@ from map_api.utils.active_perception import (
 from map_api.utils.get_satellite_image import haversine_distance
 from map_api.models import ChatHistory, DownloadTask, ImageryScene
 from map_api.imagery_sources.mapbox import MapboxProvider
+from map_api.imagery_sources.earth_search import EarthSearchProvider, score_candidate
 from map_api.views import ANALYSIS_MODES, compute_image_plan, normalize_bbox, _download_progress
 
 
@@ -192,6 +194,49 @@ class ImageryMetadataTests(SimpleTestCase):
         self.assertEqual(meta.decision_grade, "reference")
         self.assertIn("不应作为单独行政决策", meta.limitations)
 
+    def test_earth_search_item_becomes_traceable_candidate(self):
+        item = {
+            "id": "S2A_TEST",
+            "collection": "sentinel-2-l2a",
+            "stac_version": "1.0.0",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-06-01T03:17:00Z",
+                "updated": "2026-06-01T08:00:00Z",
+                "eo:cloud_cover": 8.5,
+                "platform": "sentinel-2a",
+                "constellation": "sentinel-2",
+                "instruments": ["msi"],
+                "s2:product_uri": "S2A_PRODUCT.SAFE",
+                "s2:processing_baseline": "05.12",
+            },
+            "assets": {
+                "visual": {
+                    "href": "https://example.com/visual.tif",
+                    "type": "image/tiff",
+                    "gsd": 10,
+                    "roles": ["visual"],
+                },
+                "thumbnail": {"href": "https://example.com/thumb.jpg", "type": "image/jpeg"},
+            },
+            "links": [{"rel": "license", "href": "https://example.com/license"}],
+        }
+        candidate = EarthSearchProvider().candidate_from_item(item)
+        data = candidate.as_dict()
+        self.assertEqual(data["source"], "earth_search")
+        self.assertEqual(data["product_id"], "S2A_PRODUCT.SAFE")
+        self.assertEqual(data["cloud_percent"], 8.5)
+        self.assertEqual(data["gsd_m"], 10.0)
+        self.assertEqual(data["decision_grade"], "screening")
+        self.assertIn("visual", data["assets"])
+        self.assertIn("license", data["links"])
+
+    def test_candidate_score_penalizes_missing_metadata(self):
+        score, reasons = score_candidate(None, None, 30, False)
+        self.assertLess(score, 45)
+        self.assertIn("缺少明确拍摄时间", reasons)
+        self.assertIn("缺少云量指标", reasons)
+
 
 class HistoryApiTests(TestCase):
     def test_rejects_compare_history(self):
@@ -282,6 +327,38 @@ class ImagerySceneApiTests(TestCase):
         r = self.client.get("/api/imagery/scenes/")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(len(r.json()["data"]), 1)
+
+    def test_imagery_search_returns_candidates(self):
+        item = {
+            "id": "S2A_TEST",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-06-01T03:17:00Z",
+                "eo:cloud_cover": 8.5,
+                "s2:product_uri": "S2A_PRODUCT.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/visual.tif", "gsd": 10}},
+        }
+        candidate = EarthSearchProvider().candidate_from_item(item)
+        with patch("map_api.views.EarthSearchProvider.search", return_value=[candidate]) as mocked:
+            r = self.client.get(
+                "/api/imagery/search/?min_lng=1&min_lat=2&max_lng=3&max_lat=4&limit=5&max_cloud=20"
+            )
+        self.assertEqual(r.status_code, 200)
+        mocked.assert_called_once()
+        kwargs = mocked.call_args.kwargs
+        self.assertEqual(kwargs["limit"], 5)
+        self.assertEqual(kwargs["max_cloud"], 20.0)
+        data = r.json()["data"]
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["candidates"][0]["item_id"], "S2A_TEST")
+
+    def test_imagery_search_rejects_unknown_provider(self):
+        r = self.client.get(
+            "/api/imagery/search/?provider=x&min_lng=1&min_lat=2&max_lng=3&max_lat=4"
+        )
+        self.assertEqual(r.status_code, 400)
 
 
 class ReportSceneTests(TestCase):

@@ -26,6 +26,7 @@ from .utils.active_perception import (
 )
 from .models import ChatHistory, DownloadTask, ImageryScene
 from .imagery_sources.mapbox import MapboxProvider
+from .imagery_sources.earth_search import EarthSearchProvider
 
 # 规范化保存目录
 SAVE_DIR = os.path.join(settings.MEDIA_ROOT, 'satellite_imgs')
@@ -755,6 +756,46 @@ def imagery_scene_detail(request, scene_id):
         return JsonResponse({"code": 200, "data": scene_payload(scene)})
     except ImageryScene.DoesNotExist:
         return JsonResponse({"code": 404, "msg": "not found"}, status=404)
+
+
+def imagery_search(request):
+    try:
+        min_lng, min_lat, max_lng, max_lat = normalize_bbox(request.GET)
+        limit = min(20, max(1, int(request.GET.get("limit", 10))))
+        max_cloud = request.GET.get("max_cloud", 30)
+        max_cloud = None if max_cloud == "" else float(max_cloud)
+        provider_name = request.GET.get("provider", "earth_search")
+        collection = request.GET.get("collection", "sentinel-2-l2a")
+        start_date = request.GET.get("start")
+        end_date = request.GET.get("end")
+
+        if provider_name != "earth_search":
+            return JsonResponse({"code": 400, "msg": "unsupported provider"}, status=400)
+
+        bbox = {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat}
+        candidates = EarthSearchProvider().search(
+            bbox,
+            start_date=start_date,
+            end_date=end_date,
+            max_cloud=max_cloud,
+            limit=limit,
+            collection=collection,
+        )
+        return JsonResponse({
+            "code": 200,
+            "data": {
+                "provider": provider_name,
+                "collection": collection,
+                "bbox": bbox,
+                "count": len(candidates),
+                "candidates": [candidate.as_dict() for candidate in candidates],
+            }
+        })
+    except requests.RequestException as e:
+        logger.warning("imagery search provider failed: %s", e)
+        return JsonResponse({"code": 502, "msg": "影像源查询失败，请稍后重试"}, status=502)
+    except Exception as e:
+        return JsonResponse({"code": 400, "msg": str(e)}, status=400)
 
 
 # ----------------------
