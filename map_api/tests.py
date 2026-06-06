@@ -3,11 +3,13 @@
 只覆盖不依赖数据库/网络/外部 API 的纯逻辑函数,可直接运行:
     python manage.py test map_api
 """
-from django.test import SimpleTestCase, TestCase
+from django.test import Client, SimpleTestCase, TestCase
 from django.conf import settings
+from django.utils import timezone
 import os
 import json
 import tempfile
+from datetime import timedelta
 from unittest.mock import patch
 
 from map_api.utils.smart_query_analyzer import analyze_query, adaptive_resolution, _build_clip_query
@@ -20,7 +22,10 @@ from map_api.utils.analysis_strategy import build_analysis_strategy
 from map_api.models import ChatHistory, DownloadTask, ImageryScene
 from map_api.imagery_sources.mapbox import MapboxProvider
 from map_api.imagery_sources.earth_search import EarthSearchProvider, score_candidate
-from map_api.views import ANALYSIS_MODES, compute_image_plan, normalize_bbox, _download_progress
+from map_api.views import (
+    ANALYSIS_MODES, compute_image_plan, normalize_bbox,
+    imagery_quality_payload, analysis_confidence_payload, source_recommendation_payload, _download_progress
+)
 from satellite_map.env import load_project_env
 
 
@@ -349,6 +354,83 @@ class ImageryMetadataTests(SimpleTestCase):
                     256,
                 )
 
+    def test_sentinel_scene_quality_summarizes_fit_and_limits(self):
+        class Scene:
+            source = "sentinel2"
+            source_label = "Sentinel-2 L2A"
+            acquired_at = timezone.now() - timedelta(days=3)
+            fetched_at = timezone.now()
+            gsd_m = 10
+            cloud_percent = 8.5
+            decision_grade = "screening"
+
+        quality = imagery_quality_payload(Scene())
+        self.assertEqual(quality["source"], "sentinel2")
+        self.assertIn("近7天内", quality["timeliness"])
+        self.assertIn("低云量", quality["cloud_quality"])
+        self.assertIn("宏观地类", quality["best_for"])
+        self.assertIn("不适合车辆", "；".join(quality["cautions"]))
+
+    def test_sentinel_confidence_depends_on_task_granularity(self):
+        class Scene:
+            source = "sentinel2"
+            source_label = "Sentinel-2 L2A"
+            acquired_at = timezone.now() - timedelta(days=3)
+            fetched_at = timezone.now()
+            gsd_m = 10
+            cloud_percent = 8.5
+            decision_grade = "screening"
+
+        quality = imagery_quality_payload(Scene())
+        macro_strategy = build_analysis_strategy("综合分析这片区域的土地利用", scene=Scene())
+        macro_confidence = analysis_confidence_payload(macro_strategy, quality)
+        self.assertEqual(macro_confidence["level"], "decision_support")
+        self.assertEqual(macro_confidence["label"], "决策辅助级")
+
+        detail_strategy = build_analysis_strategy("数一下停车场有多少辆车", scene=Scene())
+        detail_confidence = analysis_confidence_payload(detail_strategy, quality)
+        self.assertEqual(detail_confidence["level"], "low")
+        self.assertIn("更高分辨率影像", "；".join(detail_confidence["required_checks"]))
+
+    def test_source_recommendation_guides_source_choice(self):
+        class MapboxScene:
+            source = "mapbox"
+            source_label = "Mapbox"
+            acquired_at = None
+            fetched_at = timezone.now()
+            gsd_m = 1.2
+            cloud_percent = None
+            decision_grade = "reference"
+
+        detail_strategy = build_analysis_strategy("数一下停车场有多少辆车", scene=MapboxScene())
+        detail_rec = source_recommendation_payload(
+            detail_strategy,
+            imagery_quality_payload(MapboxScene()),
+            "数一下停车场有多少辆车",
+        )
+        self.assertEqual(detail_rec["recommended_source"], "mapbox")
+        self.assertEqual(detail_rec["alignment"], "matched")
+
+        water_strategy = build_analysis_strategy("分析这片区域的水体和岸线", scene=MapboxScene())
+        water_rec = source_recommendation_payload(
+            water_strategy,
+            imagery_quality_payload(MapboxScene()),
+            "分析这片区域的水体和岸线",
+        )
+        self.assertEqual(water_rec["recommended_source"], "sentinel2")
+        self.assertEqual(water_rec["alignment"], "switch_recommended")
+        self.assertIn("近期公开影像", water_rec["action"])
+
+        recent_strategy = build_analysis_strategy("分析最近是否有新增建设用地", scene=MapboxScene())
+        recent_rec = source_recommendation_payload(
+            recent_strategy,
+            imagery_quality_payload(MapboxScene()),
+            "分析最近是否有新增建设用地",
+        )
+        self.assertEqual(recent_rec["recommended_source"], "sentinel2")
+        self.assertEqual(recent_rec["alignment"], "switch_recommended")
+        self.assertIn("近期公开影像", recent_rec["action"])
+
 
 class AnalysisStrategyTests(SimpleTestCase):
     def test_sentinel_detail_question_disables_active_perception(self):
@@ -453,7 +535,14 @@ class AIQueryApiTests(TestCase):
         self.assertEqual(data["analysis_method"]["model"], "qwen3-vl-flash")
         self.assertEqual(data["analysis_method"]["task_label"], "水体与岸线解译")
         self.assertFalse(data["analysis_method"]["active_perception"])
+        self.assertIn("高清底图", data["analysis_method"]["imagery_quality"]["summary"])
+        self.assertIn("时效性证据", "；".join(data["analysis_method"]["imagery_quality"]["cautions"]))
+        self.assertEqual(data["analysis_method"]["confidence"]["level"], "reference")
+        self.assertIn("视觉参考级", data["analysis_method"]["confidence"]["label"])
+        self.assertEqual(data["analysis_method"]["source_recommendation"]["recommended_source"], "sentinel2")
+        self.assertEqual(data["analysis_method"]["source_recommendation"]["alignment"], "switch_recommended")
         self.assertEqual(data["scene"]["id"], scene.id)
+        self.assertIn("quality", data["scene"])
 
     def test_ai_query_unknown_mode_reports_precise_fallback(self):
         file_name = "sat_ai_mode_fallback.jpg"
@@ -563,6 +652,11 @@ class HistoryApiTests(TestCase):
                     "mode": "precise",
                     "model": "qwen3-vl-plus",
                     "task_label": "水体与岸线解译",
+                    "source_recommendation": {
+                        "recommended_source": "sentinel2",
+                        "recommended_label": "建议使用近期公开影像",
+                        "alignment": "switch_recommended",
+                    },
                 },
             }],
         }
@@ -572,6 +666,8 @@ class HistoryApiTests(TestCase):
         method = detail.json()["data"]["messages"][0]["analysis_method"]
         self.assertEqual(method["model"], "qwen3-vl-plus")
         self.assertEqual(method["task_label"], "水体与岸线解译")
+        self.assertEqual(method["source_recommendation"]["recommended_source"], "sentinel2")
+        self.assertEqual(method["source_recommendation"]["alignment"], "switch_recommended")
 
     def test_history_list_hides_missing_image_records(self):
         self._touch_history_image("sat_history_ok.jpg")
@@ -766,6 +862,44 @@ class ImagerySceneApiTests(TestCase):
         )
         self.assertEqual(r.status_code, 400)
 
+    def test_imagery_recommend_source_for_detail_and_macro_questions(self):
+        detail = self.client.get(
+            "/api/imagery/recommend-source/",
+            {"question": "数一下停车场有多少辆车", "current_source": "sentinel2"},
+        )
+        self.assertEqual(detail.status_code, 200)
+        detail_rec = detail.json()["data"]["recommendation"]
+        self.assertEqual(detail_rec["recommended_source"], "mapbox")
+        self.assertEqual(detail_rec["alignment"], "switch_recommended")
+
+        macro = self.client.post(
+            "/api/imagery/recommend-source/",
+            data={"question": "分析这片区域的水体和岸线", "current_source": "mapbox"},
+            content_type="application/json",
+        )
+        self.assertEqual(macro.status_code, 200)
+        macro_rec = macro.json()["data"]["recommendation"]
+        self.assertEqual(macro_rec["recommended_source"], "sentinel2")
+        self.assertEqual(macro_rec["alignment"], "switch_recommended")
+        self.assertIn("水体", macro_rec["reason"])
+
+    def test_imagery_recommend_source_validates_question_and_method(self):
+        empty = self.client.get("/api/imagery/recommend-source/")
+        self.assertEqual(empty.status_code, 400)
+
+        unsupported = self.client.delete("/api/imagery/recommend-source/")
+        self.assertEqual(unsupported.status_code, 405)
+
+    def test_imagery_recommend_source_post_does_not_require_csrf(self):
+        client = Client(enforce_csrf_checks=True)
+        r = client.post(
+            "/api/imagery/recommend-source/",
+            data={"question": "分析这片区域的水体和岸线", "current_source": "mapbox"},
+            content_type="application/json",
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["data"]["recommendation"]["recommended_source"], "sentinel2")
+
     def test_sentinel_image_endpoint_creates_scene_and_file(self):
         item = {
             "id": "S2A_TEST",
@@ -923,6 +1057,9 @@ class ReportSceneTests(TestCase):
         text = "\n".join(p.text for p in doc.paragraphs)
         self.assertIn("影像数据说明", text)
         self.assertIn("测试限制说明", text)
+        self.assertIn("质量摘要", text)
+        self.assertIn("Mapbox 高清底图", text)
+        self.assertIn("不能作为可复核的时效性证据", text)
         os.remove(img_path)
         os.remove(report_path)
 
@@ -954,6 +1091,25 @@ class ReportSceneTests(TestCase):
                 "strengths": ["高清视觉底图"],
                 "limits": ["底图拍摄时间不透明"],
                 "method_notes": ["问题偏细节，建议启用主动感知进行局部放大"],
+                "imagery_quality": {
+                    "summary": "Mapbox 高清底图，视觉细节较强",
+                    "best_for": "适合建筑形态、道路结构和空间格局分析",
+                    "cautions": ["不能作为可复核的时效性证据"],
+                },
+                "confidence": {
+                    "level": "reference",
+                    "label": "视觉参考级",
+                    "basis": ["底图视觉细节较强，适合形态和空间格局判断"],
+                    "required_checks": ["涉及时效性或行政决策时，需使用可追溯公开影像或现场资料复核"],
+                },
+                "source_recommendation": {
+                    "recommended_source": "mapbox",
+                    "recommended_label": "建议使用高清底图",
+                    "current_source": "mapbox",
+                    "alignment": "matched",
+                    "reason": "问题包含建筑、道路、设施或计数等细节判读需求，需要更高视觉细节。",
+                    "action": "当前图像源与任务匹配。",
+                },
             },
         }]
         r = self.client.post(
@@ -970,6 +1126,13 @@ class ReportSceneTests(TestCase):
         self.assertIn("qwen3-vl-plus", text)
         self.assertIn("农业耕地与作物长势解译", text)
         self.assertIn("底图拍摄时间不透明", text)
+        self.assertIn("影像质量摘要", text)
+        self.assertIn("适合建筑形态", text)
+        self.assertIn("结论可信度", text)
+        self.assertIn("视觉参考级", text)
+        self.assertIn("复核要求", text)
+        self.assertIn("图像源建议", text)
+        self.assertIn("建议使用高清底图", text)
         os.remove(img_path)
         os.remove(report_path)
 

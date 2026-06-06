@@ -896,6 +896,24 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
+    async function checkSourceRecommendation(question, currentSource) {
+        try {
+            const res = await fetch('/api/imagery/recommend-source/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question, current_source: currentSource })
+            });
+            const result = await res.json();
+            const rec = result.data?.recommendation;
+            if (result.code === 200 && rec?.alignment === 'switch_recommended') {
+                showToast(`${rec.recommended_label}：${rec.action}`, 'info');
+            }
+            return rec || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
     let isQuerying = false;
     sendBtn.onclick = async () => {
         if (isQuerying) return;          // 防止分析期间重复提交
@@ -920,9 +938,14 @@ document.addEventListener('DOMContentLoaded', () => {
         chatBox.scrollTop = chatBox.scrollHeight;
 
         try {
+            let sourceRecommendation = null;
+            if (!isCompare) {
+                const currentSource = data.scene?.source || getImagerySource();
+                sourceRecommendation = await checkSourceRecommendation(text, currentSource);
+            }
             const body = isCompare
                 ? { file_names: data.compareFiles, question: text, history: data.history.slice(0, -1), model: analysisMode.model, mode: analysisMode.mode }
-                : { file_name: currentActiveImage, scene_id: data.sceneId, question: text, history: data.history.slice(0, -1), spatial_context: currentSpatialCtx, model: analysisMode.model, mode: analysisMode.mode, active_perception: analysisMode.activePerception, gsd: data.gsd, bbox: data.bbox };
+                : { file_name: currentActiveImage, scene_id: data.sceneId, question: text, history: data.history.slice(0, -1), spatial_context: currentSpatialCtx, model: analysisMode.model, mode: analysisMode.mode, active_perception: analysisMode.activePerception, gsd: data.gsd, bbox: data.bbox, source_recommendation: sourceRecommendation };
             const res = await fetch("/api/ai/query-region/", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },

@@ -239,7 +239,234 @@ def compute_image_plan(min_lng, min_lat, max_lng, max_lat, resolution):
     }
 
 
+def _scene_source_key(scene):
+    source = (getattr(scene, "source", "") or "").lower()
+    if source in ("sentinel2", "earth_search"):
+        return "sentinel2"
+    return source or "unknown"
+
+
+def _days_since(value):
+    if not value:
+        return None
+    if timezone.is_naive(value):
+        value = timezone.make_aware(value, timezone.get_current_timezone())
+    return max(0, (timezone.now() - value).days)
+
+
+def _grade_label(grade):
+    return {
+        "reference": "参考级",
+        "screening": "筛查级",
+        "decision_support": "决策辅助级",
+        "evidence": "证据级",
+    }.get(grade or "", grade or "未知")
+
+
+def _timeliness_label(days):
+    if days is None:
+        return "时相未知"
+    if days <= 7:
+        return f"近7天内（约 {days} 天前）"
+    if days <= 30:
+        return f"近30天内（约 {days} 天前）"
+    return f"历史影像（约 {days} 天前）"
+
+
+def _cloud_label(cloud_percent):
+    if cloud_percent is None:
+        return "云量未知"
+    if cloud_percent <= 10:
+        return f"低云量（{cloud_percent:g}%）"
+    if cloud_percent <= 30:
+        return f"中等云量（{cloud_percent:g}%）"
+    return f"高云量（{cloud_percent:g}%）"
+
+
+def imagery_quality_payload(scene):
+    if not scene:
+        return None
+    source = _scene_source_key(scene)
+    acquired_days = _days_since(scene.acquired_at)
+    fetched_days = _days_since(scene.fetched_at)
+    gsd = scene.gsd_m or 0
+    cloud_label = _cloud_label(scene.cloud_percent)
+    grade_label = _grade_label(scene.decision_grade)
+    cautions = []
+
+    if source == "sentinel2":
+        summary = "近期公开 Sentinel-2 L2A 影像，具备拍摄时间、云量和产品号追溯能力。"
+        best_for = "适合宏观地类、水体、植被、农田和大范围建设区变化筛查。"
+        spatial_note = f"约 {gsd:g} m/像素，偏区域级解译。" if gsd else "约 10m 级公开影像，偏区域级解译。"
+        cautions.append("不适合车辆、小建筑、屋顶材质等细节目标判读。")
+        if scene.cloud_percent is None:
+            cautions.append("缺少云量指标，需降低结论确定性。")
+        elif scene.cloud_percent > 30:
+            cautions.append("云量偏高，需警惕云、雾或阴影干扰。")
+        if acquired_days is None:
+            cautions.append("缺少明确拍摄时间，不能说明时效性。")
+        elif acquired_days > 30:
+            cautions.append("拍摄时间超过30天，近期态势判断需谨慎。")
+    elif source == "mapbox":
+        summary = "Mapbox 高清底图，视觉细节较强，但时相和原始产品信息不可追溯。"
+        best_for = "适合建筑形态、道路结构、空间格局和地物纹理的视觉解译。"
+        spatial_note = (
+            f"渲染约 {gsd:g} m/像素；该数值用于当前截图尺度估算，不等同于原始传感器 GSD。"
+            if gsd else "底图原始空间分辨率不透明。"
+        )
+        cautions.extend([
+            "不能作为可复核的时效性证据。",
+            "不能直接支撑需要明确拍摄日期、云量或传感器产品号的结论。",
+        ])
+    else:
+        summary = "影像来源信息不足。"
+        best_for = "仅适合做一般视觉参考。"
+        spatial_note = f"约 {gsd:g} m/像素。" if gsd else "空间分辨率未知。"
+        cautions.append("需在结论中明确数据来源和质量不确定性。")
+
+    return {
+        "source": source,
+        "summary": summary,
+        "best_for": best_for,
+        "spatial_resolution": spatial_note,
+        "timeliness": _timeliness_label(acquired_days),
+        "acquired_days_ago": acquired_days,
+        "fetched_days_ago": fetched_days,
+        "cloud_quality": cloud_label,
+        "decision_grade": scene.decision_grade,
+        "decision_grade_label": grade_label,
+        "cautions": cautions,
+    }
+
+
+def analysis_confidence_payload(strategy=None, imagery_quality=None):
+    strategy = strategy or {}
+    imagery_quality = imagery_quality or {}
+    source = strategy.get("source") or imagery_quality.get("source") or "unknown"
+    query = strategy.get("query") or {}
+    task = strategy.get("task_profile") or {}
+    task_label = task.get("label", "综合遥感解译")
+    is_detail = bool(query.get("is_detail"))
+    cloud = imagery_quality.get("cloud_quality") or "云量未知"
+    acquired_days = imagery_quality.get("acquired_days_ago")
+    cautions = imagery_quality.get("cautions") or []
+    basis = []
+    required_checks = []
+
+    if source == "mapbox":
+        level = "reference"
+        label = "视觉参考级"
+        basis.extend([
+            "底图视觉细节较强，适合形态和空间格局判断",
+            "拍摄时间、云量和原始产品号不可追溯",
+        ])
+        required_checks.append("涉及时效性或行政决策时，需使用可追溯公开影像或现场资料复核")
+    elif source == "sentinel2":
+        basis.append(f"Sentinel-2 L2A 可追溯公开影像，{cloud}")
+        if acquired_days is not None:
+            basis.append(f"拍摄时间约 {acquired_days} 天前")
+        if is_detail:
+            level = "low"
+            label = "低置信细节判读"
+            required_checks.append("细节目标需切换高清底图或更高分辨率影像复核")
+        elif acquired_days is not None and acquired_days <= 7 and "低云量" in cloud:
+            level = "decision_support"
+            label = "决策辅助级"
+            required_checks.append("可作为区域筛查和辅助判断依据，正式结论仍建议结合多时相或地面资料")
+        else:
+            level = "screening"
+            label = "筛查级"
+            required_checks.append("适合发现宏观线索，需结合多时相影像或其他数据源复核")
+    else:
+        level = "unknown"
+        label = "来源不足"
+        basis.append("影像来源或质量信息不足")
+        required_checks.append("需补充数据来源、拍摄时间和空间分辨率后再形成结论")
+
+    if cautions:
+        basis.append("主要限制：" + "；".join(cautions[:2]))
+
+    return {
+        "level": level,
+        "label": label,
+        "task_label": task_label,
+        "basis": basis,
+        "required_checks": required_checks,
+    }
+
+
+def analysis_confidence_text(confidence):
+    if not confidence:
+        return ""
+    lines = [
+        "## 结论可信度与证据层级",
+        f"证据层级：{confidence.get('label', '未知')}",
+        f"对应任务：{confidence.get('task_label', '综合遥感解译')}",
+    ]
+    basis = confidence.get("basis") or []
+    checks = confidence.get("required_checks") or []
+    if basis:
+        lines.append("判定依据：" + "；".join(basis))
+    if checks:
+        lines.append("复核要求：" + "；".join(checks))
+    return "\n".join(lines)
+
+
+def source_recommendation_payload(strategy=None, imagery_quality=None, question=""):
+    strategy = strategy or {}
+    imagery_quality = imagery_quality or {}
+    query = strategy.get("query") or {}
+    task = strategy.get("task_profile") or {}
+    source = strategy.get("source") or imagery_quality.get("source") or "unknown"
+    entities = set((query.get("entities") or {}).keys())
+    is_detail = bool(query.get("is_detail"))
+    task_key = task.get("task", "")
+    task_label = task.get("label", "综合遥感解译")
+    question_text = str(question or "")
+
+    time_keywords = ("近期", "最新", "现在", "当前", "变化", "变迁", "新增", "扩张", "退化", "灾情", "汛情")
+    needs_timeliness = any(word in question_text for word in time_keywords)
+    sentinel_macro_tasks = {"land_use", "water", "vegetation", "agriculture", "terrain_hazard"}
+
+    if is_detail or entities & {"building", "road", "infrastructure"}:
+        recommended_source = "mapbox"
+        label = "建议使用高清底图"
+        reason = "问题包含建筑、道路、设施或计数等细节判读需求，需要更高视觉细节。"
+    elif needs_timeliness or task_key in sentinel_macro_tasks:
+        recommended_source = "sentinel2"
+        label = "建议使用近期公开影像"
+        reason = "问题偏宏观地类、水体、生态农业、地形灾害或变化筛查，Sentinel-2 的拍摄时间和云量更可追溯。"
+    else:
+        recommended_source = source if source in ("mapbox", "sentinel2") else "mapbox"
+        label = "当前图像源可用于初步分析"
+        reason = "问题未表现出强时效或强细节偏好，可先按当前图像源进行初步判读。"
+
+    alignment = "matched" if source == recommended_source else "switch_recommended"
+    if source == "unknown":
+        alignment = "unknown"
+
+    if alignment == "matched":
+        action = "当前图像源与任务匹配。"
+    elif recommended_source == "sentinel2":
+        action = "建议切换到“近期公开影像”获取可追溯时相后再分析。"
+    elif recommended_source == "mapbox":
+        action = "建议切换到“高清底图”观察细节后再分析。"
+    else:
+        action = "建议先补充图像源信息。"
+
+    return {
+        "recommended_source": recommended_source,
+        "recommended_label": label,
+        "current_source": source,
+        "alignment": alignment,
+        "task_label": task_label,
+        "reason": reason,
+        "action": action,
+    }
+
+
 def scene_payload(scene):
+    quality = imagery_quality_payload(scene)
     return {
         "id": scene.id,
         "file_name": scene.file_name,
@@ -262,6 +489,7 @@ def scene_payload(scene):
         "license_type": scene.license_type,
         "decision_grade": scene.decision_grade,
         "limitations": scene.limitations,
+        "quality": quality,
         "metadata": scene.metadata,
     }
 
@@ -357,6 +585,17 @@ def imagery_context_text(scene):
         return ""
     acquired = scene.acquired_at.strftime("%Y-%m-%d %H:%M") if scene.acquired_at else "未知"
     cloud = f"{scene.cloud_percent}%" if scene.cloud_percent is not None else "未知"
+    quality = imagery_quality_payload(scene) or {}
+    quality_lines = ""
+    if quality:
+        quality_lines = (
+            f"质量摘要：{quality.get('summary', '')}\n"
+            f"时效性：{quality.get('timeliness', '')}\n"
+            f"云量质量：{quality.get('cloud_quality', '')}\n"
+            f"适合任务：{quality.get('best_for', '')}\n"
+            f"空间尺度：{quality.get('spatial_resolution', '')}\n"
+            f"使用提醒：{'；'.join(quality.get('cautions') or [])}\n"
+        )
     return (
         "## 影像元数据\n"
         f"数据源：{scene.source_label}\n"
@@ -366,13 +605,16 @@ def imagery_context_text(scene):
         f"处理级别：{scene.processing_level}\n"
         f"决策等级：{scene.decision_grade}\n"
         f"数据限制：{scene.limitations}\n"
+        f"{quality_lines}"
         "回答时必须基于上述数据限制说明不确定性，不得把参考级底图结论表述为已复核证据。"
     )
 
 
-def analysis_method_payload(mode, model_name, strategy, active_stages=1):
+def analysis_method_payload(mode, model_name, strategy, active_stages=1, imagery_quality=None, question=""):
     strategy = strategy or {}
     task = strategy.get("task_profile") or {}
+    confidence = analysis_confidence_payload(strategy, imagery_quality)
+    source_recommendation = source_recommendation_payload(strategy, imagery_quality, question)
     return {
         "mode": mode,
         "model": model_name,
@@ -384,6 +626,9 @@ def analysis_method_payload(mode, model_name, strategy, active_stages=1):
         "strengths": strategy.get("strengths") or [],
         "limits": strategy.get("limits") or [],
         "method_notes": strategy.get("method_notes") or [],
+        "imagery_quality": imagery_quality,
+        "confidence": confidence,
+        "source_recommendation": source_recommendation,
     }
 
 
@@ -767,6 +1012,7 @@ def ai_query_region(request):
         targets = []             # AI 定位到的目标(含 GSD 测量 + 经纬度),回传前端标点
         preprocess = None        # 单图/分块预处理结果(compare 路径为 None)
         strategy = None
+        imagery_quality = None
 
         # 多图对比
         if file_names and isinstance(file_names, list) and len(file_names) >= 2:
@@ -799,11 +1045,23 @@ def ai_query_region(request):
             spatial_ctx = data.get("spatial_context", "")
             requested_active = _as_bool(data.get("active_perception", mode_cfg["active_perception"]))
             strategy = build_analysis_strategy(question, scene=scene, gsd=gsd, requested_active=requested_active)
+            imagery_quality = imagery_quality_payload(scene) if scene else None
+            confidence = analysis_confidence_payload(strategy, imagery_quality)
+            source_recommendation = source_recommendation_payload(strategy, imagery_quality, question)
             context_bits = []
             context_bits.append(strategy["prompt"])
             scene_context = imagery_context_text(scene)
             if scene_context:
                 context_bits.append(scene_context)
+            confidence_context = analysis_confidence_text(confidence)
+            if confidence_context:
+                context_bits.append(confidence_context)
+            context_bits.append(
+                "## 图像源选择建议\n"
+                f"建议：{source_recommendation.get('recommended_label')}\n"
+                f"原因：{source_recommendation.get('reason')}\n"
+                f"当前状态：{source_recommendation.get('action')}"
+            )
             if gsd:
                 context_bits.append(f"GSD: {gsd} m/像素")
             if isinstance(geo_bbox, dict):
@@ -971,7 +1229,14 @@ def ai_query_region(request):
                 "targets": targets,
                 "scene": scene_payload(scene) if scene else None,
                 "analysis_strategy": strategy,
-                "analysis_method": analysis_method_payload(mode, model_name, strategy, active_stages),
+                "analysis_method": analysis_method_payload(
+                    mode,
+                    model_name,
+                    strategy,
+                    active_stages,
+                    imagery_quality,
+                    question,
+                ),
             }
         })
 
@@ -1147,6 +1412,41 @@ def imagery_search(request):
         return JsonResponse({"code": 400, "msg": str(e)}, status=400)
 
 
+@csrf_exempt
+def imagery_recommend_source(request):
+    if request.method not in ("GET", "POST"):
+        return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
+    try:
+        data = _json_body(request) if request.method == "POST" else request.GET
+        question = (data.get("question") or "").strip()
+        if not question:
+            return JsonResponse({"code": 400, "msg": "问题不能为空", "data": None}, status=400)
+        current_source = (data.get("current_source") or data.get("source") or "mapbox").strip().lower()
+        if current_source == "earth_search":
+            current_source = "sentinel2"
+        if current_source not in ("mapbox", "sentinel2"):
+            current_source = "unknown"
+
+        scene = type("Scene", (), {
+            "source": current_source,
+            "gsd_m": 10 if current_source == "sentinel2" else 1.2,
+        })()
+        strategy = build_analysis_strategy(question, scene=scene, requested_active=True)
+        recommendation = source_recommendation_payload(strategy, {"source": current_source}, question)
+        return JsonResponse({
+            "code": 200,
+            "data": {
+                "question": question,
+                "current_source": current_source,
+                "recommendation": recommendation,
+                "task": strategy.get("task_profile"),
+                "query": strategy.get("query"),
+            }
+        })
+    except Exception as e:
+        return JsonResponse({"code": 400, "msg": str(e), "data": None}, status=400)
+
+
 # ----------------------
 # 聊天历史 CRUD
 # ----------------------
@@ -1307,6 +1607,17 @@ def generate_report(request):
             acquired = scene.acquired_at.strftime("%Y-%m-%d %H:%M") if scene.acquired_at else "未知"
             published = scene.published_at.strftime("%Y-%m-%d %H:%M") if scene.published_at else "未知"
             cloud = f"{scene.cloud_percent}%" if scene.cloud_percent is not None else "未知"
+            quality = imagery_quality_payload(scene) or {}
+            quality_text = ""
+            if quality:
+                quality_text = (
+                    f"\n质量摘要：{quality.get('summary', '')}"
+                    f"\n时效性：{quality.get('timeliness', '')}"
+                    f"\n云量质量：{quality.get('cloud_quality', '')}"
+                    f"\n适合任务：{quality.get('best_for', '')}"
+                    f"\n空间尺度：{quality.get('spatial_resolution', '')}"
+                    f"\n使用提醒：{join_method_items(quality.get('cautions'))}"
+                )
             doc.add_paragraph(docx_safe_text(
                 f"数据源：{scene.source_label}\n"
                 f"拍摄时间：{acquired}\n"
@@ -1317,6 +1628,7 @@ def generate_report(request):
                 f"授权类型：{scene.license_type}\n"
                 f"决策等级：{scene.decision_grade}\n"
                 f"数据限制：{scene.limitations}"
+                f"{quality_text}"
             ))
 
         analysis_method = latest_analysis_method(messages)
@@ -1343,6 +1655,29 @@ def generate_report(request):
                 method_lines.append("判读边界：" + limits)
             if notes:
                 method_lines.append("方法提示：" + notes)
+            quality = analysis_method.get("imagery_quality") or {}
+            if quality:
+                method_lines.append("影像质量摘要：" + docx_safe_text(quality.get("summary", "")))
+                method_lines.append("适用任务：" + docx_safe_text(quality.get("best_for", "")))
+                cautions = join_method_items(quality.get("cautions"))
+                if cautions:
+                    method_lines.append("使用提醒：" + cautions)
+            confidence = analysis_method.get("confidence") or {}
+            if confidence:
+                method_lines.append("结论可信度：" + docx_safe_text(confidence.get("label", "未知")))
+                basis = join_method_items(confidence.get("basis"))
+                checks = join_method_items(confidence.get("required_checks"))
+                if basis:
+                    method_lines.append("可信度依据：" + basis)
+                if checks:
+                    method_lines.append("复核要求：" + checks)
+            source_recommendation = analysis_method.get("source_recommendation") or {}
+            if source_recommendation:
+                method_lines.append(
+                    "图像源建议：" + docx_safe_text(source_recommendation.get("recommended_label", "未知"))
+                )
+                method_lines.append("建议原因：" + docx_safe_text(source_recommendation.get("reason", "")))
+                method_lines.append("建议动作：" + docx_safe_text(source_recommendation.get("action", "")))
             doc.add_paragraph(docx_safe_text("\n".join(method_lines)))
 
         if file_name:
