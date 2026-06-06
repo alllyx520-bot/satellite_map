@@ -283,6 +283,19 @@ class AnalysisStrategyTests(SimpleTestCase):
         self.assertTrue(strategy["active_perception"])
         self.assertEqual(strategy["source"], "mapbox")
         self.assertIn("建议启用主动感知", strategy["prompt"])
+        self.assertEqual(strategy["task_profile"]["task"], "built_up")
+        self.assertIn("建设用地与城市形态解译", strategy["prompt"])
+
+    def test_water_question_gets_water_rubric(self):
+        strategy = build_analysis_strategy("分析这片区域的水体和岸线是否异常")
+        self.assertEqual(strategy["task_profile"]["task"], "water")
+        self.assertIn("水体与岸线解译", strategy["prompt"])
+        self.assertIn("岸线形态", strategy["prompt"])
+
+    def test_generic_question_gets_land_use_rubric(self):
+        strategy = build_analysis_strategy("全面分析这片区域")
+        self.assertEqual(strategy["task_profile"]["task"], "land_use")
+        self.assertIn("综合土地利用解译", strategy["prompt"])
 
 
 class HistoryApiTests(TestCase):
