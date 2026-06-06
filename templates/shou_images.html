@@ -15,7 +15,7 @@
 
     <script>
         async function getSat(){
-            let res = await fetch("http://127.0.0.1:8000/api/satellite/get-img/", {
+            let res = await fetch("/api/satellite/get-img/", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -28,8 +28,19 @@
             })
             let data = await res.json()
             if(data.code === 200){
-                alert("获取成功！")
-                document.getElementById("img").src = data.data.img_url
+                let fileName = data.data.file_name
+                let timer = setInterval(async () => {
+                    let pr = await fetch(`/api/satellite/progress/?file=${fileName}`)
+                    let pd = await pr.json()
+                    if(pd.code === 200 && pd.data.status === "done"){
+                        clearInterval(timer)
+                        alert("获取成功！")
+                        document.getElementById("img").src = `/api/satellite/show-img/?file=${fileName}&t=${Date.now()}`
+                    }else if(pd.code === 200 && pd.data.status === "error"){
+                        clearInterval(timer)
+                        alert("失败：下载出错")
+                    }
+                }, 500)
             }else{
                 alert("失败："+data.msg)
             }

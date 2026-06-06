@@ -4,6 +4,8 @@ from urllib3.util.retry import Retry
 import os
 import math
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 from io import BytesIO
 
@@ -12,9 +14,20 @@ CELL_MAX = 1280
 MAX_TOTAL = 4096
 
 _download_progress = {}
+MAX_PROGRESS_ENTRIES = 50
 
 def get_download_progress(file_name):
     return _download_progress.get(file_name)
+
+def prune_progress():
+    """限制进度字典大小,丢弃最早的已完成/出错条目,避免长期运行内存无限增长。"""
+    if len(_download_progress) <= MAX_PROGRESS_ENTRIES:
+        return
+    for k in list(_download_progress.keys()):
+        if len(_download_progress) <= MAX_PROGRESS_ENTRIES:
+            break
+        if _download_progress[k].get("status") in ("done", "error"):
+            _download_progress.pop(k, None)
 
 def haversine_distance(lon1, lat1, lon2, lat2):
     R = 6371000
@@ -51,15 +64,32 @@ def _fetch_tile(url, proxies, retries=5):
             continue
     raise Exception(f"tile fetch failed after {retries} attempts: {last_err}")
 
+def _notify(progress_callback, file_name, info):
+    if progress_callback:
+        progress_callback(file_name, info.copy())
+
+
+def _set_progress(file_name, info, progress_callback=None):
+    _download_progress[file_name] = info
+    _notify(progress_callback, file_name, info)
+
+
+def _update_progress(file_name, updates, progress_callback=None):
+    info = _download_progress.setdefault(file_name, {"total": 1, "done": 0, "status": "downloading"})
+    info.update(updates)
+    _notify(progress_callback, file_name, info)
+    return info
+
+
 def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_name="satellite_result.jpg",
-                          target_resolution=1024, ultra_hd=False):
+                          target_resolution=1024, ultra_hd=False, progress_callback=None):
     global _download_progress
     target_resolution = min(MAX_TOTAL, max(1, target_resolution))
 
     lon_diff = max_lon - min_lon
     lat_diff = max_lat - min_lat
     center_lat_rad = math.radians((min_lat + max_lat) / 2.0)
-    aspect_ratio = (lon_diff * math.cos(center_lat_rad)) / lat_diff
+    aspect_ratio = (lon_diff * math.cos(center_lat_rad)) / lat_diff if lat_diff else 1.0
 
     if aspect_ratio >= 1:
         total_w = target_resolution
@@ -78,16 +108,16 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
     if total_w <= CELL_MAX and total_h <= CELL_MAX:
         actual_w = total_w * 2 if ultra_hd else total_w
         actual_h = total_h * 2 if ultra_hd else total_h
-        _download_progress[file_name] = {"total": 1, "done": 0, "status": "downloading"}
+        _set_progress(file_name, {"total": 1, "done": 0, "failed": 0, "status": "downloading"}, progress_callback)
         url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{min_lon},{min_lat},{max_lon},{max_lat}]/{actual_w}x{actual_h}{retina}?access_token={MAPBOX_TOKEN}"
         try:
             img = _fetch_tile(url, proxies)
             img.save(full_save_path, 'JPEG', quality=95)
-            _download_progress[file_name] = {"total": 1, "done": 1, "status": "done"}
+            _set_progress(file_name, {"total": 1, "done": 1, "failed": 0, "status": "done"}, progress_callback)
             print(f"[Mapbox] ✅ {full_save_path}")
             return full_save_path
         except Exception as e:
-            _download_progress[file_name]["status"] = "error"
+            _update_progress(file_name, {"status": "error", "error": str(e)[:200]}, progress_callback)
             print(f"[Mapbox] ❌ {e}")
             return None
 
@@ -98,34 +128,57 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
     cell_h = math.ceil(total_h / rows)
 
     total_tiles = cols * rows
-    _download_progress[file_name] = {"total": total_tiles, "done": 0, "status": "downloading"}
+    _set_progress(file_name, {"total": total_tiles, "done": 0, "failed": 0, "status": "downloading"}, progress_callback)
+    progress_lock = threading.Lock()
 
     canvas = Image.new('RGB', (total_w, total_h))
+    failed_tiles = 0
 
-    for r in range(rows):
-        for c in range(cols):
-            c_min_lon = min_lon + c * (lon_diff / cols)
-            c_max_lon = min_lon + (c + 1) * (lon_diff / cols)
-            c_max_lat = max_lat - r * (lat_diff / rows)
-            c_min_lat = max_lat - (r + 1) * (lat_diff / rows)
+    def _fetch_one(r, c):
+        """抓单个格子,返回 (粘贴 x, 粘贴 y, tile 图)。失败用深灰占位,不让整图崩。"""
+        nonlocal failed_tiles
+        c_min_lon = min_lon + c * (lon_diff / cols)
+        c_max_lon = min_lon + (c + 1) * (lon_diff / cols)
+        c_max_lat = max_lat - r * (lat_diff / rows)
+        c_min_lat = max_lat - (r + 1) * (lat_diff / rows)
 
-            cw = cell_w if c < cols - 1 else total_w - c * cell_w
-            ch = cell_h if r < rows - 1 else total_h - r * cell_h
-            cw = max(1, cw); ch = max(1, ch)
+        cw = cell_w if c < cols - 1 else total_w - c * cell_w
+        ch = cell_h if r < rows - 1 else total_h - r * cell_h
+        cw = max(1, cw); ch = max(1, ch)
 
-            url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{c_min_lon},{c_min_lat},{c_max_lon},{c_max_lat}]/{cw}x{ch}{retina}?access_token={MAPBOX_TOKEN}"
-            try:
-                tile = _fetch_tile(url, proxies)
-                canvas.paste(tile, (c * cell_w, r * cell_h))
-                print(f"[Mapbox] tile ({r+1}/{rows},{c+1}/{cols}) OK")
-            except Exception as e:
-                print(f"[Mapbox] tile ({r+1}/{rows},{c+1}/{cols}) ❌ {e}")
-                fill = Image.new('RGB', (cw, ch), (40, 40, 40))
-                canvas.paste(fill, (c * cell_w, r * cell_h))
-            _download_progress[file_name]["done"] += 1
-            time.sleep(0.6)
+        url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{c_min_lon},{c_min_lat},{c_max_lon},{c_max_lat}]/{cw}x{ch}{retina}?access_token={MAPBOX_TOKEN}"
+        failed = False
+        try:
+            tile = _fetch_tile(url, proxies)
+            print(f"[Mapbox] tile ({r+1}/{rows},{c+1}/{cols}) OK")
+        except Exception as e:
+            print(f"[Mapbox] tile ({r+1}/{rows},{c+1}/{cols}) ❌ {e}")
+            failed = True
+            tile = Image.new('RGB', (cw, ch), (40, 40, 40))
+        with progress_lock:
+            if failed:
+                failed_tiles += 1
+            info = _download_progress[file_name]
+            _update_progress(
+                file_name,
+                {"done": info.get("done", 0) + 1, "failed": failed_tiles},
+                progress_callback,
+            )
+        return (c * cell_w, r * cell_h, tile)
 
-    _download_progress[file_name]["status"] = "done"
+    # 4 并发抓格子(_fetch_tile 自带重试/退避),粘贴在主线程顺序进行,避免 PIL 画布竞态
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_fetch_one, r, c) for r in range(rows) for c in range(cols)]
+        for fut in as_completed(futures):
+            px, py, tile = fut.result()
+            canvas.paste(tile, (px, py))
+
+    if failed_tiles == total_tiles:
+        _update_progress(file_name, {"status": "error", "failed": failed_tiles}, progress_callback)
+        print(f"[Mapbox] ❌ all tiles failed for {file_name}")
+        return None
+
+    _update_progress(file_name, {"status": "partial" if failed_tiles else "done", "failed": failed_tiles}, progress_callback)
     canvas.save(full_save_path, 'JPEG', quality=92)
     print(f"[Mapbox] ✅ stitched {total_w}x{total_h} → {full_save_path}")
     return full_save_path

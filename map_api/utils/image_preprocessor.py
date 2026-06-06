@@ -19,11 +19,18 @@ MAX_DIM_MAP = {
 }
 
 
-def smart_prepare_image(fp, max_dim=None):
+def smart_prepare_image(fp, max_dim=None, question=None):
     if not os.path.exists(fp):
         return None
 
-    effective_max = max_dim or MAX_DIM
+    from .smart_query_analyzer import adaptive_resolution
+
+    if question and max_dim:
+        effective_max = adaptive_resolution(question, max_dim)
+    elif question:
+        effective_max = adaptive_resolution(question, MAX_DIM)
+    else:
+        effective_max = max_dim or MAX_DIM
 
     img = Image.open(fp)
     if img.mode in ('RGBA', 'P'):
@@ -84,3 +91,39 @@ def smart_prepare_image(fp, max_dim=None):
             results.append(tile_path)
 
     return {"tiles": results, "grid": (cols, rows), "orig_w": orig_w, "orig_h": orig_h, "eff_w": TILE_SIZE, "eff_h": TILE_SIZE}
+
+
+def smart_prepare_image_v2(fp, max_dim=None, question=None):
+    preprocess = smart_prepare_image(fp, max_dim=max_dim, question=question)
+    if preprocess is None:
+        return None
+
+    if "single" in preprocess or not question:
+        return preprocess
+
+    tiles = preprocess["tiles"]
+    grid = preprocess["grid"]
+
+    if len(tiles) <= 2:
+        return preprocess
+
+    try:
+        from .smart_query_analyzer import rank_tiles, analyze_query
+
+        selected, analysis = rank_tiles(
+            tiles[1:], question,
+            tile_cols=grid[0], tile_rows=grid[1],
+            top_k=min(6, len(tiles) - 1)
+        )
+
+        if len(selected) < len(tiles) - 1:
+            new_tiles = [tiles[0]] + selected
+            preprocess["tiles"] = new_tiles
+            preprocess["_smart_select"] = True
+            preprocess["_selected_count"] = len(selected)
+            preprocess["_total_tiles"] = len(tiles) - 1
+            preprocess["_query_analysis"] = analysis
+    except ImportError:
+        pass
+
+    return preprocess

@@ -6,7 +6,8 @@
     <title>SatelliteSense · 遥感分析</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     
-    <link rel="stylesheet" href="/static/browser.css?v=6">
+    <link rel="stylesheet" href="/static/browser.css?v=7">
+
 
 
 
@@ -67,17 +68,15 @@
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     
-    <script src="/static/browser.js?v=6"></script>
+    <script src="/static/browser.js?v=7"></script>
 <div id="chat-modal" style="display: none;">
         <div class="chat-modal-content">
             <div class="chat-modal-header">
                 <h3>🛰️ SatelliteSense <span id="chat-modal-id"></span></h3>
                 <div>
                     <select id="model-select" style="background:rgba(18,18,20,0.85);color:rgba(255,255,255,0.65);border:0.5px solid rgba(255,255,255,0.08);padding:5px 8px;border-radius:6px;cursor:pointer;font-size:11px;margin-right:6px;color-scheme:dark;">
-                        <option value="qwen3-vl-plus" selected>Qwen3-VL-Plus</option>
-                        <option value="qwen3.6-plus">Qwen3.6-Plus</option>
-                        <option value="qwen3.5-plus">Qwen3.5-Plus</option>
-                        <option value="qwen3-vl-flash">Qwen3-VL-Flash</option>
+                        <option value="precise" selected>精准模式 · Qwen3-VL-Plus</option>
+                        <option value="fast">快速模式 · Qwen3-VL-Flash</option>
                     </select>
                     <button id="report-btn" style="background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.7);border:0.5px solid rgba(255,255,255,0.1);padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;margin-right:6px;transition:all 0.2s;">报告</button>
                     <button id="zoom-btn" style="background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.7);border:0.5px solid rgba(255,255,255,0.1);padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;margin-right:8px;transition:all 0.2s;">🔍 放大</button>

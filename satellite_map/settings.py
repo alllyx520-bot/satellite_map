@@ -16,18 +16,23 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')  # 卫星图保存的本地绝对路径
 MEDIA_URL = '/media/'  # 前端访问图片的URL前缀
+LOG_DIR = os.path.join(MEDIA_ROOT, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = "django-insecure-878c__a!#-_u5=(j8ipa6))!h9ss&6$og-$qz$(875h$s=63j)"
+SECRET_KEY = os.environ.get(
+    "DJANGO_SECRET_KEY",
+    "django-insecure-878c__a!#-_u5=(j8ipa6))!h9ss&6$og-$qz$(875h$s=63j)",
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() in ("1", "true", "yes", "on")
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",") if h.strip()]
 
 
 # Application definition
@@ -54,7 +59,7 @@ MIDDLEWARE = [
 ]
 
 # 允许所有域名跨域（开发环境，生产环境可指定前端域名）
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = os.environ.get("CORS_ALLOW_ALL_ORIGINS", "true").lower() in ("1", "true", "yes", "on")
 ROOT_URLCONF = "satellite_map.urls"
 
 TEMPLATES = [
@@ -129,3 +134,39 @@ STATICFILES_DIRS = [
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        },
+    },
+    "handlers": {
+        "app_file": {
+            "class": "logging.FileHandler",
+            "filename": os.path.join(LOG_DIR, "app.log"),
+            "encoding": "utf-8",
+            "formatter": "default",
+        },
+        "ai_file": {
+            "class": "logging.FileHandler",
+            "filename": os.path.join(LOG_DIR, "ai_calls.log"),
+            "encoding": "utf-8",
+            "formatter": "default",
+        },
+    },
+    "loggers": {
+        "map_api": {
+            "handlers": ["app_file"],
+            "level": "INFO",
+            "propagate": True,
+        },
+        "map_api.ai": {
+            "handlers": ["ai_file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}

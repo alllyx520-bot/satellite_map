@@ -356,6 +356,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const delBtn = div.querySelector('.delete-btn');
         delBtn.addEventListener('click', (e) => {
             e.stopPropagation();
+            if (div._pollTimer) { clearInterval(div._pollTimer); div._pollTimer = null; }
             if (div._mapRect) map.removeLayer(div._mapRect);
             const img = div.querySelector('.preview-img');
             if (img && img.dataset.filename && chatMemories[img.dataset.filename]) {
@@ -386,6 +387,92 @@ document.addEventListener('DOMContentLoaded', () => {
         return div;
     }
 
+    function pollDownloadProgress(fileName, totalTiles, opts = {}) {
+        const {
+            ownerEl,
+            progressBar,
+            fill,
+            progressText,
+            statusEl,
+            onReady,
+            onError,
+            successMessage = '卫星图抓取成功'
+        } = opts;
+
+        let pollCount = 0;
+        let missCount = 0;
+        let pollTimer = null;
+        const MAX_POLLS = 240;  // 240 × 500ms ~= 2 分钟超时
+        const MAX_MISS = 10;
+
+        const stopPoll = () => {
+            if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+            if (ownerEl) ownerEl._pollTimer = null;
+        };
+
+        const fail = (msg, toastMsg = msg) => {
+            stopPoll();
+            if (progressBar) progressBar.style.display = 'none';
+            if (statusEl) {
+                statusEl.style.display = 'block';
+                statusEl.innerHTML = msg;
+            }
+            if (onError) onError(msg);
+            showToast(toastMsg, 'error');
+            return null;
+        };
+
+        return new Promise((resolve) => {
+            pollTimer = setInterval(async () => {
+                pollCount++;
+                if (pollCount > MAX_POLLS) {
+                    resolve(fail('下载超时，请重试'));
+                    return;
+                }
+                try {
+                    const pr = await fetch(`/api/satellite/progress/?file=${fileName}`);
+                    const pd = await pr.json();
+                    if (pd.code === 200 && pd.data) {
+                        missCount = 0;
+                        const done = pd.data.done || 0;
+                        const pct = Math.round((done / Math.max(totalTiles, 1)) * 100);
+                        if (fill) fill.style.width = pct + '%';
+                        if (progressText) progressText.textContent = `${done}/${totalTiles}`;
+
+                        if (pd.data.status === 'done' || pd.data.status === 'partial') {
+                            stopPoll();
+                            if (progressBar) progressBar.style.display = 'none';
+                            if (statusEl) statusEl.style.display = 'none';
+                            if (onReady) onReady(pd.data);
+                            if (pd.data.status === 'partial') {
+                                showToast(`卫星图已加载，但 ${pd.data.failed || 0} 个瓦片失败`, 'warning');
+                            } else {
+                                showToast(successMessage, 'success');
+                            }
+                            resolve(pd.data);
+                        } else if (pd.data.status === 'error') {
+                            resolve(fail('抓取失败，请重试', '抓取失败'));
+                        }
+                    } else {
+                        missCount++;
+                        if (missCount >= MAX_MISS) {
+                            resolve(fail('进度丢失，请重试', '下载进度丢失'));
+                        }
+                    }
+                } catch (e) {
+                    missCount++;
+                    if (missCount >= MAX_MISS) {
+                        resolve(fail('网络异常，请重试'));
+                    }
+                }
+            }, 500);
+            if (ownerEl) ownerEl._pollTimer = pollTimer;
+        });
+    }
+
     async function sendToBackend(nw, se, itemEl) {
         const min_lng = Math.min(nw.lng, se.lng);
         const max_lng = Math.max(nw.lng, se.lng);
@@ -402,7 +489,7 @@ document.addEventListener('DOMContentLoaded', () => {
         let pollTimer = null;
 
         try {
-            const r = await fetch("http://127.0.0.1:8000/api/satellite/get-img/", {
+            const r = await fetch("/api/satellite/get-img/", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ min_lng, max_lng, min_lat, max_lat })
@@ -412,52 +499,38 @@ document.addEventListener('DOMContentLoaded', () => {
             if (d.code === 200) {
                 const fileName = d.data.file_name;
                 const totalTiles = d.data.total_tiles || 1;
-                const imgUrl = `http://127.0.0.1:8000/api/satellite/show-img/?file=${fileName}`;
+                const imgUrl = `/api/satellite/show-img/?file=${fileName}`;
                 const spatialCtx = d.data.gsd_m
                     ? `范围: ${d.data.area_km2} km\u00B2 | 分辨率: ${d.data.gsd_m} m/像素`
                     : "";
 
-                chatMemories[fileName] = { history: [], spatial: spatialCtx, bbox: { min_lng, max_lng, min_lat, max_lat } };
+                chatMemories[fileName] = { history: [], spatial: spatialCtx, bbox: { min_lng, max_lng, min_lat, max_lat }, gsd: d.data.gsd_m };
 
                 status.style.display = 'block';
                 status.innerHTML = '<span class="spinner"></span> 正在下载瓦片...';
                 progressBar.style.display = 'block';
                 progressText.textContent = `0/${totalTiles}`;
 
-                pollTimer = setInterval(async () => {
-                    try {
-                        const pr = await fetch(`http://127.0.0.1:8000/api/satellite/progress/?file=${fileName}`);
-                        const pd = await pr.json();
-                        if (pd.code === 200 && pd.data) {
-                            const done = pd.data.done || 0;
-                            const pct = Math.round((done / totalTiles) * 100);
-                            fill.style.width = pct + '%';
-                            progressText.textContent = `${done}/${totalTiles}`;
-                            if (pd.data.status === 'done') {
-                                clearInterval(pollTimer);
-                                progressBar.style.display = 'none';
-                                status.style.display = 'none';
-                                previewImg.src = imgUrl + '&t=' + Date.now();
-                                previewImg.dataset.filename = fileName;
-                                previewImg.style.display = 'block';
-                                previewImg.style.animation = 'none';
-                                void previewImg.offsetHeight;
-                                previewImg.style.animation = 'fadeIn 0.4s ease';
-                                questionBox.style.display = 'block';
-                                enterBtn.onclick = () => {
-                                    map.fitBounds([[se.lat, nw.lng], [nw.lat, se.lng]]);
-                                    openChatModal(fileName, imgUrl, spatialCtx);
-                                };
-                                showToast('卫星图抓取成功', 'success');
-                            } else if (pd.data.status === 'error') {
-                                clearInterval(pollTimer);
-                                progressBar.style.display = 'none';
-                                status.innerHTML = '抓取失败，请重试';
-                                showToast('抓取失败', 'error');
-                            }
-                        }
-                    } catch (e) {}
-                }, 500);
+                await pollDownloadProgress(fileName, totalTiles, {
+                    ownerEl: itemEl,
+                    progressBar,
+                    fill,
+                    progressText,
+                    statusEl: status,
+                    onReady: () => {
+                        previewImg.src = imgUrl + '&t=' + Date.now();
+                        previewImg.dataset.filename = fileName;
+                        previewImg.style.display = 'block';
+                        previewImg.style.animation = 'none';
+                        void previewImg.offsetHeight;
+                        previewImg.style.animation = 'fadeIn 0.4s ease';
+                        questionBox.style.display = 'block';
+                        enterBtn.onclick = () => {
+                            map.fitBounds([[se.lat, nw.lng], [nw.lat, se.lng]]);
+                            openChatModal(fileName, imgUrl, spatialCtx);
+                        };
+                    }
+                });
             } else {
                 status.innerHTML = '抓取失败：' + d.msg;
                 showToast('抓取失败：' + d.msg, 'error');
@@ -483,6 +556,8 @@ document.addEventListener('DOMContentLoaded', () => {
     function openChatModal(fileName, imgUrl, spatialCtx) {
         currentActiveImage = fileName;
         currentSpatialCtx = spatialCtx || "";
+        clearTargetMarkers();            // 清掉上一张图遗留的地图标点
+        restoreChatModalLayout();        // 若上次是对比模式,重建单图布局,避免白屏
         modalImg.src = imgUrl;
         modalIdSpan.innerText = currentSpatialCtx ? ` · ${currentSpatialCtx}` : '';
         renderChatHistory();
@@ -653,23 +728,76 @@ document.addEventListener('DOMContentLoaded', () => {
         chatBox.scrollTop = chatBox.scrollHeight;
     }
 
+    // 把左侧恢复为单图布局。对比模式会清空 .chat-modal-left 导致 #chat-modal-img
+    // 被移除、modalImg 指向游离节点;进入单图视图前必须先重建,否则设 src 不显示(白屏)。
     function restoreChatModalLayout() {
         const left = document.querySelector('.chat-modal-left');
-        left.innerHTML = '<img id="chat-modal-img" src="" alt="卫星图放大版" draggable="false">';
+        if (!document.getElementById('chat-modal-img')) {
+            left.innerHTML = '<img id="chat-modal-img" src="" alt="卫星图放大版" draggable="false">';
+        }
         left.style.flexWrap = '';
         left.style.gap = '';
         left.style.alignContent = '';
-        // 重新捕获 modalImg 引用
-        modalImg = document.getElementById('chat-modal-img');
-        modalImg.src = currentActiveImage && currentActiveImage !== '__compare__'
-            ? `http://127.0.0.1:8000/api/satellite/show-img/?file=${currentActiveImage}`
-            : '';
+        modalImg = document.getElementById('chat-modal-img');   // 重新捕获引用
         modalImg.style.display = '';
     }
 
+    // ==========================================
+    // AI 定位目标 → 地图标点(坐标接地闭环)
+    // ==========================================
+    let targetMarkers = [];
+    // 用 divIcon(纯 CSS 圆点),不依赖 Leaflet 默认图标资源,离线也能显示
+    const aiTargetIcon = L.divIcon({
+        className: 'ai-target-marker',
+        html: '<div style="width:16px;height:16px;border-radius:50%;background:#ff3b30;border:2px solid #fff;box-shadow:0 0 0 2px rgba(255,59,48,0.45);"></div>',
+        iconSize: [16, 16], iconAnchor: [8, 8]
+    });
+    function clearTargetMarkers() {
+        targetMarkers.forEach(m => map.removeLayer(m));
+        targetMarkers = [];
+    }
+    function placeTargetMarkers(targets) {
+        clearTargetMarkers();
+        if (!Array.isArray(targets)) return;
+        targets.forEach(t => {
+            if (typeof t.lat !== 'number' || typeof t.lng !== 'number') return;
+            const m = L.marker([t.lat, t.lng], { icon: aiTargetIcon }).addTo(map);
+            let popup = `<b>${t.label || 'AI 定位目标'}</b>`;
+            if (t.width_m != null) popup += `<br>尺寸约 ${t.width_m}m × ${t.height_m}m`;
+            if (t.area_m2 != null) popup += `<br>占地约 ${t.area_m2 >= 10000 ? (t.area_m2 / 10000).toFixed(2) + ' 公顷' : Math.round(t.area_m2) + ' m²'}`;
+            popup += `<br>${t.lat}°N, ${t.lng}°E`;
+            m.bindPopup(popup);
+            targetMarkers.push(m);
+        });
+        if (targetMarkers.length) targetMarkers[targetMarkers.length - 1].openPopup();
+    }
+
+    function getAnalysisMode() {
+        const mode = document.getElementById('model-select').value || 'precise';
+        if (mode === 'fast') {
+            return {
+                mode,
+                label: '快速模式',
+                model: 'qwen3-vl-flash',
+                activePerception: false
+            };
+        }
+        return {
+            mode: 'precise',
+            label: '精准模式',
+            model: 'qwen3-vl-plus',
+            activePerception: true
+        };
+    }
+
+    let isQuerying = false;
     sendBtn.onclick = async () => {
+        if (isQuerying) return;          // 防止分析期间重复提交
         const text = textarea.value.trim();
         if (!text) return;
+
+        isQuerying = true;
+        sendBtn.disabled = true;
 
         const data = getChatData(currentActiveImage);
         data.history.push({ role: 'user', content: text });
@@ -678,18 +806,18 @@ document.addEventListener('DOMContentLoaded', () => {
         renderChatHistory();
 
         const isCompare = currentActiveImage === '__compare__';
-        const currentModel = document.getElementById('model-select').value || 'qwen3.5-plus';
+        const analysisMode = getAnalysisMode();
         const loadingDiv = document.createElement('div');
         loadingDiv.className = 'chat-bubble chat-ai';
-        loadingDiv.innerHTML = `<span class="spinner"></span> SatelliteSense ${isCompare ? '正在对比分析' : '正在分析'}...`;
+        loadingDiv.innerHTML = `<span class="spinner"></span> SatelliteSense ${analysisMode.label}${isCompare ? '正在对比分析' : '正在分析'}...`;
         chatBox.appendChild(loadingDiv);
         chatBox.scrollTop = chatBox.scrollHeight;
 
         try {
             const body = isCompare
-                ? { file_names: data.compareFiles, question: text, history: data.history.slice(0, -1), model: currentModel }
-                : { file_name: currentActiveImage, question: text, history: data.history.slice(0, -1), spatial_context: currentSpatialCtx, model: currentModel };
-            const res = await fetch("http://127.0.0.1:8000/api/ai/query-region/", {
+                ? { file_names: data.compareFiles, question: text, history: data.history.slice(0, -1), model: analysisMode.model, mode: analysisMode.mode }
+                : { file_name: currentActiveImage, question: text, history: data.history.slice(0, -1), spatial_context: currentSpatialCtx, model: analysisMode.model, mode: analysisMode.mode, active_perception: analysisMode.activePerception, gsd: data.gsd, bbox: data.bbox };
+            const res = await fetch("/api/ai/query-region/", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body)
@@ -699,7 +827,12 @@ document.addEventListener('DOMContentLoaded', () => {
             loadingDiv.remove();
 
             if (result.code === 200) {
-                data.history.push({ role: 'ai', content: result.data.answer });
+                let aiContent = result.data.answer;
+                if (result.data.active_stages >= 2) {
+                    aiContent = `🔍 主动感知（${result.data.active_stages}级分析）\n\n` + aiContent;
+                }
+                data.history.push({ role: 'ai', content: aiContent });
+                if (!isCompare) placeTargetMarkers(result.data.targets);  // 把 AI 定位目标标到地图
             } else {
                 data.history.push({ role: 'ai', content: "❌ 分析失败: " + result.msg });
                 showToast('AI 分析失败', 'error');
@@ -708,6 +841,9 @@ document.addEventListener('DOMContentLoaded', () => {
             loadingDiv.remove();
             data.history.push({ role: 'ai', content: "⚠️ 网络请求异常，请检查后端状态" });
             showToast('网络请求异常', 'error');
+        } finally {
+            isQuerying = false;
+            sendBtn.disabled = false;
         }
         renderChatHistory();
         if (currentActiveImage) saveHistory(currentActiveImage);
@@ -774,8 +910,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const r = zoomCanvas.getBoundingClientRect();
         const ex = (e.clientX - r.left) / r.width;
         const ey = (e.clientY - r.top) / r.height;
-        const x1 = Math.min(zStart.x, ex), x2 = Math.max(zStart.x, ex);
-        const y1 = Math.min(zStart.y, ey), y2 = Math.max(zStart.y, ey);
+        const clamp01 = (v) => Math.max(0, Math.min(1, v));
+        const x1 = clamp01(Math.min(zStart.x, ex)), x2 = clamp01(Math.max(zStart.x, ex));
+        const y1 = clamp01(Math.min(zStart.y, ey)), y2 = clamp01(Math.max(zStart.y, ey));
         zStart = null; zRect = null;
 
         if (zoomCanvas) { zoomCanvas.remove(); zoomCanvas = null; }
@@ -792,12 +929,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const subMinLng = bbox.min_lng + (bbox.max_lng - bbox.min_lng) * x1;
         const subMaxLng = bbox.min_lng + (bbox.max_lng - bbox.min_lng) * x2;
-        const subMinLat = bbox.min_lat + (bbox.max_lat - bbox.min_lat) * y1;
-        const subMaxLat = bbox.min_lat + (bbox.max_lat - bbox.min_lat) * y2;
+        const latSpan = bbox.max_lat - bbox.min_lat;
+        const subMinLat = bbox.max_lat - latSpan * y2;
+        const subMaxLat = bbox.max_lat - latSpan * y1;
 
         showToast('正在获取放大影像...', 'info');
         try {
-            const r2 = await fetch("http://127.0.0.1:8000/api/satellite/get-img/", {
+            const r2 = await fetch("/api/satellite/get-img/", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ min_lng: subMinLng, max_lng: subMaxLng, min_lat: subMinLat, max_lat: subMaxLat })
@@ -805,17 +943,26 @@ document.addEventListener('DOMContentLoaded', () => {
             const d = await r2.json();
             if (d.code === 200) {
                 const fileName = d.data.file_name;
-                const imgUrl = `http://127.0.0.1:8000/api/satellite/show-img/?file=${fileName}`;
+                const totalTiles = d.data.total_tiles || 1;
+                const imgUrl = `/api/satellite/show-img/?file=${fileName}`;
                 const spatialCtx = d.data.gsd_m ? `范围: ${d.data.area_km2} km² | 分辨率: ${d.data.gsd_m} m/像素` : "";
-                chatMemories[fileName] = { history: [], spatial: spatialCtx, bbox: { min_lng: subMinLng, max_lng: subMaxLng, min_lat: subMinLat, max_lat: subMaxLat } };
-                modalImg.src = imgUrl;
+                chatMemories[fileName] = { history: [], spatial: spatialCtx, bbox: { min_lng: subMinLng, max_lng: subMaxLng, min_lat: subMinLat, max_lat: subMaxLat }, gsd: d.data.gsd_m };
                 modalIdSpan.innerText = spatialCtx ? ` · ${spatialCtx}` : '';
                 currentActiveImage = fileName;
                 currentSpatialCtx = spatialCtx;
-                renderChatHistory();
-                showToast('放大影像已加载 ✓', 'success');
+                await pollDownloadProgress(fileName, totalTiles, {
+                    onReady: () => {
+                        modalImg.src = imgUrl + '&t=' + Date.now();
+                        renderChatHistory();
+                    },
+                    successMessage: '放大影像已加载'
+                });
+            } else {
+                showToast('放大影像获取失败：' + d.msg, 'error');
             }
-        } catch(err) {}
+        } catch(err) {
+            showToast('放大影像获取失败', 'error');
+        }
     });
 
     // ==========================================
@@ -835,7 +982,7 @@ document.addEventListener('DOMContentLoaded', () => {
         searchIdx = -1;
         searchTimeout = setTimeout(async () => {
             try {
-                const r = await fetch(`http://127.0.0.1:8000/api/geo/search/?q=${encodeURIComponent(q)}`);
+                const r = await fetch(`/api/geo/search/?q=${encodeURIComponent(q)}`);
                 const resp = await r.json();
                 const data = resp.data || [];
                 searchResults.innerHTML = '';
@@ -936,10 +1083,12 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
         if (e.key === 'Escape') {
-            if (selectionRect) { map.removeLayer(selectionRect); selectionRect = null; }
-            if (isSelecting) { isSelecting = false; map.dragging.enable(); }
+            let cancelledSel = false;
+            if (selectionRect) { map.removeLayer(selectionRect); selectionRect = null; cancelledSel = true; }
+            if (isSelecting) { isSelecting = false; map.dragging.enable(); cancelledSel = true; }
             if (modal.style.display === 'flex') { modal.style.display = 'none'; }
-            showToast('已取消', 'info');
+            // 只提示真正取消了的"框选";不谎称能中断已发起的下载/AI 请求
+            if (cancelledSel) showToast('已取消框选', 'info');
         }
     });
 
@@ -951,7 +1100,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function loadHistories() {
         try {
-            const r = await fetch('http://127.0.0.1:8000/api/ai/history/');
+            const r = await fetch('/api/ai/history/');
             const d = await r.json();
             if (d.code !== 200 || !d.data.length) {
                 historyList.innerHTML = '<div style="font-size:11px;color:rgba(255,255,255,0.25);text-align:center;padding:10px 0;">暂无历史记录</div>';
@@ -965,14 +1114,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 label.textContent = (h.spatial_context || h.image_file).substring(0, 30);
                 label.title = '点击加载';
                 label.addEventListener('click', async () => {
-                    const rr = await fetch(`http://127.0.0.1:8000/api/ai/history/${h.id}/`);
+                    const rr = await fetch(`/api/ai/history/${h.id}/`);
                     const dd = await rr.json();
                     if (dd.code === 200) {
                         const fileName = dd.data.image_file;
-                        const imgUrl = `http://127.0.0.1:8000/api/satellite/show-img/?file=${fileName}`;
+                        const imgUrl = `/api/satellite/show-img/?file=${fileName}`;
                         currentActiveImage = fileName;
                         currentSpatialCtx = dd.data.spatial_context || '';
                         chatMemories[fileName] = { history: dd.data.messages || [], spatial: dd.data.spatial_context || '', bbox: dd.data.bbox };
+                        restoreChatModalLayout();        // 重建单图布局,避免对比模式残留导致白屏
                         modalImg.src = imgUrl;
                         modalIdSpan.innerText = currentSpatialCtx ? ' · ' + currentSpatialCtx : '';
                         renderChatHistory();
@@ -989,7 +1139,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 delBtn.style.cssText = 'background:none;border:none;color:rgba(255,255,255,0.2);cursor:pointer;font-size:10px;';
                 delBtn.addEventListener('click', async (e) => {
                     e.stopPropagation();
-                    await fetch(`http://127.0.0.1:8000/api/ai/history/${h.id}/`, { method: 'DELETE' });
+                    await fetch(`/api/ai/history/${h.id}/`, { method: 'DELETE' });
                     loadHistories();
                 });
                 item.appendChild(label);
@@ -1001,10 +1151,12 @@ document.addEventListener('DOMContentLoaded', () => {
     refreshHistoryBtn.addEventListener('click', loadHistories);
 
     async function saveHistory(fileName) {
+        if (!fileName || fileName === '__compare__') return;
         const mem = chatMemories[fileName] || {};
+        if (!Array.isArray(mem.history) || mem.history.length === 0) return;
         const bbox = mem.bbox ? mem.bbox : {};
         try {
-            await fetch('http://127.0.0.1:8000/api/ai/history/', {
+            await fetch('/api/ai/history/', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1026,7 +1178,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const mem = chatMemories[currentActiveImage] || {};
         showToast('正在生成报告...', 'info');
         try {
-            const r = await fetch('http://127.0.0.1:8000/api/report/generate/', {
+            const r = await fetch('/api/report/generate/', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1039,7 +1191,7 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const d = await r.json();
             if (d.code === 200) {
-                window.open('http://127.0.0.1:8000' + d.data.download_url);
+                window.location.href = d.data.download_url;
                 showToast('报告已生成，正在下载', 'success');
             } else {
                 showToast('报告生成失败：' + d.msg, 'error');

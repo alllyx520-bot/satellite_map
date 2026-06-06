@@ -3,5 +3,9 @@
 *.pyc
 __pycache__/
 db.sqlite3
-media/satellite_imgs/
+media/
+models/
+.codex-runtime/
+.playwright-mcp/
+page-snap.json
 .env
