@@ -6,8 +6,8 @@ import sys
 
 def main():
     """Run administrative tasks."""
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+    from satellite_map.env import load_project_env
+    load_project_env(os.path.dirname(__file__))
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "satellite_map.settings")
     try:
         from django.core.management import execute_from_command_line

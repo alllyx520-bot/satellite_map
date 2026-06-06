@@ -6,6 +6,8 @@
 from django.test import SimpleTestCase, TestCase
 from django.conf import settings
 import os
+import json
+import tempfile
 from unittest.mock import patch
 
 from map_api.utils.smart_query_analyzer import analyze_query, adaptive_resolution, _build_clip_query
@@ -13,12 +15,13 @@ from map_api.utils.active_perception import (
     extract_bbox_from_response, extract_answer_text, measure_bbox, pixel_bbox_to_geo,
     map_bbox_to_original
 )
-from map_api.utils.get_satellite_image import haversine_distance
+from map_api.utils.get_satellite_image import fetch_satellite_image, haversine_distance
 from map_api.utils.analysis_strategy import build_analysis_strategy
 from map_api.models import ChatHistory, DownloadTask, ImageryScene
 from map_api.imagery_sources.mapbox import MapboxProvider
 from map_api.imagery_sources.earth_search import EarthSearchProvider, score_candidate
 from map_api.views import ANALYSIS_MODES, compute_image_plan, normalize_bbox, _download_progress
+from satellite_map.env import load_project_env
 
 
 class AnalyzeQueryTests(SimpleTestCase):
@@ -162,6 +165,28 @@ class HaversineTests(SimpleTestCase):
         self.assertAlmostEqual(d / 1000, 1067, delta=20)
 
 
+class MapboxFetchTests(SimpleTestCase):
+    def test_fetch_satellite_image_reads_mapbox_token_at_call_time(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {"MAPBOX_TOKEN": "runtime-token"}, clear=False), \
+                patch("map_api.utils.get_satellite_image._fetch_tile", return_value=Image.new("RGB", (16, 16))) as mocked:
+            out = fetch_satellite_image(
+                1,
+                2,
+                1.01,
+                2.01,
+                save_dir=tmp,
+                file_name="sat_runtime_token.jpg",
+                target_resolution=64,
+            )
+
+        self.assertIsNotNone(out)
+        requested_url = mocked.call_args.args[0]
+        self.assertIn("access_token=runtime-token", requested_url)
+
+
 class ImagePlanTests(SimpleTestCase):
     def test_normalize_bbox_reversed_input(self):
         out = normalize_bbox({"min_lng": 2, "max_lng": 1, "min_lat": 4, "max_lat": 3})
@@ -186,6 +211,69 @@ class AnalysisModeTests(SimpleTestCase):
     def test_fast_mode_uses_flash_without_active_perception(self):
         self.assertEqual(ANALYSIS_MODES["fast"]["model"], "qwen3-vl-flash")
         self.assertFalse(ANALYSIS_MODES["fast"]["active_perception"])
+
+
+class SystemHealthTests(TestCase):
+    def test_health_reports_core_configuration_without_secret_values(self):
+        with patch.dict(os.environ, {
+            "MAPBOX_TOKEN": "secret-mapbox-token",
+            "DASHSCOPE_API_KEY": "secret-dashscope-key",
+            "AMAP_KEY": "secret-amap-key",
+        }, clear=False):
+            r = self.client.get("/api/system/health/")
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "ok")
+        self.assertTrue(data["checks"]["database"])
+        self.assertTrue(data["checks"]["media_root_writable"])
+        self.assertTrue(data["checks"]["satellite_image_dir_writable"])
+        self.assertTrue(data["config"]["mapbox_token"])
+        self.assertTrue(data["config"]["dashscope_api_key"])
+        self.assertTrue(data["config"]["amap_key"])
+        self.assertEqual(data["analysis_modes"]["precise"]["model"], "qwen3-vl-plus")
+        self.assertEqual(data["analysis_modes"]["fast"]["model"], "qwen3-vl-flash")
+
+        raw = json.dumps(r.json(), ensure_ascii=False)
+        self.assertNotIn("secret-mapbox-token", raw)
+        self.assertNotIn("secret-dashscope-key", raw)
+        self.assertNotIn("secret-amap-key", raw)
+
+    def test_health_degrades_when_required_keys_are_missing(self):
+        with patch.dict(os.environ, {
+            "MAPBOX_TOKEN": "",
+            "DASHSCOPE_API_KEY": "",
+            "AMAP_KEY": "",
+        }, clear=False):
+            r = self.client.get("/api/system/health/")
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "degraded")
+        self.assertFalse(data["config"]["mapbox_token"])
+        self.assertFalse(data["config"]["dashscope_api_key"])
+        self.assertFalse(data["imagery_sources"]["mapbox"]["available"])
+
+    def test_health_rejects_non_get(self):
+        r = self.client.post("/api/system/health/")
+        self.assertEqual(r.status_code, 405)
+
+
+class EnvLoadingTests(SimpleTestCase):
+    def test_load_project_env_reads_dotenv_without_overriding_existing_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = os.path.join(tmp, ".env")
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write("SATELLITE_TEST_ENV_NEW=from-dotenv\n")
+                f.write("SATELLITE_TEST_ENV_EXISTING=from-dotenv\n")
+
+            os.environ.pop("SATELLITE_TEST_ENV_NEW", None)
+            with patch.dict(os.environ, {"SATELLITE_TEST_ENV_EXISTING": "already-set"}, clear=False):
+                self.assertTrue(load_project_env(tmp))
+                self.assertEqual(os.environ.get("SATELLITE_TEST_ENV_NEW"), "from-dotenv")
+                self.assertEqual(os.environ.get("SATELLITE_TEST_ENV_EXISTING"), "already-set")
+
+            os.environ.pop("SATELLITE_TEST_ENV_NEW", None)
 
 
 class ImageryMetadataTests(SimpleTestCase):
@@ -297,8 +385,128 @@ class AnalysisStrategyTests(SimpleTestCase):
         self.assertEqual(strategy["task_profile"]["task"], "land_use")
         self.assertIn("综合土地利用解译", strategy["prompt"])
 
+    def test_agriculture_question_gets_cropland_rubric(self):
+        strategy = build_analysis_strategy("分析这片农田的作物长势和田块破碎化")
+        self.assertEqual(strategy["task_profile"]["task"], "agriculture")
+        self.assertIn("农业耕地与作物长势解译", strategy["prompt"])
+        self.assertIn("田块破碎化", strategy["prompt"])
+
+
+class AIQueryApiTests(TestCase):
+    def _make_test_image(self, file_name):
+        from PIL import Image
+
+        save_dir = os.path.join(settings.MEDIA_ROOT, "satellite_imgs")
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, file_name)
+        Image.new("RGB", (32, 32), (80, 120, 160)).save(path, "JPEG")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def _fake_qwen_response(self, text="这是 mock 遥感分析结论"):
+        message = type("Message", (), {"content": [{"text": text}]})()
+        choice = type("Choice", (), {"message": message})()
+        output = type("Output", (), {"choices": [choice]})()
+        return type("Response", (), {"status_code": 200, "output": output, "message": ""})()
+
+    def test_ai_query_returns_analysis_method_metadata(self):
+        file_name = "sat_ai_method.jpg"
+        image_path = self._make_test_image(file_name)
+        scene = ImageryScene.objects.create(
+            file_name=file_name,
+            source="mapbox",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+            gsd_m=1.2,
+        )
+        preprocess = {
+            "single": image_path,
+            "orig_w": 32,
+            "orig_h": 32,
+            "eff_w": 32,
+            "eff_h": 32,
+        }
+        with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-key"}, clear=False), \
+                patch("map_api.views.smart_prepare_image_v2", return_value=preprocess), \
+                patch("map_api.views._call_qwen", return_value=self._fake_qwen_response()):
+            r = self.client.post(
+                "/api/ai/query-region/",
+                data={
+                    "file_name": file_name,
+                    "scene_id": scene.id,
+                    "question": "分析这片区域的水体和岸线",
+                    "mode": "fast",
+                    "active_perception": False,
+                    "gsd": 1.2,
+                    "bbox": {"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4},
+                    "history": [],
+                },
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["answer"], "这是 mock 遥感分析结论")
+        self.assertEqual(data["analysis_method"]["mode"], "fast")
+        self.assertEqual(data["analysis_method"]["model"], "qwen3-vl-flash")
+        self.assertEqual(data["analysis_method"]["task_label"], "水体与岸线解译")
+        self.assertFalse(data["analysis_method"]["active_perception"])
+        self.assertEqual(data["scene"]["id"], scene.id)
+
+    def test_ai_query_unknown_mode_reports_precise_fallback(self):
+        file_name = "sat_ai_mode_fallback.jpg"
+        image_path = self._make_test_image(file_name)
+        scene = ImageryScene.objects.create(
+            file_name=file_name,
+            source="mapbox",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+            gsd_m=1.2,
+        )
+        preprocess = {
+            "single": image_path,
+            "orig_w": 32,
+            "orig_h": 32,
+            "eff_w": 32,
+            "eff_h": 32,
+        }
+        with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-key"}, clear=False), \
+                patch("map_api.views.smart_prepare_image_v2", return_value=preprocess), \
+                patch("map_api.views._call_qwen", return_value=self._fake_qwen_response()):
+            r = self.client.post(
+                "/api/ai/query-region/",
+                data={
+                    "file_name": file_name,
+                    "scene_id": scene.id,
+                    "question": "整体分析这片区域",
+                    "mode": "unknown",
+                    "active_perception": False,
+                    "gsd": 1.2,
+                    "bbox": {"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4},
+                },
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        method = r.json()["data"]["analysis_method"]
+        self.assertEqual(method["mode"], "precise")
+        self.assertEqual(method["model"], "qwen3-vl-plus")
+
 
 class HistoryApiTests(TestCase):
+    def _touch_history_image(self, file_name):
+        save_dir = os.path.join(settings.MEDIA_ROOT, "satellite_imgs")
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, file_name)
+        with open(path, "wb") as f:
+            f.write(b"jpg")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
     def test_rejects_compare_history(self):
         r = self.client.post(
             "/api/ai/history/",
@@ -309,6 +517,7 @@ class HistoryApiTests(TestCase):
         self.assertEqual(r.json()["code"], 400)
 
     def test_upserts_history_by_image_file(self):
+        self._touch_history_image("sat_test.jpg")
         scene = ImageryScene.objects.create(
             file_name="sat_test.jpg",
             min_lng=1,
@@ -323,6 +532,68 @@ class HistoryApiTests(TestCase):
         self.assertEqual(r2.json()["code"], 200)
         obj = ChatHistory.objects.get(image_file="sat_test.jpg")
         self.assertEqual(obj.scene_id, scene.id)
+
+    def test_rejects_history_when_image_file_is_missing(self):
+        r = self.client.post(
+            "/api/ai/history/",
+            data={"image_file": "sat_missing_history.jpg", "messages": [{"role": "user", "content": "a"}]},
+            content_type="application/json",
+        )
+
+        self.assertEqual(r.status_code, 410)
+        self.assertEqual(r.json()["code"], 410)
+        self.assertFalse(ChatHistory.objects.filter(image_file="sat_missing_history.jpg").exists())
+
+    def test_history_preserves_analysis_method_metadata(self):
+        self._touch_history_image("sat_method.jpg")
+        scene = ImageryScene.objects.create(
+            file_name="sat_method.jpg",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+        )
+        payload = {
+            "image_file": "sat_method.jpg",
+            "scene_id": scene.id,
+            "messages": [{
+                "role": "ai",
+                "content": "分析结论",
+                "analysis_method": {
+                    "mode": "precise",
+                    "model": "qwen3-vl-plus",
+                    "task_label": "水体与岸线解译",
+                },
+            }],
+        }
+        r = self.client.post("/api/ai/history/", data=payload, content_type="application/json")
+        self.assertEqual(r.json()["code"], 200)
+        detail = self.client.get(f"/api/ai/history/{r.json()['data']['id']}/")
+        method = detail.json()["data"]["messages"][0]["analysis_method"]
+        self.assertEqual(method["model"], "qwen3-vl-plus")
+        self.assertEqual(method["task_label"], "水体与岸线解译")
+
+    def test_history_list_hides_missing_image_records(self):
+        self._touch_history_image("sat_history_ok.jpg")
+        ChatHistory.objects.create(image_file="sat_history_ok.jpg", messages=[])
+        ChatHistory.objects.create(image_file="sat_history_missing.jpg", messages=[])
+
+        r = self.client.get("/api/ai/history/")
+
+        self.assertEqual(r.status_code, 200)
+        files = [item["image_file"] for item in r.json()["data"]]
+        self.assertIn("sat_history_ok.jpg", files)
+        self.assertNotIn("sat_history_missing.jpg", files)
+        self.assertTrue(r.json()["data"][0]["image_available"])
+
+    def test_history_detail_returns_410_for_missing_image(self):
+        obj = ChatHistory.objects.create(image_file="sat_history_missing_detail.jpg", messages=[])
+
+        r = self.client.get(f"/api/ai/history/{obj.id}/")
+
+        self.assertEqual(r.status_code, 410)
+        self.assertEqual(r.json()["code"], 410)
+        self.assertIn("历史影像文件已丢失", r.json()["msg"])
 
     def test_delete_history_without_csrf_token(self):
         obj = ChatHistory.objects.create(image_file="sat_delete.jpg", messages=[])
@@ -360,9 +631,84 @@ class DownloadTaskTests(TestCase):
     def test_cleanup_removes_old_finished_progress_entries(self):
         _download_progress.clear()
         _download_progress["sat_old.jpg"] = {"total": 1, "done": 1, "status": "done"}
-        r = self.client.post("/api/satellite/cleanup/", data={"days": 0}, content_type="application/json")
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = os.path.join(tmp, "satellite_imgs")
+            report_dir = os.path.join(tmp, "reports")
+            os.makedirs(save_dir, exist_ok=True)
+            os.makedirs(report_dir, exist_ok=True)
+            with patch("map_api.views.SAVE_DIR", save_dir), patch("map_api.views.REPORT_DIR", report_dir):
+                r = self.client.post("/api/satellite/cleanup/", data={"days": 0}, content_type="application/json")
         self.assertEqual(r.status_code, 200)
         self.assertNotIn("sat_old.jpg", _download_progress)
+
+    def test_cleanup_removes_history_for_deleted_image_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = os.path.join(tmp, "satellite_imgs")
+            report_dir = os.path.join(tmp, "reports")
+            os.makedirs(save_dir, exist_ok=True)
+            os.makedirs(report_dir, exist_ok=True)
+            image_path = os.path.join(save_dir, "sat_cleanup_history.jpg")
+            with open(image_path, "wb") as f:
+                f.write(b"jpg")
+            os.utime(image_path, (0, 0))
+
+            scene = ImageryScene.objects.create(
+                file_name="sat_cleanup_history.jpg",
+                min_lng=1,
+                min_lat=2,
+                max_lng=3,
+                max_lat=4,
+            )
+            DownloadTask.objects.create(
+                scene=scene,
+                file_name="sat_cleanup_history.jpg",
+                status="done",
+                total=1,
+                done=1,
+                min_lng=1,
+                min_lat=2,
+                max_lng=3,
+                max_lat=4,
+            )
+            ChatHistory.objects.create(
+                scene=scene,
+                image_file="sat_cleanup_history.jpg",
+                messages=[{"role": "ai", "content": "old"}],
+            )
+
+            with patch("map_api.views.SAVE_DIR", save_dir), patch("map_api.views.REPORT_DIR", report_dir):
+                r = self.client.post("/api/satellite/cleanup/", data={"days": 0}, content_type="application/json")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["data"]["deleted_image_records"], 1)
+        self.assertFalse(ChatHistory.objects.filter(image_file="sat_cleanup_history.jpg").exists())
+        self.assertFalse(DownloadTask.objects.filter(file_name="sat_cleanup_history.jpg").exists())
+        self.assertFalse(ImageryScene.objects.filter(file_name="sat_cleanup_history.jpg").exists())
+
+    def test_cleanup_all_removes_histories(self):
+        scene = ImageryScene.objects.create(
+            file_name="sat_cleanup_all.jpg",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+        )
+        ChatHistory.objects.create(scene=scene, image_file="sat_cleanup_all.jpg", messages=[])
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = os.path.join(tmp, "satellite_imgs")
+            report_dir = os.path.join(tmp, "reports")
+            os.makedirs(save_dir, exist_ok=True)
+            os.makedirs(report_dir, exist_ok=True)
+            with patch("map_api.views.SAVE_DIR", save_dir), patch("map_api.views.REPORT_DIR", report_dir):
+                r = self.client.post(
+                    "/api/satellite/cleanup/",
+                    data={"all": True},
+                    content_type="application/json",
+                )
+
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(ChatHistory.objects.exists())
+        self.assertFalse(ImageryScene.objects.exists())
 
 
 class ImagerySceneApiTests(TestCase):
@@ -451,14 +797,103 @@ class ImagerySceneApiTests(TestCase):
         self.assertEqual(data["gsd_m"], expected_gsd)
         self.assertEqual(data["scene"]["gsd_m"], expected_gsd)
         self.assertEqual(data["scene"]["metadata"]["source_asset_gsd_m"], 10.0)
+        self.assertFalse(data["cache_hit"])
+        self.assertIn("sentinel_cache_key", data["scene"]["metadata"])
+        self.assertEqual(data["scene"]["metadata"]["render_size_px"]["width"], data["render_width"])
         self.assertTrue(ImageryScene.objects.filter(file_name=data["file_name"]).exists())
         self.assertTrue(DownloadTask.objects.filter(file_name=data["file_name"], status="done").exists())
         img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", data["file_name"])
         self.assertTrue(os.path.exists(img_path))
         os.remove(img_path)
 
+    def test_sentinel_image_endpoint_reuses_cached_scene(self):
+        item = {
+            "id": "S2A_TEST",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-06-01T03:17:00Z",
+                "updated": "2026-06-01T08:00:00Z",
+                "eo:cloud_cover": 8.5,
+                "s2:product_uri": "S2A_PRODUCT.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/visual.tif", "gsd": 10}},
+        }
+        candidate = EarthSearchProvider().candidate_from_item(item)
+        payload = {"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4}
+        with patch("map_api.views.EarthSearchProvider.search", return_value=[candidate]), \
+                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", return_value=b"jpg") as render_mock:
+            first = self.client.post(
+                "/api/satellite/get-sentinel-img/",
+                data=payload,
+                content_type="application/json",
+            )
+            second = self.client.post(
+                "/api/satellite/get-sentinel-img/",
+                data=payload,
+                content_type="application/json",
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(first.json()["data"]["cache_hit"])
+        self.assertTrue(second.json()["data"]["cache_hit"])
+        self.assertEqual(first.json()["data"]["file_name"], second.json()["data"]["file_name"])
+        render_mock.assert_called_once()
+        img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", first.json()["data"]["file_name"])
+        if os.path.exists(img_path):
+            os.remove(img_path)
+
+    def test_sentinel_image_endpoint_returns_friendly_502_on_render_failure(self):
+        item = {
+            "id": "S2A_TEST",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-06-01T03:17:00Z",
+                "eo:cloud_cover": 8.5,
+                "s2:product_uri": "S2A_PRODUCT.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/visual.tif", "gsd": 10}},
+        }
+        candidate = EarthSearchProvider().candidate_from_item(item)
+        with patch("map_api.views.EarthSearchProvider.search", return_value=[candidate]), \
+                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", side_effect=ValueError("not image")):
+            r = self.client.post(
+                "/api/satellite/get-sentinel-img/",
+                data={"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 502)
+        self.assertEqual(r.json()["msg"], "近期公开影像源暂时不可用，可切回高清底图继续分析")
+        self.assertFalse(ImageryScene.objects.filter(source="sentinel2").exists())
+
+    def test_sentinel_image_endpoint_keeps_bad_input_as_400(self):
+        r = self.client.post(
+            "/api/satellite/get-sentinel-img/",
+            data={"min_lng": "bad", "min_lat": 2, "max_lng": 3, "max_lat": 4},
+            content_type="application/json",
+        )
+
+        self.assertEqual(r.status_code, 400)
+
 
 class ReportSceneTests(TestCase):
+    def test_report_rejects_missing_image_file(self):
+        r = self.client.post(
+            "/api/report/generate/",
+            data={"file_name": "missing_report.jpg", "messages": []},
+            content_type="application/json",
+        )
+        self.assertEqual(r.status_code, 410)
+        self.assertEqual(r.json()["code"], 410)
+
+    def test_report_rejects_non_post(self):
+        r = self.client.get("/api/report/generate/")
+        self.assertEqual(r.status_code, 405)
+        self.assertEqual(r.json()["code"], 405)
+
     def test_report_includes_imagery_data_section(self):
         from PIL import Image
         from docx import Document
@@ -488,5 +923,94 @@ class ReportSceneTests(TestCase):
         text = "\n".join(p.text for p in doc.paragraphs)
         self.assertIn("影像数据说明", text)
         self.assertIn("测试限制说明", text)
+        os.remove(img_path)
+        os.remove(report_path)
+
+    def test_report_includes_analysis_method_section(self):
+        from PIL import Image
+        from docx import Document
+
+        save_dir = os.path.join(settings.MEDIA_ROOT, "satellite_imgs")
+        os.makedirs(save_dir, exist_ok=True)
+        img_path = os.path.join(save_dir, "sat_report_method.jpg")
+        Image.new("RGB", (32, 32), (80, 120, 160)).save(img_path, "JPEG")
+        scene = ImageryScene.objects.create(
+            file_name="sat_report_method.jpg",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+        )
+        messages = [{
+            "role": "ai",
+            "content": "分析结论",
+            "analysis_method": {
+                "mode": "precise",
+                "model": "qwen3-vl-plus",
+                "source": "mapbox",
+                "task_label": "农业耕地与作物长势解译",
+                "active_perception": True,
+                "active_stages": 2,
+                "strengths": ["高清视觉底图"],
+                "limits": ["底图拍摄时间不透明"],
+                "method_notes": ["问题偏细节，建议启用主动感知进行局部放大"],
+            },
+        }]
+        r = self.client.post(
+            "/api/report/generate/",
+            data={"file_name": scene.file_name, "scene_id": scene.id, "messages": messages},
+            content_type="application/json",
+        )
+        self.assertEqual(r.status_code, 200)
+        report_name = r.json()["data"]["file_name"]
+        report_path = os.path.join(settings.MEDIA_ROOT, report_name)
+        doc = Document(report_path)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        self.assertIn("AI 分析方法说明", text)
+        self.assertIn("qwen3-vl-plus", text)
+        self.assertIn("农业耕地与作物长势解译", text)
+        self.assertIn("底图拍摄时间不透明", text)
+        os.remove(img_path)
+        os.remove(report_path)
+
+    def test_report_sanitizes_ai_text_for_docx(self):
+        from PIL import Image
+        from docx import Document
+
+        save_dir = os.path.join(settings.MEDIA_ROOT, "satellite_imgs")
+        os.makedirs(save_dir, exist_ok=True)
+        img_path = os.path.join(save_dir, "sat_report_safe_text.jpg")
+        Image.new("RGB", (32, 32), (80, 120, 160)).save(img_path, "JPEG")
+        scene = ImageryScene.objects.create(
+            file_name="sat_report_safe_text.jpg",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+        )
+        messages = [{
+            "role": "ai",
+            "content": "控制字符前\x0b控制字符后",
+            "analysis_method": {
+                "mode": "fast",
+                "model": "qwen3-vl-flash\x0b",
+                "source": "mapbox",
+                "task_label": "综合土地利用解译",
+                "limits": ["底图时效不透明\x0b"],
+            },
+        }]
+        r = self.client.post(
+            "/api/report/generate/",
+            data={"file_name": scene.file_name, "scene_id": scene.id, "messages": messages},
+            content_type="application/json",
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["code"], 200)
+        report_name = r.json()["data"]["file_name"]
+        report_path = os.path.join(settings.MEDIA_ROOT, report_name)
+        doc = Document(report_path)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        self.assertIn("控制字符前控制字符后", text)
+        self.assertIn("qwen3-vl-flash", text)
         os.remove(img_path)
         os.remove(report_path)

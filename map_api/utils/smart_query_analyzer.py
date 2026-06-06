@@ -24,6 +24,7 @@ INTENT_PATTERNS = {
     ],
     'macro': [
         r'(用地类型|土地利用|土地覆盖|地类|用地构成|用地结构)',
+        r'(农业|农田|耕地|田块|作物|长势|种植|高标准农田)',
         r'(城市规划|城市形态|城市格局|城镇体系|城市化)',
         r'(生态|环境|植被覆盖|绿地|森林|草原|湿地|荒漠)',
         r'(水系|流域|河流|湖泊|水库|海洋|海岸)',
@@ -50,6 +51,10 @@ ENTITY_PATTERNS = {
     'vegetation': [
         r'(植被|绿化|树|森林|林地|草地|草原|农田|耕地|庄稼|作物|稻田|麦田)',
         r'(绿色|绿地|绿化带|公园|花园)',
+    ],
+    'agriculture': [
+        r'(农业|农田|耕地|田块|田埂|农作物|作物|庄稼|稻田|麦田|玉米地|温室|大棚)',
+        r'(种植|长势|撂荒|复种|高标准农田|永久基本农田)',
     ],
     'building': [
         r'(建筑|房屋|楼房|住宅|小区|别墅|高楼|大厦|厂房|仓库|棚户|城中村)',
@@ -241,6 +246,7 @@ def score_tile_relevance(tile_features, query_entities, spatial_hints, tile_inde
 ENTITY_EN = {
     'water': 'water, river, lake, sea or reservoir',
     'vegetation': 'vegetation, forest, farmland or green field',
+    'agriculture': 'cropland, farmland, crop field, paddy field or greenhouse',
     'building': 'buildings or residential district',
     'road': 'roads, highways or road network',
     'mountain': 'mountains, hills or rugged terrain',

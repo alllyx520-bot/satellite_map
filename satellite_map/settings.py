@@ -11,9 +11,11 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 import os
 from pathlib import Path
+from .env import load_project_env
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_project_env(BASE_DIR)
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')  # 卫星图保存的本地绝对路径
 MEDIA_URL = '/media/'  # 前端访问图片的URL前缀
 LOG_DIR = os.path.join(MEDIA_ROOT, "logs")

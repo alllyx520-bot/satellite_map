@@ -26,6 +26,15 @@ TASK_RUBRICS = {
             "分析连续性、破碎化和与建设用地/水体的空间关系",
         ],
     },
+    "agriculture": {
+        "label": "农业耕地与作物长势解译",
+        "entities": {"agriculture"},
+        "rubric": [
+            "识别耕地、田块边界、温室大棚和农业设施等主要农业要素",
+            "结合色调、纹理和规则田块形态判断作物长势、撂荒或水田/旱地区分线索",
+            "分析田块破碎化、灌排条件、道路可达性和建设占用风险",
+        ],
+    },
     "built_up": {
         "label": "建设用地与城市形态解译",
         "entities": {"building", "urban", "road", "infrastructure"},
@@ -54,6 +63,14 @@ TASK_RUBRICS = {
         ],
     },
 }
+TASK_PRIORITY = {
+    "agriculture": 90,
+    "built_up": 80,
+    "terrain_hazard": 70,
+    "water": 60,
+    "vegetation": 50,
+    "land_use": 0,
+}
 
 
 def scene_source(scene):
@@ -73,7 +90,9 @@ def build_task_profile(query):
     best_score = 0
     for key, cfg in TASK_RUBRICS.items():
         score = len(entities & cfg["entities"])
-        if score > best_score:
+        if score > best_score or (
+            score == best_score and best_key and TASK_PRIORITY.get(key, 0) > TASK_PRIORITY.get(best_key, 0)
+        ):
             best_key = key
             best_score = score
 

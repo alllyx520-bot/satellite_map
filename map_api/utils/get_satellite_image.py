@@ -5,13 +5,14 @@ import os
 import math
 import time
 import threading
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 from io import BytesIO
 
-MAPBOX_TOKEN = os.environ.get('MAPBOX_TOKEN', '')
 CELL_MAX = 1280
 MAX_TOTAL = 4096
+logger = logging.getLogger(__name__)
 
 _download_progress = {}
 MAX_PROGRESS_ENTRIES = 50
@@ -81,9 +82,14 @@ def _update_progress(file_name, updates, progress_callback=None):
     return info
 
 
+def _mapbox_token():
+    return os.environ.get('MAPBOX_TOKEN', '')
+
+
 def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_name="satellite_result.jpg",
                           target_resolution=1024, ultra_hd=False, progress_callback=None):
     global _download_progress
+    token = _mapbox_token()
     target_resolution = min(MAX_TOTAL, max(1, target_resolution))
 
     lon_diff = max_lon - min_lon
@@ -109,16 +115,16 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
         actual_w = total_w * 2 if ultra_hd else total_w
         actual_h = total_h * 2 if ultra_hd else total_h
         _set_progress(file_name, {"total": 1, "done": 0, "failed": 0, "status": "downloading"}, progress_callback)
-        url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{min_lon},{min_lat},{max_lon},{max_lat}]/{actual_w}x{actual_h}{retina}?access_token={MAPBOX_TOKEN}"
+        url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{min_lon},{min_lat},{max_lon},{max_lat}]/{actual_w}x{actual_h}{retina}?access_token={token}"
         try:
             img = _fetch_tile(url, proxies)
             img.save(full_save_path, 'JPEG', quality=95)
             _set_progress(file_name, {"total": 1, "done": 1, "failed": 0, "status": "done"}, progress_callback)
-            print(f"[Mapbox] ✅ {full_save_path}")
+            logger.info("Mapbox image saved: %s", full_save_path)
             return full_save_path
         except Exception as e:
             _update_progress(file_name, {"status": "error", "error": str(e)[:200]}, progress_callback)
-            print(f"[Mapbox] ❌ {e}")
+            logger.warning("Mapbox image fetch failed: %s", e)
             return None
 
     # Large scene: split into grid and stitch
@@ -146,13 +152,13 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
         ch = cell_h if r < rows - 1 else total_h - r * cell_h
         cw = max(1, cw); ch = max(1, ch)
 
-        url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{c_min_lon},{c_min_lat},{c_max_lon},{c_max_lat}]/{cw}x{ch}{retina}?access_token={MAPBOX_TOKEN}"
+        url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{c_min_lon},{c_min_lat},{c_max_lon},{c_max_lat}]/{cw}x{ch}{retina}?access_token={token}"
         failed = False
         try:
             tile = _fetch_tile(url, proxies)
-            print(f"[Mapbox] tile ({r+1}/{rows},{c+1}/{cols}) OK")
+            logger.info("Mapbox tile (%s/%s,%s/%s) OK", r + 1, rows, c + 1, cols)
         except Exception as e:
-            print(f"[Mapbox] tile ({r+1}/{rows},{c+1}/{cols}) ❌ {e}")
+            logger.warning("Mapbox tile (%s/%s,%s/%s) failed: %s", r + 1, rows, c + 1, cols, e)
             failed = True
             tile = Image.new('RGB', (cw, ch), (40, 40, 40))
         with progress_lock:
@@ -175,10 +181,10 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
 
     if failed_tiles == total_tiles:
         _update_progress(file_name, {"status": "error", "failed": failed_tiles}, progress_callback)
-        print(f"[Mapbox] ❌ all tiles failed for {file_name}")
+        logger.warning("Mapbox all tiles failed for %s", file_name)
         return None
 
     _update_progress(file_name, {"status": "partial" if failed_tiles else "done", "failed": failed_tiles}, progress_callback)
     canvas.save(full_save_path, 'JPEG', quality=92)
-    print(f"[Mapbox] ✅ stitched {total_w}x{total_h} → {full_save_path}")
+    logger.info("Mapbox stitched image saved: %sx%s -> %s", total_w, total_h, full_save_path)
     return full_save_path

@@ -4,6 +4,7 @@ from django.conf import settings
 from django.shortcuts import render
 from http import HTTPStatus
 import dashscope
+import hashlib
 import json
 import os
 import uuid
@@ -15,7 +16,7 @@ import time
 from datetime import timedelta
 from PIL import Image
 from django.utils import timezone
-from django.db import close_old_connections
+from django.db import close_old_connections, connection
 
 from .utils.get_satellite_image import fetch_satellite_image, haversine_distance, get_download_progress, prune_progress, _download_progress
 from .utils.image_preprocessor import smart_prepare_image_v2, MAX_DIM_MAP
@@ -44,6 +45,7 @@ ANALYSIS_MODES = {
     "precise": {"model": "qwen3-vl-plus", "active_perception": True},
     "fast": {"model": "qwen3-vl-flash", "active_perception": False},
 }
+SENTINEL_FALLBACK_MSG = "近期公开影像源暂时不可用，可切回高清底图继续分析"
 
 
 def _call_qwen(model_name, messages):
@@ -125,6 +127,81 @@ def _as_bool(value):
     return bool(value)
 
 
+def _dir_writable(path):
+    os.makedirs(path, exist_ok=True)
+    probe = os.path.join(path, f".health_{uuid.uuid4().hex}.tmp")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        return True
+    except OSError:
+        return False
+    finally:
+        if os.path.exists(probe):
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
+
+
+def system_health(request):
+    if request.method != "GET":
+        return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
+
+    checks = {}
+    errors = {}
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        checks["database"] = True
+    except Exception as e:
+        checks["database"] = False
+        errors["database"] = str(e)[:160]
+
+    checks["media_root_writable"] = _dir_writable(settings.MEDIA_ROOT)
+    checks["satellite_image_dir_writable"] = _dir_writable(SAVE_DIR)
+
+    config = {
+        "mapbox_token": bool(os.environ.get("MAPBOX_TOKEN")),
+        "dashscope_api_key": bool(os.environ.get("DASHSCOPE_API_KEY")),
+        "amap_key": bool(os.environ.get("AMAP_KEY")),
+        "titiler_endpoint": os.environ.get("TITILER_ENDPOINT") or "https://titiler.xyz",
+    }
+    required_ok = checks["database"] and checks["media_root_writable"] and checks["satellite_image_dir_writable"]
+    required_ok = required_ok and config["mapbox_token"] and config["dashscope_api_key"]
+
+    return JsonResponse({
+        "code": 200,
+        "data": {
+            "status": "ok" if required_ok else "degraded",
+            "checks": checks,
+            "config": config,
+            "imagery_sources": {
+                "mapbox": {
+                    "role": "primary",
+                    "available": config["mapbox_token"],
+                    "label": "Mapbox 高清底图",
+                },
+                "sentinel2": {
+                    "role": "optional_recent_public",
+                    "available": True,
+                    "provider": "Element84 Earth Search / Sentinel-2 L2A",
+                    "renderer": config["titiler_endpoint"],
+                },
+            },
+            "analysis_modes": {
+                mode: {
+                    "model": cfg["model"],
+                    "active_perception": cfg["active_perception"],
+                }
+                for mode, cfg in ANALYSIS_MODES.items()
+            },
+            "errors": errors,
+        },
+    })
+
+
 def normalize_bbox(data):
     raw_min_lng = float(data['min_lng'])
     raw_min_lat = float(data['min_lat'])
@@ -189,8 +266,70 @@ def scene_payload(scene):
     }
 
 
-def scene_from_candidate(file_name, candidate, bbox, area_km2, rendered_gsd_m=None):
+def sentinel_cache_key(candidate, bbox, width, height):
+    payload = {
+        "source": "sentinel2",
+        "collection": candidate.collection,
+        "item_id": candidate.item_id,
+        "visual_asset": (candidate.assets.get("visual") or {}).get("href", ""),
+        "bbox": {key: round(float(bbox[key]), 6) for key in ("min_lng", "min_lat", "max_lng", "max_lat")},
+        "width": int(width),
+        "height": int(height),
+    }
+    raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def find_cached_sentinel_scene(candidate, bbox, width, height):
+    key = sentinel_cache_key(candidate, bbox, width, height)
+    scenes = ImageryScene.objects.filter(
+        source="sentinel2",
+        product_id=candidate.product_id,
+    ).order_by("-updated_at")
+    for scene in scenes[:30]:
+        metadata = scene.metadata or {}
+        if metadata.get("sentinel_cache_key") != key:
+            continue
+        image_path = safe_media_path(SAVE_DIR, scene.file_name, (".jpg", ".jpeg", ".png"))
+        if image_path and os.path.exists(image_path):
+            return scene
+    return None
+
+
+def sentinel_response_data(scene, candidate, plan, resolution, cache_hit=False):
+    return {
+        "file_name": scene.file_name,
+        "total_tiles": 1,
+        "scene_id": scene.id,
+        "scene": scene_payload(scene),
+        "candidate": candidate.as_dict(),
+        "cache_hit": cache_hit,
+        "gsd_m": scene.gsd_m,
+        "area_km2": scene.area_km2,
+        "resolution_px": resolution,
+        "render_width": plan["total_w"],
+        "render_height": plan["total_h"],
+    }
+
+
+def scene_from_candidate(file_name, candidate, bbox, area_km2, rendered_gsd_m=None, cache_key="", render_size=None):
     rendered_gsd_m = rendered_gsd_m if rendered_gsd_m is not None else candidate.gsd_m
+    metadata = {
+        **candidate.metadata,
+        "collection": candidate.collection,
+        "item_id": candidate.item_id,
+        "suitability_score": candidate.suitability_score,
+        "score_reasons": candidate.score_reasons,
+        "assets": candidate.assets,
+        "links": candidate.links,
+        "rendered_by": "titiler",
+        "source_asset_gsd_m": candidate.gsd_m,
+        "rendered_gsd_m": round(rendered_gsd_m, 2),
+    }
+    if cache_key:
+        metadata["sentinel_cache_key"] = cache_key
+    if render_size:
+        metadata["render_size_px"] = render_size
     return ImageryScene.objects.create(
         file_name=file_name,
         source="sentinel2",
@@ -209,18 +348,7 @@ def scene_from_candidate(file_name, candidate, bbox, area_km2, rendered_gsd_m=No
         license_type=candidate.license_type,
         decision_grade=candidate.decision_grade,
         limitations=candidate.limitations,
-        metadata={
-            **candidate.metadata,
-            "collection": candidate.collection,
-            "item_id": candidate.item_id,
-            "suitability_score": candidate.suitability_score,
-            "score_reasons": candidate.score_reasons,
-            "assets": candidate.assets,
-            "links": candidate.links,
-            "rendered_by": "titiler",
-            "source_asset_gsd_m": candidate.gsd_m,
-            "rendered_gsd_m": round(rendered_gsd_m, 2),
-        },
+        metadata=metadata,
     )
 
 
@@ -240,6 +368,72 @@ def imagery_context_text(scene):
         f"数据限制：{scene.limitations}\n"
         "回答时必须基于上述数据限制说明不确定性，不得把参考级底图结论表述为已复核证据。"
     )
+
+
+def analysis_method_payload(mode, model_name, strategy, active_stages=1):
+    strategy = strategy or {}
+    task = strategy.get("task_profile") or {}
+    return {
+        "mode": mode,
+        "model": model_name,
+        "source": strategy.get("source", "unknown"),
+        "task": task.get("task", ""),
+        "task_label": task.get("label", "综合遥感解译"),
+        "active_perception": bool(strategy.get("active_perception")),
+        "active_stages": active_stages,
+        "strengths": strategy.get("strengths") or [],
+        "limits": strategy.get("limits") or [],
+        "method_notes": strategy.get("method_notes") or [],
+    }
+
+
+def latest_analysis_method(messages):
+    if not isinstance(messages, list):
+        return None
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        method = msg.get("analysis_method")
+        if isinstance(method, dict):
+            return method
+    return None
+
+
+def docx_safe_text(value):
+    text = "" if value is None else str(value)
+    safe_chars = []
+    for ch in text:
+        code = ord(ch)
+        if ch in ("\t", "\n", "\r"):
+            safe_chars.append(ch)
+        elif 0x20 <= code <= 0xD7FF or 0xE000 <= code <= 0xFFFD or 0x10000 <= code <= 0x10FFFF:
+            safe_chars.append(ch)
+    return "".join(safe_chars)
+
+
+def join_method_items(items):
+    if not isinstance(items, list):
+        return ""
+    parts = [docx_safe_text(item) for item in items]
+    return "；".join(part for part in parts if part)
+
+
+def history_image_available(image_file):
+    path = safe_media_path(SAVE_DIR, image_file, ('.jpg', '.jpeg', '.png'))
+    return bool(path and os.path.exists(path))
+
+
+def chat_history_payload(obj):
+    return {
+        "id": obj.id,
+        "scene_id": obj.scene_id,
+        "image_file": obj.image_file,
+        "spatial_context": obj.spatial_context,
+        "bbox": obj.bbox,
+        "image_available": True,
+        "created_at": obj.created_at,
+        "updated_at": obj.updated_at,
+    }
 
 
 def index_view(request):
@@ -363,27 +557,59 @@ def get_sentinel_img_api(request):
         bbox = {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat}
         plan = compute_image_plan(min_lng, min_lat, max_lng, max_lat, resolution)
         provider = EarthSearchProvider(titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
-        candidates = provider.search(
-            bbox,
-            start_date=start_date,
-            end_date=end_date,
-            max_cloud=max_cloud,
-            limit=1,
-            collection="sentinel-2-l2a",
-        )
+        try:
+            candidates = provider.search(
+                bbox,
+                start_date=start_date,
+                end_date=end_date,
+                max_cloud=max_cloud,
+                limit=1,
+                collection="sentinel-2-l2a",
+            )
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("sentinel image search failed: %s", e)
+            return JsonResponse({"code": 502, "msg": SENTINEL_FALLBACK_MSG, "data": None}, status=502)
         if not candidates:
-            return JsonResponse({"code": 404, "msg": "未找到符合条件的 Sentinel-2 影像", "data": None}, status=404)
+            return JsonResponse({"code": 404, "msg": "未找到符合条件的 Sentinel-2 影像，可切回高清底图继续分析", "data": None}, status=404)
 
         candidate = candidates[0]
-        image_bytes = provider.render_candidate_jpeg(candidate, bbox, plan["total_w"], plan["total_h"])
         rendered_gsd = plan["gsd_m"]
+        cache_key = sentinel_cache_key(candidate, bbox, plan["total_w"], plan["total_h"])
+        cached_scene = find_cached_sentinel_scene(candidate, bbox, plan["total_w"], plan["total_h"])
+        if cached_scene:
+            _download_progress[cached_scene.file_name] = {
+                "total": 1,
+                "done": 1,
+                "failed": 0,
+                "status": "done",
+                "scene_id": cached_scene.id,
+            }
+            return JsonResponse({
+                "code": 200,
+                "msg": "已复用本地 Sentinel-2 影像缓存",
+                "data": sentinel_response_data(cached_scene, candidate, plan, resolution, cache_hit=True),
+            })
+
+        try:
+            image_bytes = provider.render_candidate_jpeg(candidate, bbox, plan["total_w"], plan["total_h"])
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("sentinel image render failed: %s", e)
+            return JsonResponse({"code": 502, "msg": SENTINEL_FALLBACK_MSG, "data": None}, status=502)
         file_name = f"sentinel_{uuid.uuid4().hex[:8]}.jpg"
         full_path = os.path.join(SAVE_DIR, file_name)
         scene = None
         with open(full_path, "wb") as f:
             f.write(image_bytes)
         try:
-            scene = scene_from_candidate(file_name, candidate, bbox, plan["area_km2"], rendered_gsd_m=rendered_gsd)
+            scene = scene_from_candidate(
+                file_name,
+                candidate,
+                bbox,
+                plan["area_km2"],
+                rendered_gsd_m=rendered_gsd,
+                cache_key=cache_key,
+                render_size={"width": plan["total_w"], "height": plan["total_h"]},
+            )
             DownloadTask.objects.create(
                 scene=scene,
                 file_name=file_name,
@@ -410,20 +636,8 @@ def get_sentinel_img_api(request):
         return JsonResponse({
             "code": 200,
             "msg": "Sentinel-2 影像已生成",
-            "data": {
-                "file_name": file_name,
-                "total_tiles": 1,
-                "scene_id": scene.id,
-                "scene": scene_payload(scene),
-                "candidate": candidate.as_dict(),
-                "gsd_m": round(rendered_gsd, 2),
-                "area_km2": round(plan["area_km2"], 4),
-                "resolution_px": resolution,
-            }
+            "data": sentinel_response_data(scene, candidate, plan, resolution, cache_hit=False),
         })
-    except requests.RequestException as e:
-        logger.warning("sentinel image provider failed: %s", e)
-        return JsonResponse({"code": 502, "msg": "Sentinel-2 影像源或渲染服务暂时不可用", "data": None}, status=502)
     except Exception as e:
         return JsonResponse({"code": 400, "msg": str(e), "data": None}, status=400)
 
@@ -526,7 +740,9 @@ def ai_query_region(request):
         if not isinstance(front_history, list):
             front_history = []
         mode = data.get("mode", "precise")
-        mode_cfg = ANALYSIS_MODES.get(mode, ANALYSIS_MODES["precise"])
+        if mode not in ANALYSIS_MODES:
+            mode = "precise"
+        mode_cfg = ANALYSIS_MODES[mode]
         model_name = mode_cfg["model"]
         gsd = data.get("gsd")              # 米/像素(用于 GSD 测量)
         geo_bbox = data.get("bbox")        # 图像地理范围 {min_lng,max_lng,min_lat,max_lat}(用于坐标接地)
@@ -755,6 +971,7 @@ def ai_query_region(request):
                 "targets": targets,
                 "scene": scene_payload(scene) if scene else None,
                 "analysis_strategy": strategy,
+                "analysis_method": analysis_method_payload(mode, model_name, strategy, active_stages),
             }
         })
 
@@ -823,8 +1040,11 @@ def cleanup_cache(request):
 
         deleted_files = 0
         freed_bytes = 0
+        deleted_image_files = []
         roots = [SAVE_DIR, REPORT_DIR]
         report_ext = (".docx",)
+        image_ext = (".jpg", ".jpeg", ".png")
+        save_real = os.path.realpath(SAVE_DIR)
 
         for root in roots:
             if not os.path.isdir(root):
@@ -843,12 +1063,19 @@ def cleanup_cache(request):
                     os.remove(path)
                     deleted_files += 1
                     freed_bytes += size
+                    if root_real == save_real and name.lower().endswith(image_ext):
+                        deleted_image_files.append(name)
 
         if clean_all:
             DownloadTask.objects.all().delete()
             ImageryScene.objects.all().delete()
+            ChatHistory.objects.all().delete()
             _download_progress.clear()
         else:
+            if deleted_image_files:
+                DownloadTask.objects.filter(file_name__in=deleted_image_files).delete()
+                ImageryScene.objects.filter(file_name__in=deleted_image_files).delete()
+                ChatHistory.objects.filter(image_file__in=deleted_image_files).delete()
             DownloadTask.objects.filter(updated_at__lt=cutoff).delete()
             for key, info in list(_download_progress.items()):
                 if info.get("status") in ("done", "partial", "error"):
@@ -858,6 +1085,7 @@ def cleanup_cache(request):
             "code": 200,
             "data": {
                 "deleted_files": deleted_files,
+                "deleted_image_records": len(deleted_image_files),
                 "freed_mb": round(freed_bytes / (1024 * 1024), 2),
             }
         })
@@ -925,10 +1153,14 @@ def imagery_search(request):
 @csrf_exempt
 def chat_history_list(request):
     if request.method == "GET":
-        histories = ChatHistory.objects.values(
-            "id", "scene_id", "image_file", "spatial_context", "bbox", "created_at", "updated_at"
-        )[:20]
-        return JsonResponse({"code": 200, "data": list(histories)})
+        histories = []
+        for obj in ChatHistory.objects.all()[:100]:
+            if not history_image_available(obj.image_file):
+                continue
+            histories.append(chat_history_payload(obj))
+            if len(histories) >= 20:
+                break
+        return JsonResponse({"code": 200, "data": histories})
     if request.method == "POST":
         try:
             data = json.loads(request.body)
@@ -940,6 +1172,8 @@ def chat_history_list(request):
             messages = data.get("messages", [])
             if not isinstance(messages, list):
                 return JsonResponse({"code": 400, "msg": "invalid messages"})
+            if not history_image_available(image_file):
+                return JsonResponse({"code": 410, "msg": "历史影像文件已丢失，请重新框选分析"}, status=410)
             scene = None
             if data.get("scene_id"):
                 scene = ImageryScene.objects.filter(id=data.get("scene_id"), file_name=image_file).first()
@@ -969,11 +1203,14 @@ def chat_history_detail(request, history_id):
     if request.method == "GET":
         try:
             obj = ChatHistory.objects.get(id=history_id)
+            if not history_image_available(obj.image_file):
+                return JsonResponse({"code": 410, "msg": "历史影像文件已丢失，请重新框选分析"}, status=410)
             return JsonResponse({"code": 200, "data": {
                 "id": obj.id, "image_file": obj.image_file,
                 "messages": obj.messages, "spatial_context": obj.spatial_context,
                 "bbox": obj.bbox, "scene_id": obj.scene_id,
                 "scene": scene_payload(obj.scene) if obj.scene else None,
+                "image_available": True,
                 "created_at": obj.created_at.isoformat(),
             }})
         except ChatHistory.DoesNotExist:
@@ -989,16 +1226,27 @@ def chat_history_detail(request, history_id):
 # ----------------------
 @csrf_exempt
 def generate_report(request):
+    if request.method != "POST":
+        return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
     try:
         data = _json_body(request)
-        file_name = data.get("file_name", "")
-        title = data.get("title", "遥感分析报告")
+        file_name = os.path.basename(data.get("file_name", "") or "")
+        if file_name == "__compare__":
+            file_name = ""
+        if file_name and not file_name.lower().endswith(('.jpg', '.jpeg', '.png')):
+            return JsonResponse({"code": 400, "msg": "invalid file_name"}, status=400)
+        if file_name and not history_image_available(file_name):
+            return JsonResponse({"code": 410, "msg": "卫星图文件已丢失，请重新框选"}, status=410)
+        title = docx_safe_text(data.get("title", "遥感分析报告"))
         messages = data.get("messages", [])
-        spatial_ctx = data.get("spatial_context", "")
+        spatial_ctx = docx_safe_text(data.get("spatial_context", ""))
         bbox = data.get("bbox", {})
         scene = None
         if data.get("scene_id"):
-            scene = ImageryScene.objects.filter(id=data.get("scene_id")).first()
+            scene_qs = ImageryScene.objects.filter(id=data.get("scene_id"))
+            if file_name:
+                scene_qs = scene_qs.filter(file_name=file_name)
+            scene = scene_qs.first()
         if not scene and file_name:
             scene = ImageryScene.objects.filter(file_name=os.path.basename(file_name)).first()
 
@@ -1049,17 +1297,17 @@ def generate_report(request):
             loc_text = f"经度：{bbox.get('min_lng', '?')} ~ {bbox.get('max_lng', '?')}  纬度：{bbox.get('min_lat', '?')} ~ {bbox.get('max_lat', '?')}"
             if spatial_ctx:
                 loc_text += f"\n{spatial_ctx}"
-            doc.add_paragraph(loc_text)
+            doc.add_paragraph(docx_safe_text(loc_text))
         elif spatial_ctx:
             doc.add_heading("空间数据", level=2)
-            doc.add_paragraph(spatial_ctx)
+            doc.add_paragraph(docx_safe_text(spatial_ctx))
 
         if scene:
             doc.add_heading("影像数据说明", level=2)
             acquired = scene.acquired_at.strftime("%Y-%m-%d %H:%M") if scene.acquired_at else "未知"
             published = scene.published_at.strftime("%Y-%m-%d %H:%M") if scene.published_at else "未知"
             cloud = f"{scene.cloud_percent}%" if scene.cloud_percent is not None else "未知"
-            doc.add_paragraph(
+            doc.add_paragraph(docx_safe_text(
                 f"数据源：{scene.source_label}\n"
                 f"拍摄时间：{acquired}\n"
                 f"发布时间：{published}\n"
@@ -1069,7 +1317,33 @@ def generate_report(request):
                 f"授权类型：{scene.license_type}\n"
                 f"决策等级：{scene.decision_grade}\n"
                 f"数据限制：{scene.limitations}"
+            ))
+
+        analysis_method = latest_analysis_method(messages)
+        if analysis_method:
+            doc.add_heading("AI 分析方法说明", level=2)
+            mode_label = "精准模式" if analysis_method.get("mode") == "precise" else "快速模式"
+            active_text = (
+                f"启用，{analysis_method.get('active_stages', 1)} 级分析"
+                if analysis_method.get("active_perception") else "未启用"
             )
+            method_lines = [
+                f"分析模式：{mode_label}",
+                f"视觉模型：{docx_safe_text(analysis_method.get('model', '未知'))}",
+                f"任务画像：{docx_safe_text(analysis_method.get('task_label', '综合遥感解译'))}",
+                f"图像源类型：{docx_safe_text(analysis_method.get('source', 'unknown'))}",
+                f"主动感知：{active_text}",
+            ]
+            strengths = join_method_items(analysis_method.get("strengths"))
+            limits = join_method_items(analysis_method.get("limits"))
+            notes = join_method_items(analysis_method.get("method_notes"))
+            if strengths:
+                method_lines.append("可重点分析：" + strengths)
+            if limits:
+                method_lines.append("判读边界：" + limits)
+            if notes:
+                method_lines.append("方法提示：" + notes)
+            doc.add_paragraph(docx_safe_text("\n".join(method_lines)))
 
         if file_name:
             img_path = safe_media_path(SAVE_DIR, file_name, ('.jpg', '.jpeg', '.png'))
@@ -1091,7 +1365,7 @@ def generate_report(request):
                 run_label.font.size = Pt(10.5)
                 run_label.font.bold = True
                 run_label.font.color.rgb = color
-                run_content = p.add_run(msg.get("content", ""))
+                run_content = p.add_run(docx_safe_text(msg.get("content", "")))
                 run_content.font.name = 'Microsoft YaHei'
                 run_content.font.size = Pt(10.5)
 
@@ -1103,6 +1377,7 @@ def generate_report(request):
         download_url = f"/api/report/download/?file={report_name}"
         return JsonResponse({"code": 200, "data": {"file_name": report_name, "download_url": download_url}})
     except Exception as e:
+        logger.exception("report generation failed")
         return JsonResponse({"code": 500, "msg": str(e)})
 
 

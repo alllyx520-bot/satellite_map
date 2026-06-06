@@ -938,7 +938,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     aiContent = `🔍 主动感知（${result.data.active_stages}级分析）\n\n` + aiContent;
                 }
                 if (result.data.scene) data.scene = result.data.scene;
-                data.history.push({ role: 'ai', content: aiContent });
+                data.history.push({
+                    role: 'ai',
+                    content: aiContent,
+                    analysis_method: result.data.analysis_method || null
+                });
                 if (!isCompare) placeTargetMarkers(result.data.targets);  // 把 AI 定位目标标到地图
             } else {
                 data.history.push({ role: 'ai', content: "❌ 分析失败: " + result.msg });
@@ -1254,6 +1258,9 @@ document.addEventListener('DOMContentLoaded', () => {
                             map.fitBounds([[b.min_lat, b.min_lng], [b.max_lat, b.max_lng]]);
                         }
                         showToast('已加载历史对话', 'info');
+                    } else if (dd.code === 410) {
+                        showToast(dd.msg || '历史影像文件已丢失', 'error');
+                        loadHistories();
                     }
                 });
                 const delBtn = document.createElement('button');
@@ -1278,7 +1285,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!Array.isArray(mem.history) || mem.history.length === 0) return;
         const bbox = mem.bbox ? mem.bbox : {};
         try {
-            await fetch('/api/ai/history/', {
+            const r = await fetch('/api/ai/history/', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1289,6 +1296,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     bbox: bbox
                 })
             });
+            const d = await r.json();
+            if (d.code === 410) {
+                showToast(d.msg || '历史影像文件已丢失', 'error');
+            }
             loadHistories();
         } catch (e) {}
     }
@@ -1317,6 +1328,9 @@ document.addEventListener('DOMContentLoaded', () => {
             if (d.code === 200) {
                 window.location.href = d.data.download_url;
                 showToast('报告已生成，正在下载', 'success');
+            } else if (d.code === 410) {
+                showToast(d.msg || '卫星图文件已丢失，请重新框选', 'error');
+                loadHistories();
             } else {
                 showToast('报告生成失败：' + d.msg, 'error');
             }

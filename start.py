@@ -8,12 +8,12 @@ from django.core.management import execute_from_command_line
 def open_browser():
     """延迟 2 秒后，自动调用系统默认浏览器打开网址"""
     time.sleep(2)
-    print("\n🌍 正在自动打开浏览器，进入 AI 遥感分析舱...\n")
+    print("\n正在自动打开浏览器，进入 AI 遥感分析舱...\n")
     webbrowser.open('http://127.0.0.1:8000/')
 
 if __name__ == '__main__':
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+    from satellite_map.env import load_project_env
+    load_project_env(os.path.dirname(__file__))
     # 1. 指定 Django 的配置路径
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'satellite_map.settings')
     
@@ -21,5 +21,5 @@ if __name__ == '__main__':
     threading.Thread(target=open_browser, daemon=True).start()
     
     # 3. 启动 Django 服务器 (打包成 exe 后，必须加 --noreload 禁用热重载)
-    print("🚀 系统启动中，请勿关闭此窗口...")
+    print("系统启动中，请勿关闭此窗口...")
     execute_from_command_line(['manage.py', 'runserver', '127.0.0.1:8000', '--noreload'])
