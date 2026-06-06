@@ -189,7 +189,8 @@ def scene_payload(scene):
     }
 
 
-def scene_from_candidate(file_name, candidate, bbox, area_km2):
+def scene_from_candidate(file_name, candidate, bbox, area_km2, rendered_gsd_m=None):
+    rendered_gsd_m = rendered_gsd_m if rendered_gsd_m is not None else candidate.gsd_m
     return ImageryScene.objects.create(
         file_name=file_name,
         source="sentinel2",
@@ -201,7 +202,7 @@ def scene_from_candidate(file_name, candidate, bbox, area_km2):
         min_lat=bbox["min_lat"],
         max_lng=bbox["max_lng"],
         max_lat=bbox["max_lat"],
-        gsd_m=candidate.gsd_m,
+        gsd_m=round(rendered_gsd_m, 2),
         area_km2=round(area_km2, 4),
         cloud_percent=candidate.cloud_percent,
         processing_level=candidate.processing_level,
@@ -217,6 +218,8 @@ def scene_from_candidate(file_name, candidate, bbox, area_km2):
             "assets": candidate.assets,
             "links": candidate.links,
             "rendered_by": "titiler",
+            "source_asset_gsd_m": candidate.gsd_m,
+            "rendered_gsd_m": round(rendered_gsd_m, 2),
         },
     )
 
@@ -373,13 +376,14 @@ def get_sentinel_img_api(request):
 
         candidate = candidates[0]
         image_bytes = provider.render_candidate_jpeg(candidate, bbox, plan["total_w"], plan["total_h"])
+        rendered_gsd = plan["gsd_m"]
         file_name = f"sentinel_{uuid.uuid4().hex[:8]}.jpg"
         full_path = os.path.join(SAVE_DIR, file_name)
         scene = None
         with open(full_path, "wb") as f:
             f.write(image_bytes)
         try:
-            scene = scene_from_candidate(file_name, candidate, bbox, plan["area_km2"])
+            scene = scene_from_candidate(file_name, candidate, bbox, plan["area_km2"], rendered_gsd_m=rendered_gsd)
             DownloadTask.objects.create(
                 scene=scene,
                 file_name=file_name,
@@ -391,7 +395,7 @@ def get_sentinel_img_api(request):
                 min_lat=min_lat,
                 max_lng=max_lng,
                 max_lat=max_lat,
-                gsd_m=candidate.gsd_m,
+                gsd_m=round(rendered_gsd, 2),
                 area_km2=round(plan["area_km2"], 4),
                 resolution_px=resolution,
             )
@@ -412,7 +416,7 @@ def get_sentinel_img_api(request):
                 "scene_id": scene.id,
                 "scene": scene_payload(scene),
                 "candidate": candidate.as_dict(),
-                "gsd_m": candidate.gsd_m,
+                "gsd_m": round(rendered_gsd, 2),
                 "area_km2": round(plan["area_km2"], 4),
                 "resolution_px": resolution,
             }
