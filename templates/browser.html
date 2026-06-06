@@ -6,7 +6,7 @@
     <title>SatelliteSense · 遥感分析</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     
-    <link rel="stylesheet" href="/static/browser.css?v=7">
+    <link rel="stylesheet" href="/static/browser.css?v=8">
 
 
 
@@ -30,10 +30,16 @@
         <div id="sidebar">
             <div class="sidebar-header">
                 <span><span id="record-count">0</span> 个区域 <span id="compare-toggle" style="font-size:12px;font-weight:400;color:rgba(255,255,255,0.4);cursor:pointer;margin-left:8px;">对比</span></span>
-                <select id="map-style-toggle" class="custom-select">
-                    <option value="normal">🗺️ 街道图</option>
-                    <option value="satellite">🌍 卫星图</option>
-                </select>
+                <div class="sidebar-selects">
+                    <select id="imagery-source-toggle" class="custom-select" title="分析图像源">
+                        <option value="mapbox" selected>高清底图</option>
+                        <option value="sentinel2">近期公开影像</option>
+                    </select>
+                    <select id="map-style-toggle" class="custom-select">
+                        <option value="normal">🗺️ 街道图</option>
+                        <option value="satellite">🌍 卫星图</option>
+                    </select>
+                </div>
             </div>
             <div id="compare-bar" style="display:none; padding:8px 14px; border-bottom:0.5px solid rgba(255,255,255,0.06);">
                 <button id="compare-btn" style="width:100%; padding:8px; background:#007aff; color:white; border:none; border-radius:8px; cursor:pointer; font-weight:600; font-size:13px;">对比所选区域</button>
@@ -68,7 +74,7 @@
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     
-    <script src="/static/browser.js?v=8"></script>
+    <script src="/static/browser.js?v=9"></script>
 <div id="chat-modal" style="display: none;">
         <div class="chat-modal-content">
             <div class="chat-modal-header">

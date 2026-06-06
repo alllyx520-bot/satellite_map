@@ -63,6 +63,14 @@ html, body {
     align-items: center;
 }
 
+.sidebar-selects {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
 #coords-list {
     flex: 1;
     overflow-y: auto;

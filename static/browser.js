@@ -17,6 +17,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }).setView(INITIAL_VIEW.center, INITIAL_VIEW.zoom);
 
     const styleToggle = document.getElementById('map-style-toggle');
+    const imagerySourceToggle = document.getElementById('imagery-source-toggle');
     if (styleToggle) {
         styleToggle.addEventListener('change', (e) => {
             if (e.target.value === 'satellite') {
@@ -80,6 +81,14 @@ document.addEventListener('DOMContentLoaded', () => {
     function sceneBrief(scene) {
         if (!scene) return '';
         return `${scene.source_label || scene.source || '影像源'} · ${sceneGradeText(scene.decision_grade)}`;
+    }
+
+    function getImagerySource() {
+        return imagerySourceToggle?.value === 'sentinel2' ? 'sentinel2' : 'mapbox';
+    }
+
+    function imagerySourceLabel(source) {
+        return source === 'sentinel2' ? '近期公开影像' : '高清底图';
     }
 
     // ==========================================
@@ -377,7 +386,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <span class="progress-text" style="font-size:11px; color:rgba(255,255,255,0.4);">0/0</span>
             </div>
             <div class="ai-status">
-                <span class="spinner"></span> 正在抓取高清卫星图...
+                <span class="spinner"></span> 正在准备影像...
             </div>
             <div class="ai-question" style="margin-top:10px; display:none;">
                 <button class="enter-cabin-btn" style="width:100%; padding:10px; background:#007aff; color:white; border:none; border-radius:9999px; cursor:pointer; font-weight:600; font-size:13px; transition:all 0.3s cubic-bezier(0.25,0.1,0.25,1);">
@@ -520,10 +529,14 @@ document.addEventListener('DOMContentLoaded', () => {
         const progressBar = itemEl.querySelector('.tile-progress');
         const fill = progressBar.querySelector('.progress-bar-fill');
         const progressText = progressBar.querySelector('.progress-text');
-        let pollTimer = null;
+        const imagerySource = getImagerySource();
+        const endpoint = imagerySource === 'sentinel2' ? "/api/satellite/get-sentinel-img/" : "/api/satellite/get-img/";
 
         try {
-            const r = await fetch("/api/satellite/get-img/", {
+            status.style.display = 'block';
+            status.innerHTML = `<span class="spinner"></span> 正在获取${imagerySourceLabel(imagerySource)}...`;
+
+            const r = await fetch(endpoint, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ min_lng, max_lng, min_lat, max_lat })
@@ -552,37 +565,43 @@ document.addEventListener('DOMContentLoaded', () => {
                     sceneBriefEl.hidden = false;
                 }
 
-                status.style.display = 'block';
-                status.innerHTML = '<span class="spinner"></span> 正在下载瓦片...';
-                progressBar.style.display = 'block';
-                progressText.textContent = `0/${totalTiles}`;
+                const showReadyImage = () => {
+                    previewImg.src = imgUrl + '&t=' + Date.now();
+                    previewImg.dataset.filename = fileName;
+                    previewImg.style.display = 'block';
+                    previewImg.style.animation = 'none';
+                    void previewImg.offsetHeight;
+                    previewImg.style.animation = 'fadeIn 0.4s ease';
+                    questionBox.style.display = 'block';
+                    enterBtn.onclick = () => {
+                        map.fitBounds([[se.lat, nw.lng], [nw.lat, se.lng]]);
+                        openChatModal(fileName, imgUrl, spatialCtx);
+                    };
+                };
 
-                await pollDownloadProgress(fileName, totalTiles, {
-                    ownerEl: itemEl,
-                    progressBar,
-                    fill,
-                    progressText,
-                    statusEl: status,
-                    onReady: () => {
-                        previewImg.src = imgUrl + '&t=' + Date.now();
-                        previewImg.dataset.filename = fileName;
-                        previewImg.style.display = 'block';
-                        previewImg.style.animation = 'none';
-                        void previewImg.offsetHeight;
-                        previewImg.style.animation = 'fadeIn 0.4s ease';
-                        questionBox.style.display = 'block';
-                        enterBtn.onclick = () => {
-                            map.fitBounds([[se.lat, nw.lng], [nw.lat, se.lng]]);
-                            openChatModal(fileName, imgUrl, spatialCtx);
-                        };
-                    }
-                });
+                if (imagerySource === 'sentinel2') {
+                    status.style.display = 'none';
+                    progressBar.style.display = 'none';
+                    showReadyImage();
+                    showToast('近期公开影像已生成', 'success');
+                } else {
+                    status.innerHTML = '<span class="spinner"></span> 正在下载瓦片...';
+                    progressBar.style.display = 'block';
+                    progressText.textContent = `0/${totalTiles}`;
+                    await pollDownloadProgress(fileName, totalTiles, {
+                        ownerEl: itemEl,
+                        progressBar,
+                        fill,
+                        progressText,
+                        statusEl: status,
+                        onReady: showReadyImage
+                    });
+                }
             } else {
                 status.innerHTML = '抓取失败：' + d.msg;
                 showToast('抓取失败：' + d.msg, 'error');
             }
         } catch (e) {
-            if (pollTimer) clearInterval(pollTimer);
             status.innerHTML = '网络错误，请检查后端';
             showToast('网络请求失败，请确认后端运行中', 'error');
         }
