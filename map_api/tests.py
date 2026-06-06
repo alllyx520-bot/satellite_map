@@ -237,6 +237,29 @@ class ImageryMetadataTests(SimpleTestCase):
         self.assertIn("缺少明确拍摄时间", reasons)
         self.assertIn("缺少云量指标", reasons)
 
+    def test_titiler_json_response_is_not_saved_as_image(self):
+        item = {
+            "id": "S2A_TEST",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {"datetime": "2026-06-01T03:17:00Z"},
+            "assets": {"visual": {"href": "https://example.com/visual.tif", "gsd": 10}},
+        }
+        candidate = EarthSearchProvider().candidate_from_item(item)
+        response = type("Response", (), {
+            "headers": {"content-type": "application/json"},
+            "content": b'{"detail":"error"}',
+            "raise_for_status": lambda self: None,
+        })()
+        with patch("map_api.imagery_sources.earth_search.requests.get", return_value=response):
+            with self.assertRaises(ValueError):
+                EarthSearchProvider().render_candidate_jpeg(
+                    candidate,
+                    {"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4},
+                    256,
+                    256,
+                )
+
 
 class HistoryApiTests(TestCase):
     def test_rejects_compare_history(self):
@@ -359,6 +382,39 @@ class ImagerySceneApiTests(TestCase):
             "/api/imagery/search/?provider=x&min_lng=1&min_lat=2&max_lng=3&max_lat=4"
         )
         self.assertEqual(r.status_code, 400)
+
+    def test_sentinel_image_endpoint_creates_scene_and_file(self):
+        item = {
+            "id": "S2A_TEST",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-06-01T03:17:00Z",
+                "updated": "2026-06-01T08:00:00Z",
+                "eo:cloud_cover": 8.5,
+                "s2:product_uri": "S2A_PRODUCT.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/visual.tif", "gsd": 10}},
+        }
+        candidate = EarthSearchProvider().candidate_from_item(item)
+        with patch("map_api.views.EarthSearchProvider.search", return_value=[candidate]), \
+                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", return_value=b"jpg"):
+            r = self.client.post(
+                "/api/satellite/get-sentinel-img/",
+                data={"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4},
+                content_type="application/json",
+            )
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertTrue(data["file_name"].startswith("sentinel_"))
+        self.assertEqual(data["scene"]["source"], "sentinel2")
+        self.assertEqual(data["scene"]["product_id"], "S2A_PRODUCT.SAFE")
+        self.assertEqual(data["scene"]["decision_grade"], "screening")
+        self.assertTrue(ImageryScene.objects.filter(file_name=data["file_name"]).exists())
+        self.assertTrue(DownloadTask.objects.filter(file_name=data["file_name"], status="done").exists())
+        img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", data["file_name"])
+        self.assertTrue(os.path.exists(img_path))
+        os.remove(img_path)
 
 
 class ReportSceneTests(TestCase):

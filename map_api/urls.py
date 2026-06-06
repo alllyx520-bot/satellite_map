@@ -3,6 +3,7 @@ from . import views
 
 urlpatterns = [
     path('satellite/get-img/', views.get_satellite_img_api, name='get_satellite_img'),
+    path('satellite/get-sentinel-img/', views.get_sentinel_img_api, name='get_sentinel_img'),
     path('satellite/show-img/', views.show_satellite_image, name='show_satellite_image'),
     path('satellite/progress/', views.get_progress, name='get_progress'),
     path('satellite/cleanup/', views.cleanup_cache, name='cleanup_cache'),

@@ -188,6 +188,38 @@ def scene_payload(scene):
     }
 
 
+def scene_from_candidate(file_name, candidate, bbox, area_km2):
+    return ImageryScene.objects.create(
+        file_name=file_name,
+        source="sentinel2",
+        source_label="Sentinel-2 L2A",
+        product_id=candidate.product_id,
+        acquired_at=candidate.acquired_at,
+        published_at=candidate.published_at,
+        min_lng=bbox["min_lng"],
+        min_lat=bbox["min_lat"],
+        max_lng=bbox["max_lng"],
+        max_lat=bbox["max_lat"],
+        gsd_m=candidate.gsd_m,
+        area_km2=round(area_km2, 4),
+        cloud_percent=candidate.cloud_percent,
+        processing_level=candidate.processing_level,
+        license_type=candidate.license_type,
+        decision_grade=candidate.decision_grade,
+        limitations=candidate.limitations,
+        metadata={
+            **candidate.metadata,
+            "collection": candidate.collection,
+            "item_id": candidate.item_id,
+            "suitability_score": candidate.suitability_score,
+            "score_reasons": candidate.score_reasons,
+            "assets": candidate.assets,
+            "links": candidate.links,
+            "rendered_by": "titiler",
+        },
+    )
+
+
 def imagery_context_text(scene):
     if not scene:
         return ""
@@ -311,6 +343,85 @@ def get_satellite_img_api(request):
     except Exception as e:
         return JsonResponse({"code":400,"msg":str(e),"data":None},status=400)
 
+
+@csrf_exempt
+def get_sentinel_img_api(request):
+    if request.method != 'POST':
+        return JsonResponse({'code': 405, 'msg': '仅支持POST', 'data': None}, status=405)
+
+    try:
+        data = _json_body(request)
+        min_lng, min_lat, max_lng, max_lat = normalize_bbox(data)
+        max_cloud = float(data.get("max_cloud", 30))
+        start_date = data.get("start")
+        end_date = data.get("end")
+        resolution = min(2048, max(256, int(data.get("target_resolution", 1024))))
+        bbox = {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat}
+        plan = compute_image_plan(min_lng, min_lat, max_lng, max_lat, resolution)
+        provider = EarthSearchProvider(titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
+        candidates = provider.search(
+            bbox,
+            start_date=start_date,
+            end_date=end_date,
+            max_cloud=max_cloud,
+            limit=1,
+            collection="sentinel-2-l2a",
+        )
+        if not candidates:
+            return JsonResponse({"code": 404, "msg": "未找到符合条件的 Sentinel-2 影像", "data": None}, status=404)
+
+        candidate = candidates[0]
+        image_bytes = provider.render_candidate_jpeg(candidate, bbox, plan["total_w"], plan["total_h"])
+        file_name = f"sentinel_{uuid.uuid4().hex[:8]}.jpg"
+        full_path = os.path.join(SAVE_DIR, file_name)
+        scene = None
+        with open(full_path, "wb") as f:
+            f.write(image_bytes)
+        try:
+            scene = scene_from_candidate(file_name, candidate, bbox, plan["area_km2"])
+            DownloadTask.objects.create(
+                scene=scene,
+                file_name=file_name,
+                status="done",
+                total=1,
+                done=1,
+                failed=0,
+                min_lng=min_lng,
+                min_lat=min_lat,
+                max_lng=max_lng,
+                max_lat=max_lat,
+                gsd_m=candidate.gsd_m,
+                area_km2=round(plan["area_km2"], 4),
+                resolution_px=resolution,
+            )
+        except Exception:
+            if os.path.exists(full_path):
+                os.remove(full_path)
+            if scene:
+                scene.delete()
+            raise
+        _download_progress[file_name] = {"total": 1, "done": 1, "failed": 0, "status": "done", "scene_id": scene.id}
+
+        return JsonResponse({
+            "code": 200,
+            "msg": "Sentinel-2 影像已生成",
+            "data": {
+                "file_name": file_name,
+                "total_tiles": 1,
+                "scene_id": scene.id,
+                "scene": scene_payload(scene),
+                "candidate": candidate.as_dict(),
+                "gsd_m": candidate.gsd_m,
+                "area_km2": round(plan["area_km2"], 4),
+                "resolution_px": resolution,
+            }
+        })
+    except requests.RequestException as e:
+        logger.warning("sentinel image provider failed: %s", e)
+        return JsonResponse({"code": 502, "msg": "Sentinel-2 影像源或渲染服务暂时不可用", "data": None}, status=502)
+    except Exception as e:
+        return JsonResponse({"code": 400, "msg": str(e), "data": None}, status=400)
+
 # ----------------------
 # 精准读取图片接口 (防缓存、防串联)
 # ----------------------
@@ -323,7 +434,7 @@ def show_satellite_image(request):
     else:
         # 兼容旧版的后备逻辑:只取原始下载图(sat_*.jpg),排除 _hd/_overview/_tile/_crop/_stage1 等派生图
         files = sorted([f for f in os.listdir(SAVE_DIR)
-                        if f.startswith('sat_') and f.endswith('.jpg')],
+                        if (f.startswith('sat_') or f.startswith('sentinel_')) and f.endswith('.jpg')],
                         key=lambda x: os.path.getmtime(os.path.join(SAVE_DIR, x)), reverse=True)
         if not files:
             return JsonResponse({"code":404,"msg":"无图片"},status=404)

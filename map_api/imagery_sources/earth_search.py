@@ -6,6 +6,7 @@ from .base import ImageryCandidate, ImageryProvider
 
 
 EARTH_SEARCH_URL = "https://earth-search.aws.element84.com/v1/search"
+TITILER_URL = "https://titiler.xyz"
 DEFAULT_COLLECTION = "sentinel-2-l2a"
 EARTH_SEARCH_LIMITATIONS = (
     "Element84 Earth Search 是公开 STAC 检索服务，可提供 Sentinel-2 等影像的拍摄时间、"
@@ -94,8 +95,9 @@ def decision_grade_for_score(score):
 class EarthSearchProvider(ImageryProvider):
     source = "earth_search"
 
-    def __init__(self, endpoint=EARTH_SEARCH_URL, timeout=20):
+    def __init__(self, endpoint=EARTH_SEARCH_URL, titiler_endpoint=TITILER_URL, timeout=20):
         self.endpoint = endpoint
+        self.titiler_endpoint = (titiler_endpoint or TITILER_URL).rstrip("/")
         self.timeout = timeout
 
     def search(self, bbox, start_date=None, end_date=None, max_cloud=30, limit=10, collection=DEFAULT_COLLECTION):
@@ -119,6 +121,28 @@ class EarthSearchProvider(ImageryProvider):
         response.raise_for_status()
         data = response.json()
         return [self.candidate_from_item(item) for item in data.get("features", [])]
+
+    def render_candidate_jpeg(self, candidate, bbox, width, height):
+        visual_asset = candidate.assets.get("visual") or {}
+        cog_url = visual_asset.get("href")
+        if not cog_url:
+            raise ValueError("候选影像缺少可渲染的 true color 资产")
+        endpoint = (
+            f"{self.titiler_endpoint}/cog/bbox/"
+            f"{bbox['min_lng']},{bbox['min_lat']},{bbox['max_lng']},{bbox['max_lat']}/"
+            f"{width}x{height}.jpg"
+        )
+        response = requests.get(
+            endpoint,
+            params={"url": cog_url},
+            timeout=max(self.timeout, 60),
+            proxies={"http": None, "https": None},
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
+        if "image" not in content_type:
+            raise ValueError("影像渲染服务未返回图片")
+        return response.content
 
     def candidate_from_item(self, item):
         properties = item.get("properties") or {}
