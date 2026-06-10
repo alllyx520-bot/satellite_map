@@ -67,3 +67,27 @@ class ImageryScene(models.Model):
 
     class Meta:
         ordering = ["-updated_at"]
+
+
+class AgentSession(models.Model):
+    STATUS_RUNNING = "running"
+    STATUS_WAITING_USER = "waiting_user"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+
+    goal = models.TextField()
+    mode = models.CharField(max_length=20, default="precise")
+    status = models.CharField(max_length=30, default=STATUS_RUNNING)
+    slots = models.JSONField(default=dict, blank=True)
+    plan = models.JSONField(default=dict, blank=True)
+    timeline = models.JSONField(default=list, blank=True)
+    messages = models.JSONField(default=list, blank=True)
+    artifacts = models.JSONField(default=dict, blank=True)
+    error = models.TextField(blank=True, default="")
+    scene = models.ForeignKey(ImageryScene, null=True, blank=True, on_delete=models.SET_NULL, related_name="agent_sessions")
+    history = models.ForeignKey(ChatHistory, null=True, blank=True, on_delete=models.SET_NULL, related_name="agent_sessions")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at"]

@@ -29,6 +29,23 @@ def parse_stac_datetime(value):
     return dt
 
 
+def stac_datetime_range(start_date=None, end_date=None):
+    def normalize(value, is_end=False):
+        if not value:
+            return ".."
+        text = str(value).strip()
+        if not text:
+            return ".."
+        if "T" in text:
+            return text if text.endswith("Z") or "+" in text else f"{text}Z"
+        suffix = "T23:59:59Z" if is_end else "T00:00:00Z"
+        return f"{text}{suffix}"
+
+    if not start_date and not end_date:
+        return None
+    return f"{normalize(start_date)}/{normalize(end_date, is_end=True)}"
+
+
 def score_candidate(acquired_at, cloud_percent, gsd_m, has_product_id=True):
     score = 0
     reasons = []
@@ -107,8 +124,9 @@ class EarthSearchProvider(ImageryProvider):
             "limit": limit,
             "sortby": [{"field": "properties.datetime", "direction": "desc"}],
         }
-        if start_date or end_date:
-            payload["datetime"] = f"{start_date or '..'}/{end_date or '..'}"
+        datetime_range = stac_datetime_range(start_date, end_date)
+        if datetime_range:
+            payload["datetime"] = datetime_range
         if max_cloud is not None:
             payload["query"] = {"eo:cloud_cover": {"lte": float(max_cloud)}}
 

@@ -9,3 +9,6 @@ models/
 .playwright-mcp/
 page-snap.json
 .env
+output/
+test-results/
+design-qa.md

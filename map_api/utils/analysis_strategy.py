@@ -5,6 +5,7 @@ SENTINEL2_DETAIL_LIMITS = {
     "building",
     "road",
     "infrastructure",
+    "vehicle",
 }
 
 TASK_RUBRICS = {
@@ -44,6 +45,15 @@ TASK_RUBRICS = {
             "关注新增硬化地表、零散斑块和功能区混合关系",
         ],
     },
+    "small_target": {
+        "label": "小目标与交通设施精细判读",
+        "entities": {"vehicle"},
+        "rubric": [
+            "识别车辆、船舶、飞机、集装箱或停车场等小目标的可见线索",
+            "结合目标尺寸、排列密度、阴影和道路/泊位/停机坪关系估计数量与分布",
+            "说明遮挡、分辨率、阴影和底图时相不透明对计数可靠性的影响",
+        ],
+    },
     "terrain_hazard": {
         "label": "地形地貌与灾害线索解译",
         "entities": {"mountain"},
@@ -65,6 +75,7 @@ TASK_RUBRICS = {
 }
 TASK_PRIORITY = {
     "agriculture": 90,
+    "small_target": 85,
     "built_up": 80,
     "terrain_hazard": 70,
     "water": 60,

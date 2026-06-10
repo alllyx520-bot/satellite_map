@@ -6,12 +6,15 @@ import math
 import time
 import threading
 import logging
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 from io import BytesIO
 
 CELL_MAX = 1280
 MAX_TOTAL = 4096
+BLANK_PIXEL_THRESHOLD = 10
+MIN_VALID_PIXEL_RATIO = 0.02
 logger = logging.getLogger(__name__)
 
 _download_progress = {}
@@ -39,6 +42,35 @@ def haversine_distance(lon1, lat1, lon2, lat2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
+
+def _visual_valid_ratio(img, threshold=BLANK_PIXEL_THRESHOLD):
+    sample = img.convert("RGB")
+    sample.thumbnail((96, 96))
+    total = sample.width * sample.height
+    if total <= 0:
+        return 0
+    valid = sum(1 for r, g, b in sample.getdata() if max(r, g, b) > threshold)
+    return valid / total
+
+
+def _ensure_not_blank(img, label="image"):
+    ratio = _visual_valid_ratio(img)
+    if ratio < MIN_VALID_PIXEL_RATIO:
+        raise Exception(f"{label} appears blank: valid ratio {ratio:.3f}")
+
+
+def _save_jpeg_atomic(img, full_save_path, quality):
+    tmp_path = f"{full_save_path}.tmp_{uuid.uuid4().hex}.jpg"
+    try:
+        img.save(tmp_path, "JPEG", quality=quality)
+        with Image.open(tmp_path) as check:
+            check.verify()
+        os.replace(tmp_path, full_save_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 def _fetch_tile(url, proxies, retries=5):
     last_err = None
     for attempt in range(retries):
@@ -55,6 +87,7 @@ def _fetch_tile(url, proxies, retries=5):
                 img = Image.open(BytesIO(resp.content))
                 if img.mode in ('RGBA', 'P'):
                     img = img.convert('RGB')
+                _ensure_not_blank(img, "Mapbox tile")
                 return img
             raise Exception(f"tile fetch failed: {resp.status_code}")
         except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
@@ -118,7 +151,8 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
         url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{min_lon},{min_lat},{max_lon},{max_lat}]/{actual_w}x{actual_h}{retina}?access_token={token}"
         try:
             img = _fetch_tile(url, proxies)
-            img.save(full_save_path, 'JPEG', quality=95)
+            _ensure_not_blank(img, "Mapbox image")
+            _save_jpeg_atomic(img, full_save_path, quality=95)
             _set_progress(file_name, {"total": 1, "done": 1, "failed": 0, "status": "done"}, progress_callback)
             logger.info("Mapbox image saved: %s", full_save_path)
             return full_save_path
@@ -184,7 +218,14 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
         logger.warning("Mapbox all tiles failed for %s", file_name)
         return None
 
+    try:
+        _ensure_not_blank(canvas, "Mapbox stitched image")
+        _save_jpeg_atomic(canvas, full_save_path, quality=92)
+    except Exception as e:
+        _update_progress(file_name, {"status": "error", "failed": failed_tiles, "error": str(e)[:200]}, progress_callback)
+        logger.warning("Mapbox stitched image validation failed for %s: %s", file_name, e)
+        return None
+
     _update_progress(file_name, {"status": "partial" if failed_tiles else "done", "failed": failed_tiles}, progress_callback)
-    canvas.save(full_save_path, 'JPEG', quality=92)
     logger.info("Mapbox stitched image saved: %sx%s -> %s", total_w, total_h, full_save_path)
     return full_save_path

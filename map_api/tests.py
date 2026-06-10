@@ -5,26 +5,41 @@
 """
 from django.test import Client, SimpleTestCase, TestCase
 from django.conf import settings
+from django.core.management import call_command
 from django.utils import timezone
 import os
 import json
 import tempfile
-from datetime import timedelta
+from http import HTTPStatus
+from io import BytesIO, StringIO
+from datetime import date, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
+import numpy as np
+import requests
+from PIL import Image
 
 from map_api.utils.smart_query_analyzer import analyze_query, adaptive_resolution, _build_clip_query
+from map_api.utils.agent_tools import (
+    build_agent_plan, compute_ndwi_from_arrays, deterministic_extract_slots,
+    merge_agent_slots, parse_amap_boundary
+)
 from map_api.utils.active_perception import (
     extract_bbox_from_response, extract_answer_text, measure_bbox, pixel_bbox_to_geo,
     map_bbox_to_original
 )
 from map_api.utils.get_satellite_image import fetch_satellite_image, haversine_distance
 from map_api.utils.analysis_strategy import build_analysis_strategy
-from map_api.models import ChatHistory, DownloadTask, ImageryScene
+from map_api.models import AgentSession, ChatHistory, DownloadTask, ImageryScene
 from map_api.imagery_sources.mapbox import MapboxProvider
-from map_api.imagery_sources.earth_search import EarthSearchProvider, score_candidate
+from map_api.imagery_sources.earth_search import EarthSearchProvider, score_candidate, stac_datetime_range
 from map_api.views import (
     ANALYSIS_MODES, compute_image_plan, normalize_bbox,
-    imagery_quality_payload, analysis_confidence_payload, source_recommendation_payload, _download_progress
+    imagery_quality_payload, analysis_confidence_payload, source_recommendation_payload,
+    run_agent_session, select_best_sentinel_candidate, bbox_intersection_ratio,
+    bbox_union_coverage_ratio, compose_sentinel_mosaic, image_valid_ratio,
+    crop_sentinel_nodata_border, image_plan_for_bbox_and_size,
+    select_sentinel_scene_candidates, sentinel_retrieval_result, _download_progress
 )
 from satellite_map.env import load_project_env
 
@@ -34,6 +49,7 @@ class AnalyzeQueryTests(SimpleTestCase):
         r = analyze_query("数一下这个停车场里有多少辆车")
         self.assertTrue(r["is_detail"])
         self.assertTrue(r["suggest_stages"])
+        self.assertIn("vehicle", r["entities"])
 
     def test_macro_question_no_stages(self):
         r = analyze_query("分析这片区域的整体用地类型构成")
@@ -172,11 +188,9 @@ class HaversineTests(SimpleTestCase):
 
 class MapboxFetchTests(SimpleTestCase):
     def test_fetch_satellite_image_reads_mapbox_token_at_call_time(self):
-        from PIL import Image
-
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.dict(os.environ, {"MAPBOX_TOKEN": "runtime-token"}, clear=False), \
-                patch("map_api.utils.get_satellite_image._fetch_tile", return_value=Image.new("RGB", (16, 16))) as mocked:
+                patch("map_api.utils.get_satellite_image._fetch_tile", return_value=Image.new("RGB", (16, 16), (80, 120, 160))) as mocked:
             out = fetch_satellite_image(
                 1,
                 2,
@@ -190,6 +204,53 @@ class MapboxFetchTests(SimpleTestCase):
         self.assertIsNotNone(out)
         requested_url = mocked.call_args.args[0]
         self.assertIn("access_token=runtime-token", requested_url)
+
+    def test_fetch_satellite_image_rejects_blank_mapbox_response(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {"MAPBOX_TOKEN": "runtime-token"}, clear=False), \
+                patch("map_api.utils.get_satellite_image._fetch_tile", return_value=Image.new("RGB", (64, 64), (0, 0, 0))):
+            out = fetch_satellite_image(
+                1,
+                2,
+                1.01,
+                2.01,
+                save_dir=tmp,
+                file_name="sat_blank.jpg",
+                target_resolution=64,
+            )
+
+        self.assertIsNone(out)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "sat_blank.jpg")))
+
+    def test_large_mapbox_marks_done_only_after_atomic_save(self):
+        progress_events = []
+
+        def progress_callback(file_name, info):
+            progress_events.append(info.copy())
+
+        def fake_save(img, full_save_path, quality):
+            statuses = [event.get("status") for event in progress_events]
+            self.assertNotIn("done", statuses)
+            self.assertNotIn("partial", statuses)
+            img.crop((0, 0, 32, 32)).save(full_save_path, "JPEG")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {"MAPBOX_TOKEN": "runtime-token"}, clear=False), \
+                patch("map_api.utils.get_satellite_image._fetch_tile", return_value=Image.new("RGB", (700, 700), (80, 120, 160))), \
+                patch("map_api.utils.get_satellite_image._save_jpeg_atomic", side_effect=fake_save):
+            out = fetch_satellite_image(
+                1,
+                2,
+                1.2,
+                2.2,
+                save_dir=tmp,
+                file_name="sat_large.jpg",
+                target_resolution=1400,
+                progress_callback=progress_callback,
+            )
+            self.assertIsNotNone(out)
+            self.assertEqual(progress_events[-1]["status"], "done")
+            self.assertTrue(os.path.exists(os.path.join(tmp, "sat_large.jpg")))
 
 
 class ImagePlanTests(SimpleTestCase):
@@ -218,11 +279,235 @@ class AnalysisModeTests(SimpleTestCase):
         self.assertFalse(ANALYSIS_MODES["fast"]["active_perception"])
 
 
+class AgentToolTests(SimpleTestCase):
+    def test_extracts_nanning_april_water_slots(self):
+        slots = deterministic_extract_slots("帮我调查南宁市在2026年四月的水体情况")
+        self.assertEqual(slots["place_name"], "南宁市")
+        self.assertEqual(slots["date_start"], "2026-04-01")
+        self.assertEqual(slots["date_end"], "2026-04-30")
+        self.assertEqual(slots["task"], "water")
+        self.assertEqual(slots["source"], "sentinel2")
+
+    def test_normalizes_model_task_aliases(self):
+        slots = merge_agent_slots({"task": "water_body_monitoring", "source": "sentinel2"}, "调查水体")
+        self.assertEqual(slots["task"], "water")
+
+    def test_extracts_relative_current_year_spring(self):
+        slots = deterministic_extract_slots("帮我调查南宁今年春季的水体情况", today=date(2026, 6, 7))
+        self.assertEqual(slots["date_start"], "2026-03-01")
+        self.assertEqual(slots["date_end"], "2026-05-31")
+        self.assertEqual(slots["time_granularity"], "season")
+
+    def test_rule_relative_dates_override_model_slots(self):
+        slots = merge_agent_slots(
+            {"date_start": "2024-03-01", "date_end": "2024-05-31", "time_granularity": "season"},
+            "帮我调查南宁今年春季的水体情况",
+            today=date(2026, 6, 7),
+        )
+        self.assertEqual(slots["date_start"], "2026-03-01")
+        self.assertEqual(slots["date_end"], "2026-05-31")
+
+    def test_stac_datetime_range_uses_rfc3339(self):
+        self.assertEqual(
+            stac_datetime_range("2025-03-01", "2025-05-31"),
+            "2025-03-01T00:00:00Z/2025-05-31T23:59:59Z",
+        )
+
+    def test_bbox_intersection_ratio_flags_partial_sentinel_tile(self):
+        target = {"min_lng": 107.0, "min_lat": 22.0, "max_lng": 109.0, "max_lat": 24.0}
+        tile = {"min_lng": 107.0, "min_lat": 22.0, "max_lng": 108.0, "max_lat": 23.0}
+        self.assertEqual(bbox_intersection_ratio(target, tile), 0.25)
+
+    def test_image_valid_ratio_detects_mostly_blank_render(self):
+        buf = BytesIO()
+        img = Image.new("RGB", (20, 20), (0, 0, 0))
+        for x in range(2):
+            for y in range(2):
+                img.putpixel((x, y), (80, 120, 160))
+        img.save(buf, "PNG")
+        self.assertLess(image_valid_ratio(buf.getvalue()), 0.02)
+
+    def test_crop_sentinel_nodata_border_updates_effective_bbox(self):
+        img = Image.new("RGB", (4, 2), (0, 0, 0))
+        for x in range(2, 4):
+            for y in range(2):
+                img.putpixel((x, y), (90, 120, 80))
+        buf = BytesIO()
+        img.save(buf, "PNG")
+        bbox = {"min_lng": 0, "min_lat": 0, "max_lng": 4, "max_lat": 2}
+
+        out = crop_sentinel_nodata_border(buf.getvalue(), bbox)
+        cropped = Image.open(BytesIO(out["image_bytes"]))
+
+        self.assertTrue(out["metadata"]["applied"])
+        self.assertEqual(cropped.size, (2, 2))
+        self.assertEqual(out["bbox"], {"min_lng": 2.0, "max_lng": 4.0, "max_lat": 2.0, "min_lat": 0.0})
+        self.assertEqual(out["plan"]["total_w"], 2)
+
+    def test_crop_sentinel_nodata_border_keeps_full_valid_image(self):
+        buf = BytesIO()
+        Image.new("RGB", (4, 2), (90, 120, 80)).save(buf, "PNG")
+        bbox = {"min_lng": 0, "min_lat": 0, "max_lng": 4, "max_lat": 2}
+
+        out = crop_sentinel_nodata_border(buf.getvalue(), bbox)
+
+        self.assertFalse(out["metadata"]["applied"])
+        self.assertEqual(out["bbox"], bbox)
+
+    def test_bbox_union_coverage_merges_partial_sentinel_tiles(self):
+        target = {"min_lng": 0, "min_lat": 0, "max_lng": 2, "max_lat": 2}
+        tiles = [
+            {"min_lng": 0, "min_lat": 0, "max_lng": 1, "max_lat": 2},
+            {"min_lng": 1, "min_lat": 0, "max_lng": 2, "max_lat": 2},
+        ]
+        self.assertEqual(bbox_union_coverage_ratio(target, tiles), 1.0)
+
+    def test_compose_sentinel_mosaic_fills_valid_pixels_from_multiple_tiles(self):
+        first = Image.new("RGB", (4, 2), (0, 0, 0))
+        second = Image.new("RGB", (4, 2), (0, 0, 0))
+        for x in range(2):
+            for y in range(2):
+                first.putpixel((x, y), (100, 30, 30))
+        for x in range(2, 4):
+            for y in range(2):
+                second.putpixel((x, y), (30, 100, 30))
+        first_buf = BytesIO()
+        second_buf = BytesIO()
+        first.save(first_buf, "PNG")
+        second.save(second_buf, "PNG")
+        candidate = type("Candidate", (), {"product_id": "p", "item_id": "i"})()
+
+        mosaic, valid_ratio, items = compose_sentinel_mosaic(
+            [
+                {"candidate": candidate, "image_bytes": first_buf.getvalue()},
+                {"candidate": candidate, "image_bytes": second_buf.getvalue()},
+            ],
+            4,
+            2,
+        )
+
+        self.assertGreater(image_valid_ratio(mosaic), 0.95)
+        self.assertEqual(valid_ratio, 1.0)
+        self.assertEqual(len(items), 2)
+
+    def test_select_sentinel_candidates_builds_mosaic_when_single_scene_is_insufficient(self):
+        provider = EarthSearchProvider()
+        left = provider.candidate_from_item({
+            "id": "S2_LEFT",
+            "collection": "sentinel-2-l2a",
+            "bbox": [0, 0, 1, 2],
+            "properties": {
+                "datetime": "2026-04-12T03:17:00Z",
+                "eo:cloud_cover": 5,
+                "s2:product_uri": "S2_LEFT.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/left.tif", "gsd": 10}},
+        })
+        right = provider.candidate_from_item({
+            "id": "S2_RIGHT",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 0, 2, 2],
+            "properties": {
+                "datetime": "2026-04-12T03:17:00Z",
+                "eo:cloud_cover": 5,
+                "s2:product_uri": "S2_RIGHT.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/right.tif", "gsd": 10}},
+        })
+
+        selected, coverage, method = select_sentinel_scene_candidates(
+            [left, right],
+            {"min_lng": 0, "min_lat": 0, "max_lng": 2, "max_lat": 2},
+            min_coverage=0.8,
+        )
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(coverage, 1.0)
+        self.assertEqual(method, "same_day_mosaic")
+
+    def test_sentinel_retrieval_rejects_large_nodata_single_render(self):
+        provider = EarthSearchProvider()
+        candidate = provider.candidate_from_item({
+            "id": "S2_BAD_EDGE",
+            "collection": "sentinel-2-l2a",
+            "bbox": [0, 0, 4, 2],
+            "properties": {
+                "datetime": "2026-04-12T03:17:00Z",
+                "eo:cloud_cover": 5,
+                "s2:product_uri": "S2_BAD_EDGE.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/bad.tif", "gsd": 10}},
+        })
+        img = Image.new("RGB", (4, 2), (0, 0, 0))
+        for x in range(2, 4):
+            for y in range(2):
+                img.putpixel((x, y), (90, 120, 80))
+        buf = BytesIO()
+        img.save(buf, "PNG")
+        fake_provider = type("Provider", (), {
+            "render_candidate_jpeg": lambda self, c, bbox, width, height: buf.getvalue()
+        })()
+
+        with patch("map_api.views.find_cached_sentinel_scene", return_value=None):
+            with self.assertRaises(ValueError) as ctx:
+                sentinel_retrieval_result(
+                    fake_provider,
+                    [candidate],
+                    {"min_lng": 0, "min_lat": 0, "max_lng": 4, "max_lat": 2},
+                    {"total_w": 4, "total_h": 2, "gsd_m": 1, "area_km2": 1},
+                    4,
+                    min_coverage=0.9,
+                    min_valid_ratio=0.4,
+                )
+
+        self.assertIn("no-data", str(ctx.exception))
+
+    def test_merges_model_slots_with_rule_defaults(self):
+        slots = merge_agent_slots({"place_name": "南宁市"}, "调查2026年四月水体")
+        self.assertEqual(slots["place_name"], "南宁市")
+        self.assertEqual(slots["task"], "water")
+        self.assertEqual(slots["source"], "sentinel2")
+        self.assertEqual(slots["mode"], "precise")
+
+    def test_parse_amap_boundary_to_bbox(self):
+        bbox = parse_amap_boundary("108.1,22.1;108.5,22.1|108.5,22.9;108.1,22.9")
+        self.assertEqual(bbox, {"min_lng": 108.1, "min_lat": 22.1, "max_lng": 108.5, "max_lat": 22.9})
+
+    def test_ndwi_from_arrays(self):
+        green = np.array([[0.8, 0.2], [0.7, 0.1]], dtype=np.float32)
+        nir = np.array([[0.1, 0.5], [0.2, 0.6]], dtype=np.float32)
+        out = compute_ndwi_from_arrays(green, nir, threshold=0.1, min_valid_pixels=1)
+        self.assertTrue(out["available"])
+        self.assertEqual(out["water_percent"], 50.0)
+        self.assertEqual(out["method"], "NDWI=(Green-NIR)/(Green+NIR)")
+
+    def test_ndwi_rejects_tiny_valid_sample(self):
+        green = np.ones((2, 2), dtype=np.float32)
+        nir = np.ones((2, 2), dtype=np.float32)
+        with self.assertRaises(ValueError):
+            compute_ndwi_from_arrays(green, nir, min_valid_pixels=8)
+
+    def test_build_agent_plan_uses_deepseek_slots(self):
+        with patch("map_api.utils.agent_tools.call_deepseek_json", return_value={
+            "place_name": "南宁市",
+            "date_start": "2026-04-01",
+            "date_end": "2026-04-30",
+            "task": "water",
+            "source": "sentinel2",
+            "mode": "precise",
+        }):
+            plan = build_agent_plan("帮我调查南宁市在2026年四月的水体情况")
+        self.assertEqual(plan["slots"]["task"], "water")
+        self.assertEqual(plan["slots"]["source"], "sentinel2")
+        self.assertIn("task_strategy", plan)
+
+
 class SystemHealthTests(TestCase):
     def test_health_reports_core_configuration_without_secret_values(self):
         with patch.dict(os.environ, {
             "MAPBOX_TOKEN": "secret-mapbox-token",
             "DASHSCOPE_API_KEY": "secret-dashscope-key",
+            "DEEPSEEK_API_KEY": "secret-deepseek-key",
             "AMAP_KEY": "secret-amap-key",
         }, clear=False):
             r = self.client.get("/api/system/health/")
@@ -235,19 +520,34 @@ class SystemHealthTests(TestCase):
         self.assertTrue(data["checks"]["satellite_image_dir_writable"])
         self.assertTrue(data["config"]["mapbox_token"])
         self.assertTrue(data["config"]["dashscope_api_key"])
+        self.assertTrue(data["config"]["deepseek_api_key"])
         self.assertTrue(data["config"]["amap_key"])
         self.assertEqual(data["analysis_modes"]["precise"]["model"], "qwen3-vl-plus")
         self.assertEqual(data["analysis_modes"]["fast"]["model"], "qwen3-vl-flash")
+        self.assertEqual(data["imagery_strategy"]["id"], "task_adaptive_dual_source")
+        self.assertEqual(data["imagery_strategy"]["default_source"], "mapbox")
+        self.assertEqual(data["imagery_strategy"]["recommendation_endpoint"], "/api/imagery/recommend-source/")
+        self.assertEqual(data["imagery_sources"]["mapbox"]["role"], "default_high_resolution_reference")
+        self.assertEqual(data["imagery_sources"]["sentinel2"]["role"], "optional_recent_traceable_public")
+        self.assertIn("近期态势", data["imagery_sources"]["sentinel2"]["recommended_for"])
+        pipeline_ids = {item["id"] for item in data["smart_pipeline"]}
+        self.assertIn("adaptive_source_routing", pipeline_ids)
+        self.assertIn("active_perception", pipeline_ids)
+        self.assertIn("evidence_confidence", pipeline_ids)
+        self.assertEqual(data["agent"]["controller_model"], "deepseek-v4-flash")
+        self.assertTrue(data["agent"]["available"])
 
         raw = json.dumps(r.json(), ensure_ascii=False)
         self.assertNotIn("secret-mapbox-token", raw)
         self.assertNotIn("secret-dashscope-key", raw)
+        self.assertNotIn("secret-deepseek-key", raw)
         self.assertNotIn("secret-amap-key", raw)
 
     def test_health_degrades_when_required_keys_are_missing(self):
         with patch.dict(os.environ, {
             "MAPBOX_TOKEN": "",
             "DASHSCOPE_API_KEY": "",
+            "DEEPSEEK_API_KEY": "",
             "AMAP_KEY": "",
         }, clear=False):
             r = self.client.get("/api/system/health/")
@@ -330,6 +630,38 @@ class ImageryMetadataTests(SimpleTestCase):
         self.assertLess(score, 45)
         self.assertIn("缺少明确拍摄时间", reasons)
         self.assertIn("缺少云量指标", reasons)
+
+    def test_select_best_sentinel_candidate_uses_suitability_score(self):
+        cloudy_item = {
+            "id": "S2A_CLOUDY",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-06-02T03:17:00Z",
+                "eo:cloud_cover": 55,
+                "s2:product_uri": "S2A_CLOUDY.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/cloudy.tif", "gsd": 10}},
+        }
+        clear_item = {
+            "id": "S2A_CLEAR",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-05-30T03:17:00Z",
+                "eo:cloud_cover": 3,
+                "s2:product_uri": "S2A_CLEAR.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/clear.tif", "gsd": 10}},
+        }
+        provider = EarthSearchProvider()
+        cloudy = provider.candidate_from_item(cloudy_item)
+        clear = provider.candidate_from_item(clear_item)
+
+        selected = select_best_sentinel_candidate([cloudy, clear])
+
+        self.assertEqual(selected.product_id, "S2A_CLEAR.SAFE")
+        self.assertGreater(selected.suitability_score, cloudy.suitability_score)
 
     def test_titiler_json_response_is_not_saved_as_image(self):
         item = {
@@ -473,6 +805,12 @@ class AnalysisStrategyTests(SimpleTestCase):
         self.assertIn("农业耕地与作物长势解译", strategy["prompt"])
         self.assertIn("田块破碎化", strategy["prompt"])
 
+    def test_vehicle_count_question_gets_small_target_rubric(self):
+        strategy = build_analysis_strategy("数一下停车场有多少辆车")
+        self.assertEqual(strategy["task_profile"]["task"], "small_target")
+        self.assertIn("小目标与交通设施精细判读", strategy["prompt"])
+        self.assertIn("估计数量与分布", strategy["prompt"])
+
 
 class AIQueryApiTests(TestCase):
     def _make_test_image(self, file_name):
@@ -482,7 +820,14 @@ class AIQueryApiTests(TestCase):
         os.makedirs(save_dir, exist_ok=True)
         path = os.path.join(save_dir, file_name)
         Image.new("RGB", (32, 32), (80, 120, 160)).save(path, "JPEG")
-        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        def cleanup():
+            base, _ = os.path.splitext(path)
+            for name in os.listdir(save_dir):
+                candidate = os.path.join(save_dir, name)
+                if candidate == path or candidate.startswith(base + "_"):
+                    if os.path.exists(candidate):
+                        os.remove(candidate)
+        self.addCleanup(cleanup)
         return path
 
     def _fake_qwen_response(self, text="这是 mock 遥感分析结论"):
@@ -541,8 +886,63 @@ class AIQueryApiTests(TestCase):
         self.assertIn("视觉参考级", data["analysis_method"]["confidence"]["label"])
         self.assertEqual(data["analysis_method"]["source_recommendation"]["recommended_source"], "sentinel2")
         self.assertEqual(data["analysis_method"]["source_recommendation"]["alignment"], "switch_recommended")
+        self.assertFalse(data["analysis_method"]["output_quality"]["structured_answer"])
+        self.assertTrue(data["analysis_method"]["output_quality"]["fallback_used"])
+        self.assertIn("模型未按 <answer> 结构化格式输出", "；".join(data["analysis_method"]["output_quality"]["warnings"]))
         self.assertEqual(data["scene"]["id"], scene.id)
         self.assertIn("quality", data["scene"])
+
+    def test_ai_query_records_structured_output_and_self_check(self):
+        file_name = "sat_ai_self_check.jpg"
+        image_path = self._make_test_image(file_name)
+        scene = ImageryScene.objects.create(
+            file_name=file_name,
+            source="mapbox",
+            min_lng=10,
+            min_lat=20,
+            max_lng=14,
+            max_lat=24,
+            gsd_m=2.0,
+        )
+        preprocess = {
+            "single": image_path,
+            "orig_w": 32,
+            "orig_h": 32,
+            "eff_w": 32,
+            "eff_h": 32,
+        }
+        stage1 = '<think>[{"bbox_2d": [8, 8, 16, 16], "label": "建筑"}]</think>'
+        stage2 = "<answer>局部细节分析结论</answer>"
+        checked = "<answer>自检后一致的最终结论</answer>"
+        with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-key"}, clear=False), \
+                patch("map_api.views.smart_prepare_image_v2", return_value=preprocess), \
+                patch("map_api.views._call_qwen", side_effect=[
+                    self._fake_qwen_response(stage1),
+                    self._fake_qwen_response(stage2),
+                    self._fake_qwen_response(checked),
+                ]):
+            r = self.client.post(
+                "/api/ai/query-region/",
+                data={
+                    "file_name": file_name,
+                    "scene_id": scene.id,
+                    "question": "数一下这里的建筑细节",
+                    "mode": "precise",
+                    "self_check": True,
+                    "history": [],
+                },
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertIn("自检后一致的最终结论", data["answer"])
+        output_quality = data["analysis_method"]["output_quality"]
+        self.assertTrue(output_quality["structured_answer"])
+        self.assertFalse(output_quality["fallback_used"])
+        self.assertTrue(output_quality["self_check_enabled"])
+        self.assertTrue(output_quality["self_check_applied"])
+        self.assertEqual(output_quality["stage_count"], 2)
 
     def test_ai_query_unknown_mode_reports_precise_fallback(self):
         file_name = "sat_ai_mode_fallback.jpg"
@@ -584,6 +984,55 @@ class AIQueryApiTests(TestCase):
         method = r.json()["data"]["analysis_method"]
         self.assertEqual(method["mode"], "precise")
         self.assertEqual(method["model"], "qwen3-vl-plus")
+
+    def test_ai_query_uses_scene_gsd_and_bbox_when_frontend_context_is_missing(self):
+        file_name = "sat_ai_scene_context_fallback.jpg"
+        image_path = self._make_test_image(file_name)
+        scene = ImageryScene.objects.create(
+            file_name=file_name,
+            source="mapbox",
+            min_lng=10,
+            min_lat=20,
+            max_lng=14,
+            max_lat=24,
+            gsd_m=2.0,
+        )
+        preprocess = {
+            "single": image_path,
+            "orig_w": 32,
+            "orig_h": 32,
+            "eff_w": 32,
+            "eff_h": 32,
+        }
+        stage1 = '<think>[{"bbox_2d": [8, 8, 16, 16], "label": "建筑"}]</think>'
+        stage2 = "<answer>局部细节分析结论</answer>"
+        with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-key"}, clear=False), \
+                patch("map_api.views.smart_prepare_image_v2", return_value=preprocess), \
+                patch("map_api.views._call_qwen", side_effect=[
+                    self._fake_qwen_response(stage1),
+                    self._fake_qwen_response(stage2),
+                ]):
+            r = self.client.post(
+                "/api/ai/query-region/",
+                data={
+                    "file_name": file_name,
+                    "scene_id": scene.id,
+                    "question": "数一下这里的建筑细节",
+                    "mode": "precise",
+                    "history": [],
+                },
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["active_stages"], 2)
+        self.assertEqual(data["answer"], "局部细节分析结论\n\n📐 **定量信息**（基于 GSD 测算）：尺寸约 16.0m × 16.0m · 占地约 256 m² · 中心约 22.5°N, 11.5°E")
+        self.assertEqual(data["targets"][0]["width_m"], 16.0)
+        self.assertEqual(data["targets"][0]["height_m"], 16.0)
+        self.assertEqual(data["targets"][0]["area_m2"], 256.0)
+        self.assertEqual(data["targets"][0]["lat"], 22.5)
+        self.assertEqual(data["targets"][0]["lng"], 11.5)
 
 
 class HistoryApiTests(TestCase):
@@ -681,6 +1130,42 @@ class HistoryApiTests(TestCase):
         self.assertIn("sat_history_ok.jpg", files)
         self.assertNotIn("sat_history_missing.jpg", files)
         self.assertTrue(r.json()["data"][0]["image_available"])
+
+    def test_history_list_includes_scene_brief_for_source_traceability(self):
+        self._touch_history_image("sentinel_history.jpg")
+        scene = ImageryScene.objects.create(
+            file_name="sentinel_history.jpg",
+            source="sentinel2",
+            source_label="Sentinel-2 L2A",
+            product_id="S2A_HISTORY.SAFE",
+            acquired_at=timezone.now() - timedelta(days=5),
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+            gsd_m=10,
+            cloud_percent=7,
+            decision_grade="screening",
+            metadata={
+                "selection_method": "suitability_score",
+                "candidate_count": 5,
+                "selection_rank": 1,
+                "suitability_score": 93,
+                "score_reasons": ["拍摄时间在 7 天内，时效性很好", "云量低于 10%，可视条件较好"],
+            },
+        )
+        ChatHistory.objects.create(image_file="sentinel_history.jpg", scene=scene, messages=[])
+
+        r = self.client.get("/api/ai/history/")
+
+        self.assertEqual(r.status_code, 200)
+        item = r.json()["data"][0]
+        self.assertEqual(item["scene"]["source"], "sentinel2")
+        self.assertEqual(item["scene"]["source_label"], "Sentinel-2 L2A")
+        self.assertEqual(item["scene"]["cloud_percent"], 7)
+        self.assertEqual(item["scene"]["selection"]["candidate_count"], 5)
+        self.assertEqual(item["scene"]["selection"]["suitability_score"], 93)
+        self.assertIn("候选池 5 景", item["scene"]["selection"]["summary"])
 
     def test_history_detail_returns_410_for_missing_image(self):
         obj = ChatHistory.objects.create(image_file="sat_history_missing_detail.jpg", messages=[])
@@ -807,7 +1292,41 @@ class DownloadTaskTests(TestCase):
         self.assertFalse(ImageryScene.objects.exists())
 
 
+class SmokePipelineCommandTests(TestCase):
+    def test_smoke_pipeline_command_exercises_core_loop_and_cleans_artifacts(self):
+        out = StringIO()
+
+        call_command("smoke_pipeline", stdout=out)
+
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["status"], "passed")
+        step_ids = [step["id"] for step in data["steps"]]
+        self.assertEqual(step_ids, ["health", "source_recommendation", "ai_analysis", "history", "report"])
+        self.assertTrue(all(step["ok"] for step in data["steps"]))
+        image_file = data["artifacts"]["image_file"]
+        report_file = data["artifacts"]["report_file"]
+        self.assertFalse(ChatHistory.objects.filter(image_file=image_file).exists())
+        self.assertFalse(DownloadTask.objects.filter(file_name=image_file).exists())
+        self.assertFalse(ImageryScene.objects.filter(file_name=image_file).exists())
+        self.assertFalse(os.path.exists(os.path.join(settings.MEDIA_ROOT, "satellite_imgs", image_file)))
+        self.assertFalse(os.path.exists(os.path.join(settings.MEDIA_ROOT, report_file)))
+
+    def test_smoke_pipeline_help_lists_live_dependency_checks(self):
+        from map_api.management.commands.smoke_pipeline import Command
+
+        help_text = Command().create_parser("", "smoke_pipeline").format_help()
+        self.assertIn("--live-mapbox", help_text)
+        self.assertIn("--live-sentinel", help_text)
+        self.assertIn("--live-ai", help_text)
+        self.assertIn("--keep-artifacts", help_text)
+
+
 class ImagerySceneApiTests(TestCase):
+    def _jpg_bytes(self, color=(80, 120, 160), size=(1024, 1024)):
+        buf = BytesIO()
+        Image.new("RGB", size, color).save(buf, "JPEG")
+        return buf.getvalue()
+
     def test_scene_detail_returns_metadata(self):
         scene = ImageryScene.objects.create(
             file_name="sat_scene.jpg",
@@ -915,7 +1434,7 @@ class ImagerySceneApiTests(TestCase):
         }
         candidate = EarthSearchProvider().candidate_from_item(item)
         with patch("map_api.views.EarthSearchProvider.search", return_value=[candidate]), \
-                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", return_value=b"jpg"):
+                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", return_value=self._jpg_bytes()):
             r = self.client.post(
                 "/api/satellite/get-sentinel-img/",
                 data={"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4},
@@ -927,7 +1446,14 @@ class ImagerySceneApiTests(TestCase):
         self.assertEqual(data["scene"]["source"], "sentinel2")
         self.assertEqual(data["scene"]["product_id"], "S2A_PRODUCT.SAFE")
         self.assertEqual(data["scene"]["decision_grade"], "screening")
-        expected_gsd = round(compute_image_plan(1, 2, 3, 4, 1024)["gsd_m"], 2)
+        expected_gsd = round(
+            image_plan_for_bbox_and_size(
+                {"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4},
+                data["render_width"],
+                data["render_height"],
+            )["gsd_m"],
+            2,
+        )
         self.assertEqual(data["gsd_m"], expected_gsd)
         self.assertEqual(data["scene"]["gsd_m"], expected_gsd)
         self.assertEqual(data["scene"]["metadata"]["source_asset_gsd_m"], 10.0)
@@ -939,6 +1465,122 @@ class ImagerySceneApiTests(TestCase):
         img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", data["file_name"])
         self.assertTrue(os.path.exists(img_path))
         os.remove(img_path)
+
+    def test_sentinel_image_endpoint_selects_best_candidate_from_recent_pool(self):
+        provider = EarthSearchProvider()
+        cloudy = provider.candidate_from_item({
+            "id": "S2A_CLOUDY",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-06-02T03:17:00Z",
+                "eo:cloud_cover": 55,
+                "s2:product_uri": "S2A_CLOUDY.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/cloudy.tif", "gsd": 10}},
+        })
+        clear = provider.candidate_from_item({
+            "id": "S2A_CLEAR",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-05-30T03:17:00Z",
+                "eo:cloud_cover": 3,
+                "s2:product_uri": "S2A_CLEAR.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/clear.tif", "gsd": 10}},
+        })
+        with patch("map_api.views.EarthSearchProvider.search", return_value=[cloudy, clear]) as search_mock, \
+                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", return_value=self._jpg_bytes()) as render_mock:
+            r = self.client.post(
+                "/api/satellite/get-sentinel-img/",
+                data={"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(search_mock.call_args.kwargs["limit"], 10)
+        render_mock.assert_called_once()
+        self.assertEqual(render_mock.call_args.args[0].product_id, "S2A_CLEAR.SAFE")
+        self.assertEqual(data["candidate_count"], 2)
+        self.assertEqual(data["candidate"]["product_id"], "S2A_CLEAR.SAFE")
+        self.assertEqual(data["scene"]["metadata"]["candidate_count"], 2)
+        self.assertEqual(data["scene"]["metadata"]["selection_method"], "single_scene")
+        self.assertIn("云量低于 10%", "；".join(data["selection_reasons"]))
+        img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", data["file_name"])
+        if os.path.exists(img_path):
+            os.remove(img_path)
+
+    def test_sentinel_image_endpoint_falls_back_when_best_candidate_fails_to_render(self):
+        provider = EarthSearchProvider()
+        best = provider.candidate_from_item({
+            "id": "S2A_BEST",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-06-02T03:17:00Z",
+                "eo:cloud_cover": 2,
+                "s2:product_uri": "S2A_BEST.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/best.tif", "gsd": 10}},
+        })
+        fallback = provider.candidate_from_item({
+            "id": "S2A_FALLBACK",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-05-30T03:17:00Z",
+                "eo:cloud_cover": 8,
+                "s2:product_uri": "S2A_FALLBACK.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/fallback.tif", "gsd": 10}},
+        })
+        with patch("map_api.views.EarthSearchProvider.search", return_value=[fallback, best]), \
+                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", side_effect=[ValueError("bad cog"), self._jpg_bytes()]) as render_mock:
+            r = self.client.post(
+                "/api/satellite/get-sentinel-img/",
+                data={"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(render_mock.call_count, 2)
+        self.assertEqual(data["candidate"]["product_id"], "S2A_FALLBACK.SAFE")
+        self.assertEqual(data["scene"]["product_id"], "S2A_FALLBACK.SAFE")
+        self.assertEqual(data["scene"]["metadata"]["selection_rank"], 2)
+        self.assertIn("S2A_BEST.SAFE: bad cog", data["scene"]["metadata"]["render_fallback_errors"])
+        self.assertFalse(ImageryScene.objects.filter(product_id="S2A_BEST.SAFE").exists())
+        img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", data["file_name"])
+        if os.path.exists(img_path):
+            os.remove(img_path)
+
+    def test_sentinel_image_endpoint_validates_request_parameters(self):
+        base = {"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4}
+
+        high_cloud = self.client.post(
+            "/api/satellite/get-sentinel-img/",
+            data={**base, "max_cloud": 150},
+            content_type="application/json",
+        )
+        low_limit = self.client.post(
+            "/api/satellite/get-sentinel-img/",
+            data={**base, "candidate_limit": 0},
+            content_type="application/json",
+        )
+        bad_resolution = self.client.post(
+            "/api/satellite/get-sentinel-img/",
+            data={**base, "target_resolution": "large"},
+            content_type="application/json",
+        )
+
+        self.assertEqual(high_cloud.status_code, 400)
+        self.assertIn("max_cloud 不能大于 100", high_cloud.json()["msg"])
+        self.assertEqual(low_limit.status_code, 400)
+        self.assertIn("candidate_limit 不能小于 1", low_limit.json()["msg"])
+        self.assertEqual(bad_resolution.status_code, 400)
+        self.assertIn("target_resolution 必须是整数", bad_resolution.json()["msg"])
 
     def test_sentinel_image_endpoint_reuses_cached_scene(self):
         item = {
@@ -956,7 +1598,7 @@ class ImagerySceneApiTests(TestCase):
         candidate = EarthSearchProvider().candidate_from_item(item)
         payload = {"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4}
         with patch("map_api.views.EarthSearchProvider.search", return_value=[candidate]), \
-                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", return_value=b"jpg") as render_mock:
+                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", return_value=self._jpg_bytes()) as render_mock:
             first = self.client.post(
                 "/api/satellite/get-sentinel-img/",
                 data=payload,
@@ -975,6 +1617,63 @@ class ImagerySceneApiTests(TestCase):
         self.assertEqual(first.json()["data"]["file_name"], second.json()["data"]["file_name"])
         render_mock.assert_called_once()
         img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", first.json()["data"]["file_name"])
+        if os.path.exists(img_path):
+            os.remove(img_path)
+
+    def test_sentinel_image_endpoint_creates_mosaic_for_partial_tiles(self):
+        provider = EarthSearchProvider()
+        left = provider.candidate_from_item({
+            "id": "S2A_LEFT",
+            "collection": "sentinel-2-l2a",
+            "bbox": [1, 2, 2, 4],
+            "properties": {
+                "datetime": "2026-06-01T03:17:00Z",
+                "eo:cloud_cover": 5,
+                "s2:product_uri": "S2A_LEFT.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/left.tif", "gsd": 10}},
+        })
+        right = provider.candidate_from_item({
+            "id": "S2A_RIGHT",
+            "collection": "sentinel-2-l2a",
+            "bbox": [2, 2, 3, 4],
+            "properties": {
+                "datetime": "2026-06-01T03:17:00Z",
+                "eo:cloud_cover": 5,
+                "s2:product_uri": "S2A_RIGHT.SAFE",
+            },
+            "assets": {"visual": {"href": "https://example.com/right.tif", "gsd": 10}},
+        })
+        left_img = Image.new("RGB", (64, 64), (0, 0, 0))
+        right_img = Image.new("RGB", (64, 64), (0, 0, 0))
+        for x in range(32):
+            for y in range(64):
+                left_img.putpixel((x, y), (100, 120, 150))
+        for x in range(32, 64):
+            for y in range(64):
+                right_img.putpixel((x, y), (80, 130, 100))
+        left_buf = BytesIO()
+        right_buf = BytesIO()
+        left_img.save(left_buf, "JPEG")
+        right_img.save(right_buf, "JPEG")
+
+        with patch("map_api.views.EarthSearchProvider.search", return_value=[left, right]), \
+                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", side_effect=[left_buf.getvalue(), right_buf.getvalue()]) as render_mock:
+            r = self.client.post(
+                "/api/satellite/get-sentinel-img/",
+                data={"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertTrue(data["mosaic"])
+        self.assertEqual(data["total_tiles"], 2)
+        self.assertEqual(data["scene"]["metadata"]["selection_method"], "coverage_mosaic")
+        self.assertEqual(data["scene"]["metadata"]["mosaic_candidate_count"], 2)
+        self.assertGreaterEqual(data["scene"]["metadata"]["valid_image_ratio"], 0.95)
+        self.assertEqual(render_mock.call_count, 2)
+        img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", data["file_name"])
         if os.path.exists(img_path):
             os.remove(img_path)
 
@@ -1011,6 +1710,380 @@ class ImagerySceneApiTests(TestCase):
         )
 
         self.assertEqual(r.status_code, 400)
+
+
+class AgentSessionApiTests(TestCase):
+    def _jpg_bytes(self):
+        buf = BytesIO()
+        Image.new("RGB", (64, 64), (80, 120, 160)).save(buf, "JPEG")
+        return buf.getvalue()
+
+    def _candidate(self, cloud=8.5):
+        return EarthSearchProvider().candidate_from_item({
+            "id": "S2A_AGENT",
+            "collection": "sentinel-2-l2a",
+            "bbox": [108.1, 22.1, 108.5, 22.9],
+            "properties": {
+                "datetime": "2026-04-12T03:17:00Z",
+                "updated": "2026-04-12T08:00:00Z",
+                "eo:cloud_cover": cloud,
+                "s2:product_uri": f"S2A_AGENT_{cloud}.SAFE",
+            },
+            "assets": {
+                "visual": {"href": "https://example.com/visual.tif", "gsd": 10},
+                "green": {"href": "https://example.com/green.tif", "gsd": 10},
+                "nir": {"href": "https://example.com/nir.tif", "gsd": 10},
+            },
+        })
+
+    def _candidate_with_bbox(self, item_id, bbox, cloud=8.5):
+        return EarthSearchProvider().candidate_from_item({
+            "id": item_id,
+            "collection": "sentinel-2-l2a",
+            "bbox": bbox,
+            "properties": {
+                "datetime": "2026-04-12T03:17:00Z",
+                "updated": "2026-04-12T08:00:00Z",
+                "eo:cloud_cover": cloud,
+                "s2:product_uri": f"{item_id}.SAFE",
+            },
+            "assets": {
+                "visual": {"href": f"https://example.com/{item_id}.tif", "gsd": 10},
+                "green": {"href": f"https://example.com/{item_id}_green.tif", "gsd": 10},
+                "nir": {"href": f"https://example.com/{item_id}_nir.tif", "gsd": 10},
+            },
+        })
+
+    def _agent_patches(self, candidate=None, cloud=8.5):
+        candidate = candidate or self._candidate(cloud)
+        return (
+            patch.dict(os.environ, {
+                "DEEPSEEK_API_KEY": "test-deepseek-key",
+                "DASHSCOPE_API_KEY": "test-dashscope-key",
+                "AMAP_KEY": "test-amap-key",
+            }, clear=False),
+            patch("map_api.utils.agent_tools.call_deepseek_json", return_value={
+                "place_name": "南宁市",
+                "date_start": "2026-04-01",
+                "date_end": "2026-04-30",
+                "task": "water",
+                "source": "sentinel2",
+                "mode": "precise",
+            }),
+            patch("map_api.views.resolve_district_bbox", return_value={
+                "name": "南宁市",
+                "adcode": "450100",
+                "level": "city",
+                "bbox": {"min_lng": 108.1, "min_lat": 22.1, "max_lng": 108.5, "max_lat": 22.9},
+                "candidate_count": 1,
+                "bbox_policy": "行政区 bbox 筛查，不做精确行政边界裁剪",
+            }),
+            patch("map_api.views.EarthSearchProvider.search", return_value=[candidate]),
+            patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", return_value=self._jpg_bytes()),
+            patch("map_api.views.compute_ndwi_summary", return_value={
+                "available": True,
+                "method": "NDWI=(Green-NIR)/(Green+NIR)",
+                "threshold": 0.1,
+                "water_percent": 18.5,
+                "water_ratio": 0.185,
+                "limitations": "轻量 NDWI 仅用于 bbox 内水体线索筛查。",
+            }),
+            patch("map_api.views._call_qwen", return_value=SimpleNamespace(
+                status_code=HTTPStatus.OK,
+                output=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=[{"text": "<answer>水体主要分布在河道和坑塘。</answer>"}]))]),
+                message="",
+            )),
+            patch("map_api.views.call_deepseek", return_value="复核结论：南宁市 2026 年 4 月 bbox 范围内可见河流、湖库和坑塘水体，NDWI 显示可能水体约 18.5%，该比例仅作筛查。"),
+        )
+
+    def _agent_base_patches(self):
+        return (
+            patch.dict(os.environ, {
+                "DEEPSEEK_API_KEY": "test-deepseek-key",
+                "DASHSCOPE_API_KEY": "test-dashscope-key",
+                "AMAP_KEY": "test-amap-key",
+            }, clear=False),
+            patch("map_api.utils.agent_tools.call_deepseek_json", return_value={
+                "place_name": "南宁市",
+                "date_start": "2026-04-01",
+                "date_end": "2026-04-30",
+                "task": "water",
+                "source": "sentinel2",
+                "mode": "precise",
+            }),
+            patch("map_api.views.resolve_district_bbox", return_value={
+                "name": "南宁市",
+                "adcode": "450100",
+                "level": "city",
+                "bbox": {"min_lng": 108.1, "min_lat": 22.1, "max_lng": 108.5, "max_lat": 22.9},
+                "candidate_count": 1,
+                "bbox_policy": "行政区 bbox 筛查，不做精确行政边界裁剪",
+            }),
+            patch("map_api.views._call_qwen", return_value=SimpleNamespace(
+                status_code=HTTPStatus.OK,
+                output=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=[{"text": "<answer>水体主要分布在河道和坑塘。</answer>"}]))]),
+                message="",
+            )),
+            patch("map_api.views.call_deepseek", return_value="复核结论：南宁市 2026 年 4 月 bbox 范围内可见河流、湖库和坑塘水体，NDWI 显示可能水体约 18.5%，该比例仅作筛查。"),
+        )
+
+    def test_agent_session_requires_deepseek_key(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}, clear=False):
+            r = self.client.post(
+                "/api/agent/sessions/",
+                data={"goal": "帮我调查南宁市在2026年四月的水体情况"},
+                content_type="application/json",
+            )
+        self.assertEqual(r.status_code, 500)
+        self.assertIn("DEEPSEEK_API_KEY", r.json()["msg"])
+
+    def test_mocked_agent_full_loop_completes(self):
+        patches = self._agent_patches()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
+            r = self.client.post(
+                "/api/agent/sessions/",
+                data={"goal": "帮我调查南宁市在2026年四月的水体情况", "sync": True},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual(data["slots"]["task"], "water")
+        self.assertEqual(data["slots"]["source"], "sentinel2")
+        self.assertEqual(data["artifacts"]["ndwi"]["water_percent"], 18.5)
+        self.assertIn("复核结论", data["artifacts"]["final_answer"])
+        self.assertEqual(data["observer"]["current_step"], "complete")
+        self.assertIn("整理", data["observer"]["public_thought"])
+        self.assertTrue(data["observer"]["plan_steps"])
+        self.assertTrue(ChatHistory.objects.filter(id=data["history_id"]).exists())
+        self.assertTrue(AgentSession.objects.filter(id=data["id"], status=AgentSession.STATUS_COMPLETED).exists())
+        image_file = data["artifacts"]["file_name"]
+        img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", image_file)
+        if os.path.exists(img_path):
+            os.remove(img_path)
+
+    def test_agent_uses_sentinel_mosaic_for_city_bbox(self):
+        left = self._candidate_with_bbox("S2A_LEFT", [108.1, 22.1, 108.3, 22.9])
+        right = self._candidate_with_bbox("S2A_RIGHT", [108.3, 22.1, 108.5, 22.9])
+
+        left_img = Image.new("RGB", (64, 64), (0, 0, 0))
+        right_img = Image.new("RGB", (64, 64), (0, 0, 0))
+        for x in range(32):
+            for y in range(64):
+                left_img.putpixel((x, y), (90, 120, 150))
+        for x in range(32, 64):
+            for y in range(64):
+                right_img.putpixel((x, y), (80, 130, 100))
+        left_buf = BytesIO()
+        right_buf = BytesIO()
+        left_img.save(left_buf, "JPEG")
+        right_img.save(right_buf, "JPEG")
+
+        base = self._agent_base_patches()
+        with base[0], base[1], base[2], base[3], base[4], \
+                patch("map_api.views.EarthSearchProvider.search", return_value=[left, right]), \
+                patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", side_effect=[left_buf.getvalue(), right_buf.getvalue()]), \
+                patch("map_api.views.compute_ndwi_mosaic_summary", return_value={
+                    "available": True,
+                    "method": "NDWI=(Green-NIR)/(Green+NIR)",
+                    "aggregation": "按每景有效像元数加权汇总",
+                    "water_percent": 21.0,
+                    "water_ratio": 0.21,
+                    "sample_size_px": 4096,
+                    "limitations": "多景 NDWI 为 bbox 筛查级加权结果。",
+                }) as ndwi_mock:
+            r = self.client.post(
+                "/api/agent/sessions/",
+                data={"goal": "帮我调查南宁市在2026年四月的水体情况", "sync": True},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "completed")
+        scene = ImageryScene.objects.get(id=data["scene_id"])
+        self.assertTrue(scene.metadata["mosaic"])
+        self.assertEqual(scene.metadata["mosaic_candidate_count"], 2)
+        self.assertGreaterEqual(scene.metadata["target_coverage_ratio"], 0.99)
+        self.assertGreaterEqual(scene.metadata["valid_image_ratio"], 0.95)
+        self.assertEqual(data["artifacts"]["ndwi"]["water_percent"], 21.0)
+        ndwi_mock.assert_called_once()
+        img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", data["artifacts"]["file_name"])
+        if os.path.exists(img_path):
+            os.remove(img_path)
+
+    def test_agent_waits_when_sentinel_has_no_candidate(self):
+        patches = self._agent_patches()
+        with patches[0], patches[1], patches[2], patch("map_api.views.EarthSearchProvider.search", return_value=[]):
+            r = self.client.post(
+                "/api/agent/sessions/",
+                data={"goal": "帮我调查南宁市在2026年四月的水体情况", "sync": True},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "waiting_user")
+        self.assertIn("扩大时间范围", data["artifacts"]["waiting"]["options"])
+        self.assertEqual(data["observer"]["current_step"], "retrieve_imagery")
+        self.assertEqual(data["observer"]["current_status"], "waiting_user")
+        retrieve_step = [s for s in data["observer"]["plan_steps"] if s["id"] == "retrieve_imagery"][0]
+        self.assertEqual(retrieve_step["status"], "waiting_user")
+
+    def test_agent_waits_when_sentinel_provider_errors(self):
+        patches = self._agent_patches()
+        with patches[0], patches[1], patches[2], patch("map_api.views.EarthSearchProvider.search", side_effect=requests.HTTPError("bad request")):
+            r = self.client.post(
+                "/api/agent/sessions/",
+                data={"goal": "帮我调查南宁市在2026年四月的水体情况", "sync": True},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "waiting_user")
+        self.assertEqual(data["observer"]["current_step"], "retrieve_imagery")
+        self.assertIn("切换高清底图", data["artifacts"]["waiting"]["options"])
+
+    def test_agent_waits_when_sentinel_candidate_coverage_is_too_low(self):
+        low_coverage = EarthSearchProvider().candidate_from_item({
+            "id": "S2A_LOW_COVERAGE",
+            "collection": "sentinel-2-l2a",
+            "bbox": [108.1, 22.1, 108.2, 22.2],
+            "properties": {
+                "datetime": "2026-04-12T03:17:00Z",
+                "eo:cloud_cover": 8,
+                "s2:product_uri": "S2A_LOW_COVERAGE.SAFE",
+            },
+            "assets": {
+                "visual": {"href": "https://example.com/visual.tif", "gsd": 10},
+                "green": {"href": "https://example.com/green.tif", "gsd": 10},
+                "nir": {"href": "https://example.com/nir.tif", "gsd": 10},
+            },
+        })
+        patches = self._agent_patches(candidate=low_coverage)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
+            r = self.client.post(
+                "/api/agent/sessions/",
+                data={"goal": "帮我调查南宁市在2026年四月的水体情况", "sync": True},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "waiting_user")
+        self.assertEqual(data["observer"]["current_step"], "retrieve_imagery")
+        self.assertIn("Sentinel-2 候选覆盖不足", data["artifacts"]["waiting"]["message"])
+
+    def test_agent_waits_on_high_cloud(self):
+        patches = self._agent_patches(cloud=45)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
+            r = self.client.post(
+                "/api/agent/sessions/",
+                data={"goal": "帮我调查南宁市在2026年四月的水体情况", "sync": True},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "waiting_user")
+        self.assertIn("云量", data["artifacts"]["waiting"]["message"])
+        self.assertEqual(data["observer"]["current_step"], "quality_check")
+        self.assertEqual(data["observer"]["current_status"], "waiting_user")
+        self.assertEqual(data["observer"]["next"], "等待用户确认")
+        image_file = data.get("artifacts", {}).get("file_name")
+        if image_file:
+            img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", image_file)
+            if os.path.exists(img_path):
+                os.remove(img_path)
+
+    def test_agent_waits_when_vision_output_is_unstable(self):
+        patches = self._agent_patches()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], \
+                patch("map_api.views._call_qwen", return_value=SimpleNamespace(
+                    status_code=HTTPStatus.OK,
+                    output=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=[{"text": ""}]))]),
+                    message="",
+                )), patches[7]:
+            r = self.client.post(
+                "/api/agent/sessions/",
+                data={"goal": "帮我调查南宁市在2026年四月的水体情况", "sync": True},
+                content_type="application/json",
+            )
+
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "waiting_user")
+        self.assertEqual(data["observer"]["current_step"], "vl_analysis")
+        self.assertIn("快速模式重试", data["artifacts"]["waiting"]["options"])
+        image_file = data.get("artifacts", {}).get("file_name")
+        if image_file:
+            img_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", image_file)
+            if os.path.exists(img_path):
+                os.remove(img_path)
+
+    def test_agent_cancel_updates_observer(self):
+        patches = self._agent_patches()
+        with patches[0], patches[1], patches[2], patch("map_api.views.EarthSearchProvider.search", return_value=[]):
+            r = self.client.post(
+                "/api/agent/sessions/",
+                data={"goal": "帮我调查南宁市在2026年四月的水体情况", "sync": True},
+                content_type="application/json",
+            )
+        session_id = r.json()["data"]["id"]
+        r2 = self.client.post(
+            f"/api/agent/sessions/{session_id}/messages/",
+            data={"content": "取消任务"},
+            content_type="application/json",
+        )
+
+        self.assertEqual(r2.status_code, 200)
+        data = r2.json()["data"]
+        self.assertEqual(data["status"], "failed")
+        self.assertEqual(data["observer"]["current_step"], "failed")
+        self.assertEqual(data["observer"]["current_status"], "failed")
+        self.assertNotIn("waiting", data["artifacts"])
+
+    def test_agent_uses_current_scene_context(self):
+        save_dir = os.path.join(settings.MEDIA_ROOT, "satellite_imgs")
+        os.makedirs(save_dir, exist_ok=True)
+        image_file = "agent_current_scene.jpg"
+        Image.new("RGB", (64, 64), (80, 120, 160)).save(os.path.join(save_dir, image_file), "JPEG")
+        scene = ImageryScene.objects.create(
+            file_name=image_file,
+            source="mapbox",
+            source_label="Mapbox Satellite Basemap",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+            gsd_m=1.5,
+            area_km2=10,
+        )
+        with patch.dict(os.environ, {
+            "DEEPSEEK_API_KEY": "test-deepseek-key",
+            "DASHSCOPE_API_KEY": "test-dashscope-key",
+            "AMAP_KEY": "test-amap-key",
+        }, clear=False), \
+                patch("map_api.utils.agent_tools.call_deepseek_json", return_value={"task": "built_up", "source": "mapbox"}), \
+                patch("map_api.views._call_qwen", return_value=SimpleNamespace(
+                    status_code=HTTPStatus.OK,
+                    output=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=[{"text": "<answer>当前区域以建设用地为主。</answer>"}]))]),
+                    message="",
+                )), \
+                patch("map_api.views.call_deepseek", return_value="复核结论：当前区域以建设用地为主。"):
+            r = self.client.post(
+                "/api/agent/sessions/",
+                data={"goal": "调查当前区域建设用地", "scene_id": scene.id, "file_name": image_file, "sync": True},
+                content_type="application/json",
+            )
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual(data["scene_id"], scene.id)
+        self.assertEqual(data["slots"]["bbox"], {"min_lng": 1.0, "min_lat": 2.0, "max_lng": 3.0, "max_lat": 4.0})
+        os.remove(os.path.join(save_dir, image_file))
 
 
 class ReportSceneTests(TestCase):
@@ -1063,6 +2136,56 @@ class ReportSceneTests(TestCase):
         os.remove(img_path)
         os.remove(report_path)
 
+    def test_report_includes_sentinel_candidate_selection_basis(self):
+        from PIL import Image
+        from docx import Document
+
+        save_dir = os.path.join(settings.MEDIA_ROOT, "satellite_imgs")
+        os.makedirs(save_dir, exist_ok=True)
+        img_path = os.path.join(save_dir, "sentinel_report_selection.jpg")
+        Image.new("RGB", (32, 32), (80, 120, 160)).save(img_path, "JPEG")
+        scene = ImageryScene.objects.create(
+            file_name="sentinel_report_selection.jpg",
+            source="sentinel2",
+            source_label="Sentinel-2 L2A",
+            min_lng=1,
+            min_lat=2,
+            max_lng=3,
+            max_lat=4,
+            gsd_m=10,
+            cloud_percent=3,
+            processing_level="sentinel-2-l2a",
+            license_type="sentinel_data_terms",
+            decision_grade="screening",
+            limitations="公开影像筛查限制",
+            metadata={
+                "selection_method": "suitability_score",
+                "suitability_score": 88,
+                "candidate_count": 3,
+                "selection_rank": 2,
+                "score_reasons": ["拍摄时间在 7 天内，时效性很好", "云量低于 10%，可视条件较好"],
+                "render_fallback_errors": ["S2A_BEST.SAFE: bad cog"],
+            },
+        )
+        r = self.client.post(
+            "/api/report/generate/",
+            data={"file_name": scene.file_name, "scene_id": scene.id, "messages": []},
+            content_type="application/json",
+        )
+        self.assertEqual(r.status_code, 200)
+        report_name = r.json()["data"]["file_name"]
+        report_path = os.path.join(settings.MEDIA_ROOT, report_name)
+        doc = Document(report_path)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        self.assertIn("候选优选方法：suitability_score", text)
+        self.assertIn("候选优选分数：88", text)
+        self.assertIn("候选池数量：3", text)
+        self.assertIn("最终采用排序：第 2 个可渲染候选", text)
+        self.assertIn("云量低于 10%，可视条件较好", text)
+        self.assertIn("候选渲染降级记录：S2A_BEST.SAFE: bad cog", text)
+        os.remove(img_path)
+        os.remove(report_path)
+
     def test_report_includes_analysis_method_section(self):
         from PIL import Image
         from docx import Document
@@ -1110,6 +2233,13 @@ class ReportSceneTests(TestCase):
                     "reason": "问题包含建筑、道路、设施或计数等细节判读需求，需要更高视觉细节。",
                     "action": "当前图像源与任务匹配。",
                 },
+                "output_quality": {
+                    "structured_answer": False,
+                    "fallback_used": True,
+                    "self_check_enabled": True,
+                    "self_check_applied": False,
+                    "warnings": ["模型未按 <answer> 结构化格式输出，已使用原文作为结论"],
+                },
             },
         }]
         r = self.client.post(
@@ -1133,6 +2263,9 @@ class ReportSceneTests(TestCase):
         self.assertIn("复核要求", text)
         self.assertIn("图像源建议", text)
         self.assertIn("建议使用高清底图", text)
+        self.assertIn("输出稳定性", text)
+        self.assertIn("使用兜底解析", text)
+        self.assertIn("已请求但未触发", text)
         os.remove(img_path)
         os.remove(report_path)
 

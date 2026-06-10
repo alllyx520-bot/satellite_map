@@ -1,20 +1,371 @@
 document.addEventListener('DOMContentLoaded', () => {
+    const MAP_MAX_ZOOM = 18;
+    const SATELLITE_MAX_NATIVE_ZOOM = 16;
+    const FIT_BOUNDS_MAX_ZOOM = 16;
+
     const normalMap = L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', {
         subdomains: ["1", "2", "3", "4"],
+        maxZoom: MAP_MAX_ZOOM,
         attribution: '&copy; 高德地图'
     });
 
     const satelliteMap = L.tileLayer('https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}', {
         subdomains: ["1", "2", "3", "4"],
+        maxZoom: MAP_MAX_ZOOM,
+        maxNativeZoom: SATELLITE_MAX_NATIVE_ZOOM,
+        errorTileUrl: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
         attribution: '&copy; 高德地图(卫星)'
     });
 
     const INITIAL_VIEW = { center: [36.0, 105.0], zoom: 4 };
     const map = L.map('map', {
-        minZoom: 3, maxZoom: 18,
+        minZoom: 3, maxZoom: MAP_MAX_ZOOM,
         maxBounds: [[-10, 70], [65, 140]],
-        layers: [normalMap]
+        layers: [satelliteMap]
     }).setView(INITIAL_VIEW.center, INITIAL_VIEW.zoom);
+
+    function outOfChina(lng, lat) {
+        return lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271;
+    }
+
+    function transformLat(lng, lat) {
+        let ret = -100.0 + 2.0 * lng + 3.0 * lat + 0.2 * lat * lat + 0.1 * lng * lat + 0.2 * Math.sqrt(Math.abs(lng));
+        ret += (20.0 * Math.sin(6.0 * lng * Math.PI) + 20.0 * Math.sin(2.0 * lng * Math.PI)) * 2.0 / 3.0;
+        ret += (20.0 * Math.sin(lat * Math.PI) + 40.0 * Math.sin(lat / 3.0 * Math.PI)) * 2.0 / 3.0;
+        ret += (160.0 * Math.sin(lat / 12.0 * Math.PI) + 320 * Math.sin(lat * Math.PI / 30.0)) * 2.0 / 3.0;
+        return ret;
+    }
+
+    function transformLng(lng, lat) {
+        let ret = 300.0 + lng + 2.0 * lat + 0.1 * lng * lng + 0.1 * lng * lat + 0.1 * Math.sqrt(Math.abs(lng));
+        ret += (20.0 * Math.sin(6.0 * lng * Math.PI) + 20.0 * Math.sin(2.0 * lng * Math.PI)) * 2.0 / 3.0;
+        ret += (20.0 * Math.sin(lng * Math.PI) + 40.0 * Math.sin(lng / 3.0 * Math.PI)) * 2.0 / 3.0;
+        ret += (150.0 * Math.sin(lng / 12.0 * Math.PI) + 300.0 * Math.sin(lng / 30.0 * Math.PI)) * 2.0 / 3.0;
+        return ret;
+    }
+
+    function wgs84ToGcj02(lng, lat) {
+        if (outOfChina(lng, lat)) return { lng, lat };
+        const a = 6378245.0;
+        const ee = 0.00669342162296594323;
+        let dLat = transformLat(lng - 105.0, lat - 35.0);
+        let dLng = transformLng(lng - 105.0, lat - 35.0);
+        const radLat = lat / 180.0 * Math.PI;
+        let magic = Math.sin(radLat);
+        magic = 1 - ee * magic * magic;
+        const sqrtMagic = Math.sqrt(magic);
+        dLat = (dLat * 180.0) / ((a * (1 - ee)) / (magic * sqrtMagic) * Math.PI);
+        dLng = (dLng * 180.0) / (a / sqrtMagic * Math.cos(radLat) * Math.PI);
+        return { lng: lng + dLng, lat: lat + dLat };
+    }
+
+    function gcj02ToWgs84(lng, lat) {
+        if (outOfChina(lng, lat)) return { lng, lat };
+        const gcj = wgs84ToGcj02(lng, lat);
+        return { lng: lng * 2 - gcj.lng, lat: lat * 2 - gcj.lat };
+    }
+
+    function bboxFromPoints(points) {
+        return {
+            min_lng: Math.min(...points.map(p => p.lng)),
+            min_lat: Math.min(...points.map(p => p.lat)),
+            max_lng: Math.max(...points.map(p => p.lng)),
+            max_lat: Math.max(...points.map(p => p.lat))
+        };
+    }
+
+    function bboxCorners(bbox) {
+        return [
+            { lng: bbox.min_lng, lat: bbox.min_lat },
+            { lng: bbox.min_lng, lat: bbox.max_lat },
+            { lng: bbox.max_lng, lat: bbox.min_lat },
+            { lng: bbox.max_lng, lat: bbox.max_lat }
+        ];
+    }
+
+    function mapSelectionToDataBbox(nw, se) {
+        const mapBbox = bboxFromPoints([
+            { lng: nw.lng, lat: nw.lat },
+            { lng: se.lng, lat: se.lat }
+        ]);
+        const dataBbox = bboxFromPoints(bboxCorners(mapBbox).map(p => gcj02ToWgs84(p.lng, p.lat)));
+        return { mapBbox, dataBbox };
+    }
+
+    function dataBboxToMapBounds(bbox) {
+        const mapBbox = bboxFromPoints(bboxCorners(bbox).map(p => wgs84ToGcj02(p.lng, p.lat)));
+        return [[mapBbox.min_lat, mapBbox.min_lng], [mapBbox.max_lat, mapBbox.max_lng]];
+    }
+
+    function fitMapBounds(bounds, options = {}) {
+        map.fitBounds(bounds, {
+            padding: [24, 24],
+            maxZoom: FIT_BOUNDS_MAX_ZOOM,
+            ...options
+        });
+    }
+
+    let mapResizeTimer = null;
+    function syncMapViewport() {
+        if (!map) return;
+        map.invalidateSize({ animate: false, pan: false });
+    }
+    requestAnimationFrame(syncMapViewport);
+    setTimeout(syncMapViewport, 250);
+    window.addEventListener('resize', () => {
+        clearTimeout(mapResizeTimer);
+        mapResizeTimer = setTimeout(syncMapViewport, 120);
+    });
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) setTimeout(syncMapViewport, 80);
+    });
+
+    const LAYOUT_STORAGE_KEY = 'satelliteSenseWorkbenchLayout';
+    const agentConsole = document.getElementById('agent-console');
+    const workspaceSidebar = document.getElementById('sidebar');
+    const agentCollapseBtn = document.getElementById('agent-collapse-btn');
+    const workspaceCollapseBtn = document.getElementById('workspace-collapse-btn');
+    const agentResizer = document.getElementById('agent-sidebar-resizer');
+    const workspaceResizer = document.getElementById('workspace-sidebar-resizer');
+    const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+    function readWorkbenchLayout() {
+        try {
+            return JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) || '{}');
+        } catch (e) {
+            return {};
+        }
+    }
+
+    function saveWorkbenchLayout(patch = {}) {
+        const next = { ...readWorkbenchLayout(), ...patch };
+        localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(next));
+        return next;
+    }
+
+    function applyWorkbenchLayout() {
+        const layout = readWorkbenchLayout();
+        const agentWidth = clamp(Number(layout.agentWidth) || 360, 300, 560);
+        const workspaceWidth = clamp(Number(layout.workspaceWidth) || 388, 320, 560);
+        document.documentElement.style.setProperty('--agent-sidebar-width', `${agentWidth}px`);
+        document.documentElement.style.setProperty('--workspace-sidebar-width', `${workspaceWidth}px`);
+        document.body.classList.toggle('agent-collapsed', Boolean(layout.agentCollapsed));
+        document.body.classList.toggle('workspace-collapsed', Boolean(layout.workspaceCollapsed));
+        if (agentCollapseBtn) {
+            const collapsed = Boolean(layout.agentCollapsed);
+            agentCollapseBtn.title = collapsed ? '展开左侧 Agent' : '收起左侧 Agent';
+            agentCollapseBtn.innerHTML = `<i class="${collapsed ? 'ri-arrow-right-s-line' : 'ri-arrow-left-s-line'}" aria-hidden="true"></i>`;
+        }
+        if (workspaceCollapseBtn) {
+            const collapsed = Boolean(layout.workspaceCollapsed);
+            workspaceCollapseBtn.title = collapsed ? '展开右侧工作区' : '收起右侧工作区';
+            workspaceCollapseBtn.innerHTML = `<i class="${collapsed ? 'ri-arrow-left-s-line' : 'ri-arrow-right-s-line'}" aria-hidden="true"></i>`;
+        }
+        setTimeout(syncMapViewport, 220);
+    }
+
+    function startSidebarResize(kind, event) {
+        event.preventDefault();
+        const isAgent = kind === 'agent';
+        const maxWidth = Math.min(560, Math.max(320, window.innerWidth - 560));
+        document.body.classList.add('is-resizing-sidebar');
+        const onMove = (moveEvent) => {
+            const width = isAgent
+                ? clamp(moveEvent.clientX, 300, maxWidth)
+                : clamp(window.innerWidth - moveEvent.clientX, 320, maxWidth);
+            document.documentElement.style.setProperty(
+                isAgent ? '--agent-sidebar-width' : '--workspace-sidebar-width',
+                `${width}px`
+            );
+            saveWorkbenchLayout(isAgent ? { agentWidth: width, agentCollapsed: false } : { workspaceWidth: width, workspaceCollapsed: false });
+            document.body.classList.toggle(isAgent ? 'agent-collapsed' : 'workspace-collapsed', false);
+            syncMapViewport();
+        };
+        const onUp = () => {
+            document.body.classList.remove('is-resizing-sidebar');
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+            syncMapViewport();
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+    }
+
+    applyWorkbenchLayout();
+    agentCollapseBtn?.addEventListener('click', () => {
+        const collapsed = !document.body.classList.contains('agent-collapsed');
+        saveWorkbenchLayout({ agentCollapsed: collapsed });
+        applyWorkbenchLayout();
+    });
+    workspaceCollapseBtn?.addEventListener('click', () => {
+        const collapsed = !document.body.classList.contains('workspace-collapsed');
+        saveWorkbenchLayout({ workspaceCollapsed: collapsed });
+        applyWorkbenchLayout();
+    });
+    agentResizer?.addEventListener('mousedown', (event) => startSidebarResize('agent', event));
+    workspaceResizer?.addEventListener('mousedown', (event) => startSidebarResize('workspace', event));
+
+    function enhanceToolbarSelects() {
+        const selects = Array.from(document.querySelectorAll(
+            '.toolbar-control select.custom-select, .modal-select-control select.custom-select'
+        ));
+        const closeControl = (control) => {
+            if (!control) return;
+            control.classList.remove('is-open');
+            const trigger = control.querySelector('.toolbar-select-trigger');
+            const menu = control.querySelector('.toolbar-select-menu');
+            if (trigger) trigger.setAttribute('aria-expanded', 'false');
+            if (menu) menu.hidden = true;
+        };
+        const closeAll = (except = null) => {
+            document.querySelectorAll('.toolbar-control.is-open, .modal-select-control.is-open').forEach((control) => {
+                if (control !== except) closeControl(control);
+            });
+        };
+
+        selects.forEach((select) => {
+            if (select.dataset.enhancedSelect === '1') return;
+            const control = select.closest('.toolbar-control, .modal-select-control');
+            if (!control) return;
+
+            select.dataset.enhancedSelect = '1';
+            control.classList.add('is-enhanced');
+            const label = control.querySelector('span');
+            const labelText = control.dataset.label || label?.textContent?.trim() || select.title || '选项';
+            if (label?.id) select.setAttribute('aria-labelledby', label.id);
+
+            const shell = document.createElement('div');
+            shell.className = 'toolbar-select-shell';
+
+            const trigger = document.createElement('button');
+            trigger.type = 'button';
+            trigger.className = 'toolbar-select-trigger';
+            trigger.setAttribute('aria-haspopup', 'listbox');
+            trigger.setAttribute('aria-expanded', 'false');
+
+            const triggerText = document.createElement('span');
+            triggerText.className = 'toolbar-select-text';
+            const triggerIcon = document.createElement('i');
+            triggerIcon.className = 'ri-arrow-down-s-line';
+            triggerIcon.setAttribute('aria-hidden', 'true');
+            trigger.appendChild(triggerText);
+            trigger.appendChild(triggerIcon);
+
+            const menu = document.createElement('div');
+            menu.className = 'toolbar-select-menu';
+            menu.id = `${select.id || 'toolbar-select'}-menu`;
+            menu.setAttribute('role', 'listbox');
+            menu.hidden = true;
+            trigger.setAttribute('aria-controls', menu.id);
+
+            const optionButtons = Array.from(select.options).map((option) => {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'toolbar-select-option';
+                button.dataset.value = option.value;
+                button.setAttribute('role', 'option');
+                button.tabIndex = -1;
+
+                const text = document.createElement('span');
+                text.textContent = option.textContent;
+                const icon = document.createElement('i');
+                icon.className = 'ri-check-line';
+                icon.setAttribute('aria-hidden', 'true');
+                button.appendChild(text);
+                button.appendChild(icon);
+
+                button.addEventListener('click', () => {
+                    if (select.value !== option.value) {
+                        select.value = option.value;
+                        select.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    syncSelection();
+                    closeControl(control);
+                    trigger.focus();
+                });
+                menu.appendChild(button);
+                return button;
+            });
+
+            function selectedOption() {
+                return select.selectedOptions[0] || select.options[0];
+            }
+
+            function syncSelection() {
+                const current = selectedOption();
+                triggerText.textContent = current?.textContent || '';
+                trigger.setAttribute(
+                    'aria-label',
+                    `${labelText}：${current?.textContent || ''}`
+                );
+                optionButtons.forEach((button) => {
+                    const selected = button.dataset.value === select.value;
+                    button.classList.toggle('is-selected', selected);
+                    button.setAttribute('aria-selected', String(selected));
+                    const icon = button.querySelector('i');
+                    if (icon) icon.style.visibility = selected ? 'visible' : 'hidden';
+                });
+            }
+
+            function openMenu() {
+                closeAll(control);
+                control.classList.add('is-open');
+                trigger.setAttribute('aria-expanded', 'true');
+                menu.hidden = false;
+                const selectedButton = optionButtons.find((button) => button.dataset.value === select.value);
+                selectedButton?.focus();
+            }
+
+            trigger.addEventListener('click', (event) => {
+                event.preventDefault();
+                if (control.classList.contains('is-open')) {
+                    closeControl(control);
+                } else {
+                    openMenu();
+                }
+            });
+
+            trigger.addEventListener('keydown', (event) => {
+                if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    openMenu();
+                }
+            });
+
+            menu.addEventListener('keydown', (event) => {
+                const currentIndex = optionButtons.indexOf(document.activeElement);
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    closeControl(control);
+                    trigger.focus();
+                } else if (event.key === 'ArrowDown') {
+                    event.preventDefault();
+                    optionButtons[(currentIndex + 1) % optionButtons.length]?.focus();
+                } else if (event.key === 'ArrowUp') {
+                    event.preventDefault();
+                    optionButtons[(currentIndex - 1 + optionButtons.length) % optionButtons.length]?.focus();
+                } else if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    document.activeElement?.click();
+                }
+            });
+
+            select.addEventListener('change', syncSelection);
+            select.after(shell);
+            shell.appendChild(trigger);
+            shell.appendChild(menu);
+            syncSelection();
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!event.target.closest('.toolbar-select-shell')) closeAll();
+        });
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') closeAll();
+        });
+    }
+
+    enhanceToolbarSelects();
 
     const styleToggle = document.getElementById('map-style-toggle');
     const imagerySourceToggle = document.getElementById('imagery-source-toggle');
@@ -80,7 +431,40 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function sceneBrief(scene) {
         if (!scene) return '';
-        return `${scene.source_label || scene.source || '影像源'} · ${sceneGradeText(scene.decision_grade)}`;
+        const parts = [scene.source_label || scene.source || '影像源', sceneGradeText(scene.decision_grade)];
+        if (scene.source === 'sentinel2') {
+            const acquired = scene.acquired_at ? formatSceneDate(scene.acquired_at).split(' ')[0] : '';
+            if (acquired) parts.push(acquired);
+            if (scene.cloud_percent != null) parts.push(`云量 ${scene.cloud_percent}%`);
+            if (scene.selection?.suitability_score != null) parts.push(`评分 ${scene.selection.suitability_score}`);
+        }
+        return parts.filter(Boolean).join(' · ');
+    }
+
+    function historyLabel(history) {
+        const scene = history.scene;
+        if (!scene) return (history.spatial_context || history.image_file).substring(0, 36);
+        const prefix = scene.source === 'sentinel2' ? '近期公开影像' : '高清底图';
+        const acquired = scene.acquired_at ? formatSceneDate(scene.acquired_at).split(' ')[0] : '';
+        const detail = scene.source === 'sentinel2'
+            ? [acquired, scene.cloud_percent != null ? `云量${scene.cloud_percent}%` : '', scene.selection?.suitability_score != null ? `评分${scene.selection.suitability_score}` : ''].filter(Boolean).join(' / ')
+            : (history.spatial_context || scene.decision_grade_label || sceneGradeText(scene.decision_grade));
+        return `${prefix}${detail ? ' · ' + detail : ''}`.substring(0, 42);
+    }
+
+    function historySubtitle(history) {
+        const parts = [];
+        if (history.spatial_context) parts.push(history.spatial_context);
+        if (history.scene) parts.push(sceneBrief(history.scene));
+        if (!parts.length && history.image_file) parts.push(history.image_file);
+        return parts.filter(Boolean).join(' / ').substring(0, 88);
+    }
+
+    function historySourceCode(history) {
+        const source = history.scene?.source;
+        if (source === 'sentinel2') return 'S2';
+        if (source === 'mapbox') return 'HD';
+        return 'IMG';
     }
 
     function getImagerySource() {
@@ -91,15 +475,267 @@ document.addEventListener('DOMContentLoaded', () => {
         return source === 'sentinel2' ? '近期公开影像' : '高清底图';
     }
 
+    function formatCompactDate(value) {
+        if (!value) return '未知时间';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return '未知时间';
+        return date.toLocaleString('zh-CN', {
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        });
+    }
+
+    function estimateAreaKm2(minLat, maxLat, minLng, maxLng) {
+        const midLat = ((minLat + maxLat) / 2) * Math.PI / 180;
+        const heightKm = Math.abs(maxLat - minLat) * 111.32;
+        const widthKm = Math.abs(maxLng - minLng) * 111.32 * Math.max(Math.cos(midLat), 0.05);
+        return Math.max(widthKm * heightKm, 0);
+    }
+
+    function formatAreaKm2(value) {
+        if (!Number.isFinite(value)) return '未知';
+        if (value >= 100) return `${Math.round(value).toLocaleString('zh-CN')} km²`;
+        if (value >= 10) return `${value.toFixed(1)} km²`;
+        return `${value.toFixed(2)} km²`;
+    }
+
+    function setRegionStage(itemEl, stage, label) {
+        if (!itemEl) return;
+        itemEl.dataset.stage = stage;
+        const chip = itemEl.querySelector('.region-stage-chip');
+        if (chip) chip.textContent = label;
+    }
+
+    function updateRegionMetrics(itemEl, values = {}) {
+        if (!itemEl) return;
+        Object.entries(values).forEach(([key, value]) => {
+            const target = itemEl.querySelector(`[data-region-metric="${key}"]`);
+            if (target) target.textContent = value || '未知';
+        });
+    }
+
+    // ==========================================
+    // 智能调查 Agent
+    // ==========================================
+    const agentGoalInput = document.getElementById('agent-goal-input');
+    const agentRunBtn = document.getElementById('agent-run-btn');
+    const agentModeSelect = document.getElementById('agent-mode-select');
+    const agentPanel = document.getElementById('agent-session-panel');
+    let currentAgentSessionId = null;
+    let agentPollTimer = null;
+
+    function agentStatusText(status) {
+        const map = {
+            running: '运行中',
+            waiting_user: '等待确认',
+            completed: '已完成',
+            failed: '失败'
+        };
+        return map[status] || status || '未知';
+    }
+
+    function agentStepText(step) {
+        const mark = step.status === 'done' ? '✓' : (step.status === 'running' ? '…' : '!');
+        return `<li class="agent-step agent-step-${escapeHtml(step.status || 'todo')}"><span>${mark}</span><b>${escapeHtml(step.label || step.id)}</b>${step.message ? `<small>${escapeHtml(step.message)}</small>` : ''}</li>`;
+    }
+
+    function renderAgentPlan(observer, steps) {
+        const planSteps = Array.isArray(observer?.plan_steps) && observer.plan_steps.length
+            ? observer.plan_steps
+            : steps.map(s => ({ id: s.id, label: s.label, status: s.status === 'done' ? 'done' : (s.status === 'running' ? 'running' : 'pending') }));
+        if (!planSteps.length) return '';
+        return `<div class="agent-plan-strip">${planSteps.map(step => `
+            <span class="agent-plan-chip agent-plan-${escapeHtml(step.status || 'pending')}">${escapeHtml(step.label || step.id)}</span>
+        `).join('')}</div>`;
+    }
+
+    function renderAgentObserver(observer, steps) {
+        if (!observer || Object.keys(observer).length === 0) return '';
+        return `
+            <div class="agent-observer">
+                <div class="agent-observer-head">
+                    <span>当前阶段</span>
+                    <b>${escapeHtml(observer.current_label || '准备中')}</b>
+                </div>
+                <div class="agent-observer-grid">
+                    <div><span>Agent 公开思路</span><p>${escapeHtml(observer.public_thought || '正在整理任务上下文。')}</p></div>
+                    <div><span>正在做</span><p>${escapeHtml(observer.doing || '')}</p></div>
+                    <div><span>下一步</span><p>${escapeHtml(observer.next || '继续按计划推进')}</p></div>
+                </div>
+                ${renderAgentPlan(observer, steps)}
+            </div>
+        `;
+    }
+
+    function renderAgentSession(session) {
+        if (!agentPanel || !session) return;
+        agentPanel.hidden = false;
+        const artifacts = session.artifacts || {};
+        const observer = session.observer || artifacts.observer || {};
+        const ndwi = artifacts.ndwi;
+        const finalAnswer = artifacts.final_answer || '';
+        const report = artifacts.report;
+        const waiting = artifacts.waiting;
+        const steps = Array.isArray(session.timeline) ? session.timeline : [];
+        const optionsHtml = waiting?.options?.length
+            ? `<div class="agent-options">${waiting.options.map(opt => `<button data-agent-option="${escapeHtml(opt)}">${escapeHtml(opt)}</button>`).join('')}</div>`
+            : '';
+        const imageHtml = artifacts.image_url
+            ? `<img class="agent-result-img" src="${escapeHtml(artifacts.image_url)}&t=${Date.now()}" alt="Agent 影像结果">`
+            : '';
+        const ndwiHtml = ndwi
+            ? `<div class="agent-metric"><span>NDWI</span><b>${ndwi.available ? `${ndwi.water_percent}% 可能水体` : '未计算'}</b><p>${escapeHtml(ndwi.limitations || ndwi.reason || '')}</p></div>`
+            : '';
+        const reportHtml = report
+            ? `<a class="agent-report-link" href="${escapeHtml(report.download_url)}" target="_blank">下载 Word 报告</a>`
+            : (session.status === 'completed' ? '<button id="agent-report-btn" class="agent-secondary-btn">生成报告</button>' : '');
+        agentPanel.innerHTML = `
+            <div class="agent-session-head">
+                <span>${escapeHtml(agentStatusText(session.status))}</span>
+                <b>#${session.id}</b>
+            </div>
+            ${renderAgentObserver(observer, steps)}
+            <ol class="agent-steps">${steps.map(agentStepText).join('')}</ol>
+            ${waiting ? `<div class="agent-waiting">${escapeHtml(waiting.message || '')}${optionsHtml}</div>` : ''}
+            ${imageHtml}
+            ${ndwiHtml}
+            ${finalAnswer ? `<div class="agent-final-answer">${renderMarkdown(finalAnswer)}</div>` : ''}
+            ${reportHtml}
+        `;
+        agentPanel.querySelectorAll('[data-agent-option]').forEach(btn => {
+            btn.addEventListener('click', () => sendAgentMessage(btn.dataset.agentOption || btn.textContent));
+        });
+        const reportBtn = document.getElementById('agent-report-btn');
+        if (reportBtn) reportBtn.addEventListener('click', () => sendAgentMessage('生成报告', 'generate_report'));
+        if (artifacts.scene) {
+            const b = artifacts.bbox || artifacts.scene.bbox;
+            if (b?.min_lat != null) fitMapBounds(dataBboxToMapBounds(b));
+        }
+    }
+
+    async function loadAgentSession(id) {
+        const res = await fetch(`/api/agent/sessions/${id}/`);
+        const data = await res.json();
+        if (data.code === 200) {
+            renderAgentSession(data.data);
+            if (data.data.status === 'completed' || data.data.status === 'failed' || data.data.status === 'waiting_user') {
+                if (agentPollTimer) clearInterval(agentPollTimer);
+                agentPollTimer = null;
+                agentRunBtn.disabled = false;
+            }
+            return data.data;
+        }
+        throw new Error(data.msg || 'Agent 状态读取失败');
+    }
+
+    function startAgentPolling(id) {
+        if (agentPollTimer) clearInterval(agentPollTimer);
+        agentPollTimer = setInterval(() => {
+            loadAgentSession(id).catch(() => {
+                if (agentPollTimer) clearInterval(agentPollTimer);
+                agentPollTimer = null;
+                agentRunBtn.disabled = false;
+                showToast('Agent 状态读取失败', 'error');
+            });
+        }, 1200);
+    }
+
+    async function startAgentSession(extra = {}) {
+        const goal = (extra.goal || agentGoalInput?.value || '').trim();
+        if (!goal) {
+            showToast('请输入调查目标', 'warning');
+            return;
+        }
+        agentRunBtn.disabled = true;
+        if (agentPanel) {
+            agentPanel.hidden = false;
+            agentPanel.innerHTML = `
+                <div class="agent-session-head">
+                    <span>建立任务</span>
+                    <b>准备中</b>
+                </div>
+                <div class="agent-boot-state">
+                    <span class="spinner"></span>
+                    <div><b>正在连接调查链路</b><small>正在整理目标、影像源和执行计划。</small></div>
+                </div>
+            `;
+        }
+        try {
+            const res = await fetch('/api/agent/sessions/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    goal,
+                    mode: agentModeSelect?.value || 'precise',
+                    ...extra
+                })
+            });
+            const data = await res.json();
+            if (data.code !== 200) {
+                agentRunBtn.disabled = false;
+                showToast(data.msg || 'Agent 启动失败', 'error');
+                return;
+            }
+            currentAgentSessionId = data.data.id;
+            renderAgentSession(data.data);
+            startAgentPolling(currentAgentSessionId);
+            showToast('Agent 调查已启动', 'success');
+        } catch (e) {
+            agentRunBtn.disabled = false;
+            showToast('Agent 请求失败', 'error');
+        }
+    }
+
+    async function sendAgentMessage(content, action = '') {
+        if (!currentAgentSessionId) return;
+        try {
+            const res = await fetch(`/api/agent/sessions/${currentAgentSessionId}/messages/`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content, action })
+            });
+            const data = await res.json();
+            if (data.code === 200) {
+                renderAgentSession(data.data);
+                if (data.data?.status === 'running') {
+                    agentRunBtn.disabled = true;
+                    startAgentPolling(currentAgentSessionId);
+                } else if (data.data?.status === 'completed' || data.data?.status === 'failed' || data.data?.status === 'waiting_user') {
+                    agentRunBtn.disabled = false;
+                }
+                showToast(action === 'generate_report' ? '报告已生成' : '已发送给 Agent', 'success');
+            } else {
+                showToast(data.msg || 'Agent 消息失败', 'error');
+            }
+        } catch (e) {
+            showToast('Agent 消息请求失败', 'error');
+        }
+    }
+
+    if (agentRunBtn) {
+        agentRunBtn.addEventListener('click', () => startAgentSession());
+    }
+    if (agentGoalInput) {
+        agentGoalInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') startAgentSession();
+        });
+    }
+
     // ==========================================
     // 返回全国按钮
     // ==========================================
     const backBtn = document.getElementById('backButton');
+    const zoomReadout = document.getElementById('map-zoom-readout');
     function updateBackBtn() {
-        backBtn.style.display = map.getZoom() >= 7 ? 'block' : 'none';
+        backBtn.classList.toggle('is-visible', map.getZoom() >= 7);
+        if (zoomReadout) zoomReadout.textContent = map.getZoom();
     }
     map.on('zoomend', updateBackBtn);
     map.on('moveend', updateBackBtn);
+    updateBackBtn();
     backBtn.addEventListener('click', () => {
         map.setView(INITIAL_VIEW.center, INITIAL_VIEW.zoom);
         showToast('已返回全国视图', 'info');
@@ -125,20 +761,21 @@ document.addEventListener('DOMContentLoaded', () => {
     const compareToggle = document.getElementById('compare-toggle');
     const compareBar = document.getElementById('compare-bar');
     const compareBtn = document.getElementById('compare-btn');
+    if (compareBar) compareBar.hidden = true;
 
     compareToggle.addEventListener('click', () => {
         compareMode = !compareMode;
-        compareToggle.style.color = compareMode ? '#007aff' : 'rgba(255,255,255,0.4)';
-        document.querySelectorAll('.select-cb').forEach(cb => cb.style.display = compareMode ? 'block' : 'none');
+        compareToggle.classList.toggle('is-active', compareMode);
+        document.body.classList.toggle('compare-mode', compareMode);
         if (!compareMode) {
             document.querySelectorAll('.select-cb').forEach(cb => cb.checked = false);
-            compareBar.style.display = 'none';
+            compareBar.hidden = true;
         }
     });
 
     function updateCompareBar() {
         const checked = document.querySelectorAll('.select-cb:checked').length;
-        compareBar.style.display = compareMode && checked >= 2 ? 'block' : 'none';
+        compareBar.hidden = !(compareMode && checked >= 2);
         compareBtn.textContent = `对比所选 (${checked} 个区域)`;
     }
     document.addEventListener('change', (e) => {
@@ -162,7 +799,7 @@ document.addEventListener('DOMContentLoaded', () => {
         renderScenePanel(null);
         modalImg.style.display = 'none';
         modalIdSpan.innerText = ` · 对比 ${items.length} 个区域`;
-        chatBox.innerHTML = `<div style="color:#aaa;text-align:center;margin:20px 0;">加载 ${items.length} 张影像...</div>`;
+        chatBox.innerHTML = `<div class="chat-empty-state">加载 ${items.length} 张影像...</div>`;
 
         const container = document.querySelector('.chat-modal-left');
         container.innerHTML = '';
@@ -174,10 +811,7 @@ document.addEventListener('DOMContentLoaded', () => {
         items.forEach((item, i) => {
             const img = document.createElement('img');
             img.src = item.imgUrl;
-            img.style.width = 'calc(50% - 4px)';
-            img.style.borderRadius = '8px';
-            img.style.border = '0.5px solid rgba(255,255,255,0.1)';
-            img.style.objectFit = 'cover';
+            img.className = 'compare-preview-img';
             img.alt = `区域 ${i + 1}`;
             container.appendChild(img);
         });
@@ -223,23 +857,23 @@ document.addEventListener('DOMContentLoaded', () => {
             });
 
             L.polygon([worldOuter, ...holes], {
-                color: 'none', fillColor: '#f0f0f0', fillOpacity: 1, interactive: false, renderer: L.canvas()
+                color: 'none', fillColor: '#071113', fillOpacity: 0.82, interactive: false, renderer: L.canvas()
             }).addTo(map);
 
             provinceLayer = L.geoJSON(geojson, {
-                style: { color: "#888", weight: 1, fillOpacity: 0, fillColor: "transparent" },
+                style: { color: "#5bfff0", weight: 0.9, opacity: 0.45, fillOpacity: 0, fillColor: "transparent" },
                 onEachFeature: (feature, layer) => {
                     layer.on({
                         mouseover: (e) => {
                             isMouseOverChina = true;
-                            e.target.setStyle({ color: "#ff4757", weight: 3, fillOpacity: 0.1, fillColor: "#ff4757" });
+                            e.target.setStyle({ color: "#55eee5", weight: 2, fillOpacity: 0.08, fillColor: "#22d3c5" });
                             e.target.bringToFront();
                         },
                         mouseout: (e) => {
                             isMouseOverChina = false;
                             provinceLayer.resetStyle(e.target);
                         },
-                        click: (e) => { if (!isSelecting && !justFinished) map.fitBounds(e.target.getBounds()); }
+                        click: (e) => { if (!isSelecting && !justFinished) fitMapBounds(e.target.getBounds(), { maxZoom: 9 }); }
                     });
                 }
             }).addTo(map);
@@ -369,29 +1003,56 @@ document.addEventListener('DOMContentLoaded', () => {
         hideHint();
         const list = document.getElementById('coords-list');
         const c = list.querySelectorAll('.coord-item').length + 1;
+        const { mapBbox, dataBbox } = mapSelectionToDataBbox(nw, se);
+        const minLng = dataBbox.min_lng;
+        const maxLng = dataBbox.max_lng;
+        const minLat = dataBbox.min_lat;
+        const maxLat = dataBbox.max_lat;
+        const centerLat = (minLat + maxLat) / 2;
+        const centerLng = (minLng + maxLng) / 2;
+        const areaKm2 = estimateAreaKm2(minLat, maxLat, minLng, maxLng);
         const div = document.createElement('div');
         div.className = 'coord-item';
-        div.style.position = 'relative';
+        div.dataset.stage = 'pending';
+        div._mapBounds = [[mapBbox.min_lat, mapBbox.min_lng], [mapBbox.max_lat, mapBbox.max_lng]];
+        div._dataBbox = dataBbox;
         div.innerHTML = `
-            <button class="delete-btn" title="删除此项">✕</button>
-            <input type="checkbox" class="select-cb" style="position:absolute;top:8px;left:8px;width:16px;height:16px;accent-color:#007aff;cursor:pointer;display:none;">
-            <strong><span style="color:#3b82f6">●</span> 区域 #${c}</strong><br>
-            <span style="color:#aaa">${nw.lat.toFixed(4)}, ${nw.lng.toFixed(4)}  →  ${se.lat.toFixed(4)}, ${se.lng.toFixed(4)}</span>
+            <button class="delete-btn" title="删除此项"><i class="ri-close-line" aria-hidden="true"></i></button>
+            <input type="checkbox" class="select-cb" aria-label="选择区域 #${c}">
+            <div class="coord-title-row">
+                <strong><i class="ri-focus-3-line" aria-hidden="true"></i> 区域 #${c}</strong>
+                <span>${imagerySourceLabel(getImagerySource())}</span>
+            </div>
+            <div class="region-stage-row">
+                <span class="region-stage-chip">影像准备中</span>
+                <span class="region-center">${centerLat.toFixed(4)}°N, ${centerLng.toFixed(4)}°E</span>
+            </div>
+            <div class="coord-meta">${maxLat.toFixed(4)}, ${minLng.toFixed(4)} → ${minLat.toFixed(4)}, ${maxLng.toFixed(4)}</div>
+            <div class="region-metrics">
+                <div><span>面积</span><b data-region-metric="area">${formatAreaKm2(areaKm2)}</b></div>
+                <div><span>分辨率</span><b data-region-metric="gsd">待获取</b></div>
+                <div><span>影像源</span><b data-region-metric="source">${imagerySourceLabel(getImagerySource())}</b></div>
+            </div>
             <div class="scene-brief" hidden></div>
-            <img class="preview-img" alt="卫星图预览" style="cursor:pointer;" title="点击进入分析舱">
-            <div class="tile-progress" style="display:none; margin-top:8px;">
-                <div class="progress-bar-bg" style="width:100%; height:4px; background:rgba(255,255,255,0.08); border-radius:2px; overflow:hidden;">
-                    <div class="progress-bar-fill" style="width:0%; height:100%; background:linear-gradient(90deg, #007aff, #34c759); border-radius:2px; transition:width 0.3s;"></div>
+            <img class="preview-img" alt="卫星图预览" title="点击进入分析舱">
+            <div class="tile-progress" hidden>
+                <div class="progress-bar-bg">
+                    <div class="progress-bar-fill"></div>
                 </div>
-                <span class="progress-text" style="font-size:11px; color:rgba(255,255,255,0.4);">0/0</span>
+                <span class="progress-text">0/0</span>
             </div>
             <div class="ai-status">
                 <span class="spinner"></span> 正在准备影像...
             </div>
-            <div class="ai-question" style="margin-top:10px; display:none;">
-                <button class="enter-cabin-btn" style="width:100%; padding:10px; background:#007aff; color:white; border:none; border-radius:9999px; cursor:pointer; font-weight:600; font-size:13px; transition:all 0.3s cubic-bezier(0.25,0.1,0.25,1);">
-                    进入分析舱
-                </button>
+            <div class="ai-question" hidden>
+                <div class="region-actions">
+                    <button class="locate-region-btn secondary-action" type="button">
+                        <i class="ri-crosshair-2-line" aria-hidden="true"></i>定位
+                    </button>
+                    <button class="enter-cabin-btn" type="button">
+                        <i class="ri-door-open-line" aria-hidden="true"></i>进入分析舱
+                    </button>
+                </div>
             </div>
         `;
 
@@ -411,8 +1072,11 @@ document.addEventListener('DOMContentLoaded', () => {
             const items = list.querySelectorAll('.coord-item');
             items.forEach((item, i) => {
                 const strong = item.querySelector('strong');
-                if (strong) strong.innerHTML = `<span style="color:#3b82f6">●</span> 区域 #${i + 1}`;
+                if (strong) strong.innerHTML = `<i class="ri-focus-3-line" aria-hidden="true"></i> 区域 #${i + 1}`;
+                const cb = item.querySelector('.select-cb');
+                if (cb) cb.setAttribute('aria-label', `选择区域 #${i + 1}`);
             });
+            updateCompareBar();
             showToast('已删除该区域', 'info');
         });
 
@@ -420,9 +1084,14 @@ document.addEventListener('DOMContentLoaded', () => {
         const previewImg = div.querySelector('.preview-img');
         previewImg.addEventListener('click', function() {
             if (this.dataset.filename) {
-                map.fitBounds([[se.lat, nw.lng], [nw.lat, se.lng]]);
+                fitMapBounds(div._mapBounds || dataBboxToMapBounds(div._dataBbox));
                 openChatModal(this.dataset.filename, this.src);
             }
+        });
+        div.querySelector('.locate-region-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            fitMapBounds(div._mapBounds || dataBboxToMapBounds(div._dataBbox));
+            showToast(`已定位到区域 #${c}`, 'info');
         });
 
         list.prepend(div);
@@ -459,6 +1128,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const fail = (msg, toastMsg = msg) => {
             stopPoll();
             if (progressBar) progressBar.style.display = 'none';
+            if (progressBar) progressBar.hidden = true;
             if (statusEl) {
                 statusEl.style.display = 'block';
                 statusEl.innerHTML = msg;
@@ -488,6 +1158,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         if (pd.data.status === 'done' || pd.data.status === 'partial') {
                             stopPoll();
                             if (progressBar) progressBar.style.display = 'none';
+                            if (progressBar) progressBar.hidden = true;
                             if (statusEl) statusEl.style.display = 'none';
                             if (onReady) onReady(pd.data);
                             if (pd.data.status === 'partial') {
@@ -516,11 +1187,42 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    function loadRegionPreviewImage(img, baseUrl, fileName, retries = 3) {
+        return new Promise((resolve) => {
+            let attempt = 0;
+            const cleanup = () => {
+                img.onload = null;
+                img.onerror = null;
+            };
+            const tryLoad = () => {
+                attempt += 1;
+                cleanup();
+                img.onload = () => {
+                    cleanup();
+                    img.dataset.filename = fileName;
+                    resolve(true);
+                };
+                img.onerror = () => {
+                    if (attempt < retries) {
+                        setTimeout(tryLoad, 350 * attempt);
+                    } else {
+                        cleanup();
+                        resolve(false);
+                    }
+                };
+                img.removeAttribute('src');
+                img.src = `${baseUrl}&t=${Date.now()}_${attempt}`;
+            };
+            tryLoad();
+        });
+    }
+
     async function sendToBackend(nw, se, itemEl) {
-        const min_lng = Math.min(nw.lng, se.lng);
-        const max_lng = Math.max(nw.lng, se.lng);
-        const min_lat = Math.min(nw.lat, se.lat);
-        const max_lat = Math.max(nw.lat, se.lat);
+        const selected = itemEl?._dataBbox || mapSelectionToDataBbox(nw, se).dataBbox;
+        const min_lng = selected.min_lng;
+        const max_lng = selected.max_lng;
+        const min_lat = selected.min_lat;
+        const max_lat = selected.max_lat;
 
         const status = itemEl.querySelector('.ai-status');
         const previewImg = itemEl.querySelector('.preview-img');
@@ -533,6 +1235,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const endpoint = imagerySource === 'sentinel2' ? "/api/satellite/get-sentinel-img/" : "/api/satellite/get-img/";
 
         try {
+            setRegionStage(itemEl, 'pending', '请求影像中');
             status.style.display = 'block';
             status.innerHTML = `<span class="spinner"></span> 正在获取${imagerySourceLabel(imagerySource)}...`;
 
@@ -550,6 +1253,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 const spatialCtx = d.data.gsd_m
                     ? `范围: ${d.data.area_km2} km\u00B2 | 分辨率: ${d.data.gsd_m} m/像素`
                     : "";
+                updateRegionMetrics(itemEl, {
+                    area: d.data.area_km2 ? formatAreaKm2(Number(d.data.area_km2)) : undefined,
+                    gsd: d.data.gsd_m ? `${d.data.gsd_m} m/像素` : undefined,
+                    source: imagerySourceLabel(imagerySource)
+                });
 
                 chatMemories[fileName] = {
                     history: [],
@@ -565,28 +1273,41 @@ document.addEventListener('DOMContentLoaded', () => {
                     sceneBriefEl.hidden = false;
                 }
 
-                const showReadyImage = () => {
-                    previewImg.src = imgUrl + '&t=' + Date.now();
-                    previewImg.dataset.filename = fileName;
+                const showReadyImage = async () => {
+                    setRegionStage(itemEl, 'downloading', '预览加载中');
+                    status.style.display = 'block';
+                    status.innerHTML = '<span class="spinner"></span> 正在加载预览...';
+                    previewImg.style.display = 'none';
+                    const loaded = await loadRegionPreviewImage(previewImg, imgUrl, fileName);
+                    if (!loaded) {
+                        setRegionStage(itemEl, 'error', '预览失败');
+                        status.style.display = 'block';
+                        status.innerHTML = '预览图加载失败，请重新框选或刷新重试';
+                        showToast('预览图加载失败，请重试', 'error');
+                        return;
+                    }
+                    setRegionStage(itemEl, 'ready', '可进入分析');
+                    status.style.display = 'none';
                     previewImg.style.display = 'block';
                     previewImg.style.animation = 'none';
                     void previewImg.offsetHeight;
                     previewImg.style.animation = 'fadeIn 0.4s ease';
-                    questionBox.style.display = 'block';
+                    questionBox.hidden = false;
                     enterBtn.onclick = () => {
-                        map.fitBounds([[se.lat, nw.lng], [nw.lat, se.lng]]);
+                        fitMapBounds(itemEl?._mapBounds || dataBboxToMapBounds(selected));
                         openChatModal(fileName, imgUrl, spatialCtx);
                     };
                 };
 
                 if (imagerySource === 'sentinel2') {
-                    status.style.display = 'none';
                     progressBar.style.display = 'none';
+                    progressBar.hidden = true;
                     showReadyImage();
                     showToast('近期公开影像已生成', 'success');
                 } else {
+                    setRegionStage(itemEl, 'downloading', '瓦片下载中');
                     status.innerHTML = '<span class="spinner"></span> 正在下载瓦片...';
-                    progressBar.style.display = 'block';
+                    progressBar.hidden = false;
                     progressText.textContent = `0/${totalTiles}`;
                     await pollDownloadProgress(fileName, totalTiles, {
                         ownerEl: itemEl,
@@ -598,10 +1319,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     });
                 }
             } else {
+                setRegionStage(itemEl, 'error', '影像失败');
                 status.innerHTML = '抓取失败：' + d.msg;
                 showToast('抓取失败：' + d.msg, 'error');
             }
         } catch (e) {
+            setRegionStage(itemEl, 'error', '网络失败');
             status.innerHTML = '网络错误，请检查后端';
             showToast('网络请求失败，请确认后端运行中', 'error');
         }
@@ -617,6 +1340,26 @@ document.addEventListener('DOMContentLoaded', () => {
     const chatBox = document.getElementById('chat-message-box');
     let modalImg = document.getElementById('chat-modal-img');
     const modalIdSpan = document.getElementById('chat-modal-id');
+    const agentRegionBtn = document.getElementById('agent-region-btn');
+
+    if (agentRegionBtn) {
+        agentRegionBtn.addEventListener('click', () => {
+            if (!currentActiveImage || currentActiveImage === '__compare__') {
+                showToast('请先打开一个已生成影像的区域', 'warning');
+                return;
+            }
+            const data = getChatData(currentActiveImage);
+            const goal = textarea.value.trim() || `请对当前框选区域进行${data.scene?.source === 'sentinel2' ? '近期态势' : '遥感'}智能调查`;
+            if (agentGoalInput) agentGoalInput.value = goal;
+            startAgentSession({
+                goal,
+                file_name: currentActiveImage,
+                scene_id: data.sceneId,
+                bbox: data.bbox
+            });
+            showToast('已按当前区域启动 Agent 调查', 'info');
+        });
+    }
 
     function renderScenePanel(scene) {
         const panel = document.getElementById('imagery-scene-panel');
@@ -630,22 +1373,28 @@ document.addEventListener('DOMContentLoaded', () => {
         const gsd = scene.gsd_m ? `约 ${scene.gsd_m} m/像素` : '未知';
         const cloud = scene.cloud_percent != null ? `${scene.cloud_percent}%` : '未知';
         const acquiredAt = formatSceneDate(scene.acquired_at);
-        const fetchedAt = formatSceneDate(scene.fetched_at);
-        const limitations = scene.limitations || '暂无限制说明';
+        const grade = sceneGradeText(scene.decision_grade);
+        const limitations = scene.limitations || '公开影像辅助筛查';
+        const selection = scene.selection;
+        const selectionTitle = selection
+            ? `${selection.summary || '已记录候选优选依据'}${
+                Array.isArray(selection.score_reasons) && selection.score_reasons.length
+                    ? `：${selection.score_reasons.slice(0, 3).join('；')}`
+                    : ''
+            }`
+            : '';
         panel.innerHTML = `
-            <div class="scene-panel-head">
-                <span>影像档案</span>
-                <strong>${escapeHtml(sceneGradeText(scene.decision_grade))}</strong>
+            <div class="scene-compact-head">
+                <span>${escapeHtml(scene.source_label || scene.source || '影像源')}</span>
+                <strong title="${escapeHtml(limitations)}">${escapeHtml(grade)}</strong>
             </div>
-            <div class="scene-panel-grid">
-                <div><span>来源</span><b>${escapeHtml(scene.source_label || scene.source || '未知')}</b></div>
-                <div><span>拍摄</span><b>${escapeHtml(acquiredAt)}</b></div>
-                <div><span>获取</span><b>${escapeHtml(fetchedAt)}</b></div>
-                <div><span>分辨率</span><b>${escapeHtml(gsd)}</b></div>
-                <div><span>云量</span><b>${escapeHtml(cloud)}</b></div>
-                <div><span>处理级别</span><b>${escapeHtml(scene.processing_level || '未知')}</b></div>
+            <div class="scene-chip-row">
+                <span title="拍摄日期"><i class="ri-calendar-line" aria-hidden="true"></i>${escapeHtml(acquiredAt)}</span>
+                <span title="空间分辨率"><i class="ri-ruler-line" aria-hidden="true"></i>${escapeHtml(gsd)}</span>
+                <span title="云量"><i class="ri-cloudy-line" aria-hidden="true"></i>${escapeHtml(cloud)}</span>
+                ${scene.processing_level ? `<span title="处理级别"><i class="ri-stack-line" aria-hidden="true"></i>${escapeHtml(scene.processing_level)}</span>` : ''}
             </div>
-            <div class="scene-panel-note">${escapeHtml(limitations)}</div>
+            ${selection ? `<button class="scene-mini-note" type="button" title="${escapeHtml(selectionTitle)}"><i class="ri-check-double-line" aria-hidden="true"></i>已选最佳候选</button>` : ''}
         `;
         panel.hidden = false;
     }
@@ -805,18 +1554,36 @@ document.addEventListener('DOMContentLoaded', () => {
         return result.join('\n');
     }
 
+    function renderMethodMeta(method) {
+        if (!method || typeof method !== 'object') return '';
+        const parts = [];
+        const modeLabel = method.mode === 'fast' ? '快速模式' : '精准模式';
+        if (method.model) parts.push(`${modeLabel} · ${method.model}`);
+        if (method.task_label) parts.push(`任务：${method.task_label}`);
+        if (method.confidence?.label) parts.push(`可信度：${method.confidence.label}`);
+        const rec = method.source_recommendation;
+        if (rec?.recommended_label) {
+            const recText = rec.alignment === 'matched'
+                ? `${rec.recommended_label}（匹配）`
+                : `${rec.recommended_label}（建议切换）`;
+            parts.push(recText);
+        }
+        if (!parts.length) return '';
+        return `<div class="analysis-method-meta">${parts.map(escapeHtml).join(' / ')}</div>`;
+    }
+
     function renderChatHistory() {
         chatBox.innerHTML = '';
         const data = getChatData(currentActiveImage);
         const history = data.history || [];
         if (history.length === 0) {
-            chatBox.innerHTML = '<div style="color:#aaa; text-align:center; margin-top:50px;">🛰️ 可以开始提问了</div>';
+            chatBox.innerHTML = '<div class="chat-empty-state"><i class="ri-question-answer-line" aria-hidden="true"></i><span>可以开始提问了</span></div>';
         } else {
             history.forEach(msg => {
                 const div = document.createElement('div');
                 div.className = `chat-bubble ${msg.role === 'user' ? 'chat-user' : 'chat-ai'}`;
                 if (msg.role === 'ai') {
-                    div.innerHTML = renderMarkdown(msg.content);
+                    div.innerHTML = renderMarkdown(msg.content) + renderMethodMeta(msg.analysis_method);
                 } else {
                     div.textContent = msg.content;
                 }
@@ -855,7 +1622,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // 用 divIcon(纯 CSS 圆点),不依赖 Leaflet 默认图标资源,离线也能显示
     const aiTargetIcon = L.divIcon({
         className: 'ai-target-marker',
-        html: '<div style="width:16px;height:16px;border-radius:50%;background:#ff3b30;border:2px solid #fff;box-shadow:0 0 0 2px rgba(255,59,48,0.45);"></div>',
+        html: '<div class="ai-target-dot"></div>',
         iconSize: [16, 16], iconAnchor: [8, 8]
     });
     function clearTargetMarkers() {
@@ -922,6 +1689,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         isQuerying = true;
         sendBtn.disabled = true;
+        modal.classList.add('is-querying');
 
         const data = getChatData(currentActiveImage);
         data.history.push({ role: 'user', content: text });
@@ -978,6 +1746,7 @@ document.addEventListener('DOMContentLoaded', () => {
         } finally {
             isQuerying = false;
             sendBtn.disabled = false;
+            modal.classList.remove('is-querying');
         }
         renderChatHistory();
         if (currentActiveImage) saveHistory(currentActiveImage);
@@ -1002,13 +1771,14 @@ document.addEventListener('DOMContentLoaded', () => {
         zoomMode = !zoomMode;
         zoomBtn.style.background = zoomMode ? 'rgba(0,122,255,0.25)' : 'rgba(255,255,255,0.06)';
         zoomBtn.style.color = zoomMode ? '#007aff' : 'rgba(255,255,255,0.7)';
-        zoomBtn.textContent = zoomMode ? '✕ 退出' : '🔍 放大';
+        zoomBtn.innerHTML = zoomMode
+            ? '<i class="ri-close-line" aria-hidden="true"></i>退出'
+            : '<i class="ri-zoom-in-line" aria-hidden="true"></i>放大';
 
         if (zoomMode) {
             const container = ensureZoomContainer();
             zoomCanvas = document.createElement('div');
             zoomCanvas.id = 'zoom-canvas';
-            zoomCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;z-index:999;cursor:crosshair;';
             container.appendChild(zoomCanvas);
         } else {
             if (zoomCanvas) { zoomCanvas.remove(); zoomCanvas = null; }
@@ -1022,7 +1792,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const r = zoomCanvas.getBoundingClientRect();
         zStart = { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
         zRect = document.createElement('div');
-        zRect.style.cssText = 'position:absolute;border:2px solid #007aff;background:rgba(0,122,255,0.08);pointer-events:none;z-index:1000;';
+        zRect.className = 'zoom-selection-rect';
         zoomCanvas.appendChild(zRect);
     });
 
@@ -1053,7 +1823,7 @@ document.addEventListener('DOMContentLoaded', () => {
         zoomMode = false;
         zoomBtn.style.background = 'rgba(255,255,255,0.06)';
         zoomBtn.style.color = 'rgba(255,255,255,0.7)';
-        zoomBtn.textContent = '🔍 放大';
+        zoomBtn.innerHTML = '<i class="ri-zoom-in-line" aria-hidden="true"></i>放大';
 
         if (x2 - x1 < 0.03 || y2 - y1 < 0.03) return;
 
@@ -1120,7 +1890,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const q = searchInput.value.trim();
         if (q.length === 0) { searchResults.style.display = 'none'; searchIdx = -1; return; }
         searchResults.style.display = 'block';
-        searchResults.innerHTML = '<div class="search-result-item" style="text-align:center;color:rgba(255,255,255,0.3);"><span class="spinner"></span> 搜索中...</div>';
+        searchResults.innerHTML = '<div class="search-result-item search-state"><span class="spinner"></span> 搜索中...</div>';
         searchIdx = -1;
         searchTimeout = setTimeout(async () => {
             try {
@@ -1129,7 +1899,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const data = resp.data || [];
                 searchResults.innerHTML = '';
                 if (data.length === 0) {
-                    searchResults.innerHTML = '<div class="search-result-item" style="text-align:center;color:rgba(255,255,255,0.3);">无匹配结果</div>';
+                    searchResults.innerHTML = '<div class="search-result-item search-state">无匹配结果</div>';
                 } else {
                     data.forEach((item, i) => {
                         const name = item.name || item.display_name.split(',')[0];
@@ -1149,7 +1919,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
                 searchResults.style.display = 'block';
             } catch(e) {
-                searchResults.innerHTML = '<div class="search-result-item" style="text-align:center;color:rgba(255,255,255,0.3);">搜索服务不可用</div>';
+                searchResults.innerHTML = '<div class="search-result-item search-state">搜索服务不可用</div>';
                 searchResults.style.display = 'block';
             }
         }, 250);
@@ -1245,17 +2015,26 @@ document.addEventListener('DOMContentLoaded', () => {
             const r = await fetch('/api/ai/history/');
             const d = await r.json();
             if (d.code !== 200 || !d.data.length) {
-                historyList.innerHTML = '<div style="font-size:11px;color:rgba(255,255,255,0.25);text-align:center;padding:10px 0;">暂无历史记录</div>';
+                historyList.innerHTML = '<div class="history-empty">暂无历史记录</div>';
                 return;
             }
             historyList.innerHTML = '';
             d.data.forEach(h => {
                 const item = document.createElement('div');
-                item.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:4px 0; font-size:11px; color:rgba(255,255,255,0.6); cursor:pointer;';
+                item.className = 'history-item';
+                item.title = '点击加载历史对话';
+                const badge = document.createElement('span');
+                badge.className = 'history-source-badge';
+                badge.textContent = historySourceCode(h);
                 const label = document.createElement('span');
-                label.textContent = (h.spatial_context || h.image_file).substring(0, 30);
-                label.title = '点击加载';
-                label.addEventListener('click', async () => {
+                label.className = 'history-main';
+                label.innerHTML = `
+                    <b>${escapeHtml(historyLabel(h))}</b>
+                    <small>${escapeHtml(historySubtitle(h))}</small>
+                `;
+                const time = document.createElement('time');
+                time.textContent = formatCompactDate(h.updated_at || h.created_at);
+                item.addEventListener('click', async () => {
                     const rr = await fetch(`/api/ai/history/${h.id}/`);
                     const dd = await rr.json();
                     if (dd.code === 200) {
@@ -1267,6 +2046,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             history: dd.data.messages || [],
                             spatial: dd.data.spatial_context || '',
                             bbox: dd.data.bbox,
+                            gsd: dd.data.scene?.gsd_m,
                             sceneId: dd.data.scene_id,
                             scene: dd.data.scene
                         };
@@ -1278,7 +2058,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         modal.style.display = 'flex';
                         if (dd.data.bbox) {
                             const b = dd.data.bbox;
-                            map.fitBounds([[b.min_lat, b.min_lng], [b.max_lat, b.max_lng]]);
+                            fitMapBounds(dataBboxToMapBounds(b));
                         }
                         showToast('已加载历史对话', 'info');
                     } else if (dd.code === 410) {
@@ -1287,14 +2067,18 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 });
                 const delBtn = document.createElement('button');
-                delBtn.textContent = '✕';
-                delBtn.style.cssText = 'background:none;border:none;color:rgba(255,255,255,0.2);cursor:pointer;font-size:10px;';
+                delBtn.className = 'history-delete';
+                delBtn.type = 'button';
+                delBtn.title = '删除历史';
+                delBtn.innerHTML = '<i class="ri-close-line" aria-hidden="true"></i>';
                 delBtn.addEventListener('click', async (e) => {
                     e.stopPropagation();
                     await fetch(`/api/ai/history/${h.id}/`, { method: 'DELETE' });
                     loadHistories();
                 });
+                item.appendChild(badge);
                 item.appendChild(label);
+                item.appendChild(time);
                 item.appendChild(delBtn);
                 historyList.appendChild(item);
             });

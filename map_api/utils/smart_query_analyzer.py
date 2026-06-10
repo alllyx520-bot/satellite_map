@@ -64,6 +64,10 @@ ENTITY_PATTERNS = {
         r'(道路|公路|路网|街道|交叉口|十字路口|支路|主干道|高速|铁路|轨道)',
         r'(车流|交通|拥堵|通达)',
     ],
+    'vehicle': [
+        r'(车辆|汽车|小车|轿车|卡车|货车|公交|停车|停车场|车位|船|船舶|飞机|集装箱)',
+        r'(多少辆|数车|计数|小目标)',
+    ],
     'mountain': [
         r'(山|山脉|山坡|山脊|山谷|丘陵|坡地|陡坡|悬崖|峭壁)',
     ],
@@ -249,6 +253,7 @@ ENTITY_EN = {
     'agriculture': 'cropland, farmland, crop field, paddy field or greenhouse',
     'building': 'buildings or residential district',
     'road': 'roads, highways or road network',
+    'vehicle': 'vehicles, parking lot, ships, aircraft or small objects',
     'mountain': 'mountains, hills or rugged terrain',
     'urban': 'dense urban area, city center',
     'infrastructure': 'airport, port, station or large infrastructure',
