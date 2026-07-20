@@ -1,0 +1,10 @@
+Django==5.2.13
+django-cors-headers==4.9.0
+dashscope==1.25.16
+gunicorn==23.0.0
+numpy==2.2.5
+Pillow==12.2.0
+python-docx==1.2.0
+python-dotenv==1.2.2
+requests==2.33.1
+lxml==6.1.0

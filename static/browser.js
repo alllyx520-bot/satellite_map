@@ -861,12 +861,12 @@ document.addEventListener('DOMContentLoaded', () => {
             }).addTo(map);
 
             provinceLayer = L.geoJSON(geojson, {
-                style: { color: "#5bfff0", weight: 0.9, opacity: 0.45, fillOpacity: 0, fillColor: "transparent" },
+                style: { color: "#E4B36A", weight: 0.9, opacity: 0.45, fillOpacity: 0, fillColor: "transparent" },
                 onEachFeature: (feature, layer) => {
                     layer.on({
                         mouseover: (e) => {
                             isMouseOverChina = true;
-                            e.target.setStyle({ color: "#55eee5", weight: 2, fillOpacity: 0.08, fillColor: "#22d3c5" });
+                            e.target.setStyle({ color: "#F2CD90", weight: 2, fillOpacity: 0.08, fillColor: "#E4B36A" });
                             e.target.bringToFront();
                         },
                         mouseout: (e) => {
@@ -908,7 +908,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!isSelecting) return;
         const bounds = L.latLngBounds(startLatLng, e.latlng);
         if (!selectionRect) {
-            selectionRect = L.rectangle(bounds, { color: "#007aff", weight: 3, fillOpacity: 0.12 }).addTo(map);
+            selectionRect = L.rectangle(bounds, { color: "#E4B36A", weight: 3, fillOpacity: 0.12 }).addTo(map);
         } else {
             selectionRect.setBounds(bounds);
         }
@@ -977,7 +977,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const latlng = map.mouseEventToLatLng(touch);
         const bounds = L.latLngBounds(startLatLng, latlng);
         if (!selectionRect) {
-            selectionRect = L.rectangle(bounds, { color: "#007aff", weight: 3, fillOpacity: 0.12 }).addTo(map);
+            selectionRect = L.rectangle(bounds, { color: "#E4B36A", weight: 3, fillOpacity: 0.12 }).addTo(map);
         } else {
             selectionRect.setBounds(bounds);
         }

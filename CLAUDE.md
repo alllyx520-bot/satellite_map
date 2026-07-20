@@ -10,28 +10,28 @@ All Python MUST use the conda env absolute path (no system Python):
 
 ```bash
 # Dev (hot reload)
-E:\Anaconda\envs\satellite_env\python.exe manage.py runserver
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py runserver
 # Run as user (auto-opens browser, --noreload for PyInstaller compatibility)
-E:\Anaconda\envs\satellite_env\python.exe start.py
+C:\Users\Lenovo\anaconda3\envs\general\python.exe start.py
 # Migrations
-E:\Anaconda\envs\satellite_env\python.exe manage.py makemigrations
-E:\Anaconda\envs\satellite_env\python.exe manage.py migrate
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py makemigrations
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py migrate
 # Tests (pure-function unit tests for the core utils)
-E:\Anaconda\envs\satellite_env\python.exe manage.py test map_api
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py test map_api
 # Core loop smoke check: health → recommendation → AI → history → report
-E:\Anaconda\envs\satellite_env\python.exe manage.py smoke_pipeline
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline
 # Agent loop smoke check: adds mocked RemoteSensingAgent session → Sentinel-2 → NDWI → VL → DeepSeek review
-E:\Anaconda\envs\satellite_env\python.exe manage.py smoke_pipeline --agent
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --agent
 # Optional live dependency checks. These consume external services/API quota.
-E:\Anaconda\envs\satellite_env\python.exe manage.py smoke_pipeline --live-mapbox
-E:\Anaconda\envs\satellite_env\python.exe manage.py smoke_pipeline --live-sentinel
-E:\Anaconda\envs\satellite_env\python.exe manage.py smoke_pipeline --live-ai
-E:\Anaconda\envs\satellite_env\python.exe manage.py smoke_pipeline --live-mapbox --live-sentinel --live-ai
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-mapbox
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-sentinel
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-ai
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-mapbox --live-sentinel --live-ai
 # RemoteCLIP weights (one-time, ~350MB → models/RemoteCLIP-ViT-B-32.pt)
-E:\Anaconda\envs\satellite_env\python.exe scripts\download_remoteclip.py
+C:\Users\Lenovo\anaconda3\envs\general\python.exe scripts\download_remoteclip.py
 ```
 
-Deps installed via conda; `requirements.txt` is a `pip freeze` snapshot for reproduction (`pip install -r requirements.txt`). Key: Django 5.2, django-cors-headers, dashscope, Pillow, requests, python-docx, python-dotenv. **RemoteCLIP tile retrieval** needs `torch` (CUDA build for GPU — `pip install torch --index-url https://download.pytorch.org/whl/cu121`) + `open_clip_torch`; these are **optional** — without them the tile ranker falls back to a color/edge heuristic.
+Deps: `requirements.txt` is a curated core list for local dev (`pip install -r requirements.txt`); `requirements-prod.txt` is the minimal production set. Key: Django 5.2, django-cors-headers, dashscope, Pillow, requests, numpy, python-docx, python-dotenv. **RemoteCLIP tile retrieval** needs `torch` (CUDA build for GPU — `pip install torch --index-url https://download.pytorch.org/whl/cu121`) + `open_clip_torch`; these are **optional** (commented out in `requirements.txt`) — without them the tile ranker falls back to a color/edge heuristic.
 
 Secrets in `.env` (gitignored, loaded by both `manage.py` and `start.py` via `load_dotenv` with absolute path): `MAPBOX_TOKEN`, `DASHSCOPE_API_KEY`, `AMAP_KEY`, `DEEPSEEK_API_KEY`.
 
@@ -56,7 +56,8 @@ The command prints JSON with per-step `ok` values. It removes smoke images, repo
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/` | Main map page |
+| GET | `/` | Landing page (`home.html`) |
+| GET | `/workbench/` | Main map workbench (`browser.html`) |
 | GET | `/api/system/health/` | Health/config report, imagery strategy, smart pipeline, source roles, and analysis modes |
 | POST | `/api/satellite/get-img/` | Start background download; returns `file_name`, `total_tiles`, GSD/area metadata |
 | POST | `/api/satellite/get-sentinel-img/` | Search recent Sentinel-2 L2A candidates, select the best renderable scene, return image + traceable metadata |
@@ -78,7 +79,7 @@ The command prints JSON with per-step `ok` values. It removes smoke images, repo
 
 ## Architecture
 
-Single Django app `map_api`. Frontend is one server-rendered page (`templates/browser.html` + `static/browser.js` + `static/browser.css`) using Leaflet; no build step. All logic lives in `map_api/views.py` orchestrating the `utils/`, `imagery_sources/`, and management command modules. All dashscope calls go through `_call_qwen()` (centralizes the VL-only `vl_high_resolution_images` kwarg); all user-supplied filenames go through `safe_media_path()` (path-traversal guard).
+Single Django app `map_api`. Frontend is two server-rendered pages with no build step: a landing page (`templates/home.html` + `static/home.js` / `home.css`, Three.js globe via CDN) at `/`, and the main workbench (`templates/browser.html` + `static/browser.js` + `static/browser.css`) using Leaflet at `/workbench/`. All logic lives in `map_api/views.py` orchestrating the `utils/`, `imagery_sources/`, and management command modules. All dashscope calls go through `_call_qwen()` (centralizes the VL-only `vl_high_resolution_images` kwarg); all user-supplied filenames go through `safe_media_path()` (path-traversal guard).
 
 ### Imagery strategy
 

@@ -6,30 +6,33 @@
     <title>SatelliteSense · 遥感分析</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link rel="stylesheet" href="/static/remixicon.css?v=1">
-    <link rel="stylesheet" href="/static/browser.css?v=21">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/unbounded@5/600.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-serif-sc@5/600.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@5/500.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5/400.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5/500.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/300.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/400.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/500.css">
+    <link rel="stylesheet" href="/static/spectra.css?v=2">
+    <link rel="stylesheet" href="/static/browser.css?v=22">
 </head>
 <body>
     <div class="main-wrapper">
         <div id="map-container">
             <div id="map"></div>
-            <div class="mission-topbar">
-                <div class="mission-brand">
-                    <span class="brand-mark"><i class="ri-radar-line" aria-hidden="true"></i></span>
-                    <span class="brand-name">SatelliteSense</span>
-                    <span class="brand-divider"></span>
-                    <span class="brand-subtitle">智能遥感分析工作站</span>
-                </div>
-                <div class="mission-status">
-                    <span class="status-dot"></span>
-                    <span>服务正常</span>
-                </div>
-            </div>
-            <div class="command-bar">
+            <header class="wb-topbar glass">
+                <a class="wb-brand" href="/" title="返回首页">
+                    <i class="ri-radar-line" aria-hidden="true"></i>
+                    <span class="wb-brand-name">SatelliteSense</span>
+                </a>
+                <span class="wb-divider" aria-hidden="true"></span>
                 <div id="search-box">
                     <i id="search-icon" class="ri-search-line" aria-hidden="true"></i>
-                    <input id="search-input" type="text" placeholder="搜索地点" autocomplete="off">
+                    <input id="search-input" type="text" placeholder="搜索地点 · Ctrl K" autocomplete="off">
                     <div id="search-results"></div>
                 </div>
+                <span class="wb-divider" aria-hidden="true"></span>
                 <div class="command-controls">
                     <div class="toolbar-control">
                         <span id="agent-mode-label">调查模式</span>
@@ -53,33 +56,41 @@
                         </select>
                     </div>
                 </div>
-            </div>
-            <div id="agent-console">
+                <div class="mission-status"><span class="status-dot"></span><span>链路正常</span></div>
+            </header>
+            <aside id="agent-console" class="glass">
                 <div class="agent-sidebar-resizer" id="agent-sidebar-resizer" aria-hidden="true"></div>
                 <div class="agent-console-head">
                     <div class="agent-title-group">
-                        <button id="agent-collapse-btn" class="sidebar-collapse-btn" type="button" title="收起左侧 Agent">
-                            <i class="ri-arrow-left-s-line" aria-hidden="true"></i>
-                        </button>
-                        <span><i class="ri-radar-line" aria-hidden="true"></i>智能调查 Agent</span>
+                        <span class="agent-title"><i class="ri-radar-line" aria-hidden="true"></i>调查 Agent</span>
+                        <span class="chip chip-iris">BETA</span>
                     </div>
+                    <button id="agent-collapse-btn" class="sidebar-collapse-btn" type="button" title="收起 Agent 面板">
+                        <i class="ri-arrow-left-s-line" aria-hidden="true"></i>
+                    </button>
                 </div>
                 <div class="agent-input-row">
-                    <input id="agent-goal-input" type="text" placeholder="例如：帮我调查南宁市在2026年四月的水体情况" autocomplete="off">
-                    <button id="agent-run-btn">开始</button>
+                    <input id="agent-goal-input" type="text" placeholder="例如：调查南宁市 2026 年四月的水体情况" autocomplete="off">
+                    <button id="agent-run-btn" type="button" title="启动调查"><i class="ri-play-line" aria-hidden="true"></i></button>
                 </div>
                 <div id="agent-session-panel" hidden></div>
+                <div class="agent-empty" id="agent-empty">
+                    <i class="ri-compass-discover-line" aria-hidden="true"></i>
+                    <p>用一句自然语言目标，启动一次受控的遥感调查。</p>
+                </div>
+            </aside>
+            <div class="wb-bottom">
+                <button id="backButton"><i class="ri-arrow-left-line" aria-hidden="true"></i>返回全国</button>
+                <div id="map-hint">长按拖拽框选区域 · 右键取消</div>
+                <div class="map-scale-card glass">
+                    <span>缩放 <b id="map-zoom-readout" class="mono">4</b></span>
+                    <i class="dot" aria-hidden="true"></i>
+                    <span>分辨率 0.38 m/px</span>
+                    <i class="dot" aria-hidden="true"></i>
+                    <span class="ok">任务画布就绪</span>
+                </div>
             </div>
-            <div class="map-scale-card">
-                <span>缩放级别 <b id="map-zoom-readout">4</b></span>
-                <span>分辨率 0.38 m/px</span>
-                <span>任务画布就绪</span>
-            </div>
-            <div id="map-hint">任务画布就绪</div>
-            <button id="backButton"><i class="ri-arrow-left-line" aria-hidden="true"></i>返回全国</button>
-        </div>
-
-        <div id="sidebar">
+            <aside id="sidebar" class="glass">
             <div class="workspace-sidebar-resizer" id="workspace-sidebar-resizer" aria-hidden="true"></div>
             <button id="workspace-collapse-btn" class="sidebar-collapse-btn workspace-pin-btn" type="button" title="收起右侧工作区">
                 <i class="ri-arrow-right-s-line" aria-hidden="true"></i>
@@ -120,7 +131,8 @@
                     <button id="refresh-history-btn" class="icon-action" type="button" title="刷新"><i class="ri-refresh-line" aria-hidden="true"></i></button>
                 </div>
                 <div id="history-list"></div>
-            </div>
+                </div>
+            </aside>
         </div>
     </div>
 
@@ -128,9 +140,10 @@
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     
-    <script src="/static/browser.js?v=21"></script>
+    <script src="/static/browser.js?v=22"></script>
+    <script src="/static/workbench-ui.js?v=1"></script>
 <div id="chat-modal" style="display: none;">
-        <div class="chat-modal-content">
+        <div class="chat-modal-content glass glass-thick">
             <div class="chat-modal-header">
                 <div class="chat-title-block">
                     <h3>分析舱</h3>

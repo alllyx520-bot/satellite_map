@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SatelliteSense · 智能遥感分析</title>
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+    <link rel="preload" as="image" href="https://cdn.jsdelivr.net/npm/three-globe@2/example/img/earth-night.jpg" crossorigin="anonymous">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/unbounded@5/600.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/fraunces@5/400.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/fraunces@5/600.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-serif-sc@5/600.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@5/500.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5/400.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5/500.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/300.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/400.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/500.css">
+    <link rel="stylesheet" href="/static/remixicon.css?v=1">
+    <link rel="stylesheet" href="/static/spectra.css?v=2">
+    <link rel="stylesheet" href="/static/home.css?v=3">
+</head>
+<body>
+    <div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
+    <canvas id="earth-canvas" aria-hidden="true"></canvas>
+    <div class="vignette" aria-hidden="true"></div>
+    <div class="grain" aria-hidden="true"></div>
+
+    <nav class="nav glass glass-thin">
+        <a class="mark" href="/">
+            <i class="ri-radar-line" aria-hidden="true"></i>
+            <b>SatelliteSense</b>
+        </a>
+        <span class="spacer"></span>
+        <a class="nav-link" href="/design/">设计系统</a>
+        <a class="nav-cta" href="/workbench/">
+            <span>进入工作台</span>
+            <i class="ri-arrow-right-up-line" aria-hidden="true"></i>
+        </a>
+    </nav>
+
+    <main class="page">
+        <header class="hero">
+            <p class="kicker" data-reveal>AI REMOTE SENSING WORKBENCH</p>
+            <h1 data-reveal data-delay="0.1">Satellite<span class="accent">Sense</span></h1>
+            <p class="slogan" data-reveal data-delay="0.2">以卫星视角，看见地表变化背后的答案。</p>
+            <div class="hero-meta" data-reveal data-delay="0.3">
+                <span class="chip chip-gold">MAPBOX 高清底图</span>
+                <span class="chip chip-glacier">SENTINEL-2 溯源影像</span>
+                <span class="chip chip-iris">QWEN VL 视觉解译</span>
+            </div>
+            <div class="hero-actions" data-reveal data-delay="0.42">
+                <button class="btn-portal" id="enter-btn" type="button">
+                    <span><i class="ri-rocket-2-line" aria-hidden="true"></i>进入工作台</span>
+                </button>
+                <a class="btn" href="#chapters">
+                    <span>了解能力</span>
+                    <i class="ri-arrow-down-line" aria-hidden="true"></i>
+                </a>
+            </div>
+        </header>
+
+        <div id="chapters" class="chapters">
+            <!-- 01 双源影像 -->
+            <section class="chapter" data-reveal>
+                <div class="ch-head">
+                    <span class="ch-idx mono">01</span>
+                    <h2 class="ch-title">双源影像，各就其位</h2>
+                    <p class="ch-desc">细节判读用 Mapbox 高清底图，时效与溯源用 Sentinel-2 L2A 公开影像。系统按任务自动选择、验证并解释来源，你不需要成为影像专家。</p>
+                </div>
+                <div class="card-row">
+                    <div class="feat-card glass">
+                        <div class="feat-top">
+                            <span class="chip chip-gold">MAPBOX</span>
+                            <span class="feat-no mono">≤0.5 m/px</span>
+                        </div>
+                        <h3>高清底图 · 细节判读</h3>
+                        <p>建筑、道路、设施与小目标视觉解译的主力影像，成像清晰、覆盖稳定。</p>
+                        <div class="feat-spec mono">STATIC TILES · GRID STITCH · GSD META</div>
+                    </div>
+                    <div class="feat-card glass">
+                        <div class="feat-top">
+                            <span class="chip chip-glacier">SENTINEL-2 L2A</span>
+                            <span class="feat-no mono">10 m/px</span>
+                        </div>
+                        <h3>近期影像 · 可溯源</h3>
+                        <p>采集日期、云量、产品编号全程可查，适合水体、植被、农业与时序变化筛查。</p>
+                        <div class="feat-spec mono">EARTH SEARCH · TITILER · MOSAIC QC</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 02 AI 视觉解译 -->
+            <section class="chapter" data-reveal>
+                <div class="ch-head">
+                    <span class="ch-idx mono">02</span>
+                    <h2 class="ch-title">会放大的视觉解译</h2>
+                    <p class="ch-desc">Qwen VL 不只是看一眼整张图——它像分析师一样对可疑目标主动放大、逐级审视，并把像素坐标换算成真实世界的米、公顷与经纬度。</p>
+                </div>
+                <div class="metric-row">
+                    <div class="metric glass glass-thin">
+                        <span class="metric-v mono">≤2<span class="u">级</span></span>
+                        <span class="metric-k">主动感知放大</span>
+                    </div>
+                    <div class="metric glass glass-thin">
+                        <span class="metric-v mono">GSD<span class="u">校准</span></span>
+                        <span class="metric-k">真实尺寸测量</span>
+                    </div>
+                    <div class="metric glass glass-thin">
+                        <span class="metric-v mono">A/B<span class="u">对比</span></span>
+                        <span class="metric-k">多区域联合分析</span>
+                    </div>
+                    <div class="metric glass glass-thin">
+                        <span class="metric-v mono">2<span class="u">模式</span></span>
+                        <span class="metric-k">精确 / 快速</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 03 调查 Agent -->
+            <section class="chapter" data-reveal>
+                <div class="ch-head">
+                    <span class="ch-idx mono">03</span>
+                    <h2 class="ch-title">一句话，启动一次调查</h2>
+                    <p class="ch-desc">「帮我调查南宁市 2026 年四月的水体情况」——Agent 会解析目标、定位区域、选择影像源、计算指标、视觉解译并复核结论，全程公开进度，不暴露内部推理。</p>
+                </div>
+                <div class="agent-strip glass">
+                    <div class="a-step"><span class="a-dot mono">01</span><span>解析目标</span></div>
+                    <div class="a-step"><span class="a-dot mono">02</span><span>定位区域</span></div>
+                    <div class="a-step"><span class="a-dot mono">03</span><span>选择影像源</span></div>
+                    <div class="a-step"><span class="a-dot mono">04</span><span>获取影像</span></div>
+                    <div class="a-step"><span class="a-dot mono">05</span><span>AI 解译</span></div>
+                    <div class="a-step"><span class="a-dot mono">06</span><span>复核结论</span></div>
+                </div>
+            </section>
+
+            <!-- 04 报告 -->
+            <section class="chapter" data-reveal>
+                <div class="ch-head">
+                    <span class="ch-idx mono">04</span>
+                    <h2 class="ch-title">结论，落成正式报告</h2>
+                    <p class="ch-desc">每一段分析对话都可以一键导出为 Word 报告——影像、元数据、来源溯源与 AI 结论排版齐整，直接进入你的工作流。</p>
+                </div>
+                <div class="hero-actions" style="justify-content:flex-start">
+                    <button class="btn-portal" id="enter-btn-2" type="button">
+                        <span><i class="ri-rocket-2-line" aria-hidden="true"></i>开始第一次分析</span>
+                    </button>
+                </div>
+            </section>
+        </div>
+
+        <footer class="hero-footer" aria-hidden="true">
+            <span class="meta-item mono">22.82°N&#8194;108.37°E · NANNING DEMO REGION</span>
+            <span class="meta-item meta-status mono"><span class="pulse-dot"></span>SENTINEL-2 / MAPBOX · LINK ACTIVE</span>
+            <span class="meta-item mono" id="meta-clock"></span>
+        </footer>
+    </main>
+
+    <div class="warp" id="warp" aria-hidden="true"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+    <script async src="https://unpkg.com/es-module-shims@1.10.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+    <script type="module" src="/static/home.js?v=3"></script>
+</body>
+</html>

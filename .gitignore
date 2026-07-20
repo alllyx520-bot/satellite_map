@@ -12,3 +12,6 @@ page-snap.json
 output/
 test-results/
 design-qa.md
+staticfiles/
+.deploy/
+*.part

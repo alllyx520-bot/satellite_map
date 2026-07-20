@@ -1692,8 +1692,18 @@ def chat_history_payload(obj):
 
 
 def index_view(request):
-    """负责展示前端地图页面"""
+    """展示产品首页。"""
+    return render(request, 'home.html')
+
+
+def workbench_view(request):
+    """负责展示前端地图页面。"""
     return render(request, 'browser.html')
+
+
+def design_view(request):
+    """SPECTRA 设计系统预览页（设计验收用）。"""
+    return render(request, 'design.html')
 
 # ----------------------
 # 卫星图下载接口

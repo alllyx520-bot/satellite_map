@@ -1,0 +1,15 @@
+[Unit]
+Description=SatelliteSense Django Gunicorn Service
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/satellitesense
+EnvironmentFile=/opt/satellitesense/.env
+ExecStart=/opt/satellitesense/.venv/bin/gunicorn satellite_map.wsgi:application --bind 127.0.0.1:8010 --workers 2 --timeout 180
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

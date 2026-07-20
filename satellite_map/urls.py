@@ -22,5 +22,7 @@ from map_api import views
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('map_api.urls')),
+    path('workbench/', views.workbench_view, name='workbench'),
+    path('design/', views.design_view, name='design'),
     path('', views.index_view, name='index'),
 ]

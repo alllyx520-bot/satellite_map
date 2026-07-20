@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SPECTRA · 光谱设计系统</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/unbounded@5/600.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/fraunces@5/400.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/fraunces@5/600.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-serif-sc@5/600.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@5/500.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@5/700.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5/400.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5/500.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/300.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/400.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/500.css">
+    <link rel="stylesheet" href="/static/remixicon.css?v=1">
+    <link rel="stylesheet" href="/static/spectra.css?v=1">
+    <link rel="stylesheet" href="/static/design.css?v=1">
+</head>
+<body>
+    <!-- 环境层：极光光场 / 星点 / 暗角 / 噪点 -->
+    <div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
+    <canvas id="stars" aria-hidden="true"></canvas>
+    <div class="vignette" aria-hidden="true"></div>
+    <div class="grain" aria-hidden="true"></div>
+
+    <!-- 导航 -->
+    <nav class="nav glass glass-thin">
+        <a class="mark" href="/">
+            <i class="ri-radar-line" aria-hidden="true"></i>
+            <b>SPECTRA</b>
+        </a>
+        <span class="chip chip-gold">DESIGN SYSTEM</span>
+        <span class="chip chip-iris">方向 B · 平流层玻璃</span>
+        <span class="spacer"></span>
+        <a class="back" href="/"><i class="ri-arrow-left-line" aria-hidden="true"></i>返回首页</a>
+    </nav>
+
+    <main class="page">
+        <!-- Hero -->
+        <header class="hero">
+            <p class="kicker">SatelliteSense Design Language</p>
+            <h1>SPECTRA<span class="cn">光 谱 设 计 系 统</span></h1>
+            <p class="sub">以卫星多光谱的物理特性为基因的设计语言：彩色只属于数据与状态，光以玻璃为载体，动效遵循轨道力学。悬浮于平流层之上的仪器舱。</p>
+            <div class="meta">
+                <span class="chip chip-gold">三级玻璃材质</span>
+                <span class="chip chip-iris">光谱语义色</span>
+                <span class="chip chip-glacier">轨道缓动</span>
+                <span class="chip chip-sage">仪器级数据字体</span>
+            </div>
+        </header>
+
+        <!-- 01 色彩光谱 -->
+        <section class="section" id="colors" data-reveal>
+            <div class="sec-head">
+                <span class="idx">01</span>
+                <h2>色彩光谱</h2>
+                <span class="en">Spectral Semantics</span>
+            </div>
+            <p class="sec-desc">每种功能色对应一个真实遥感波段的物理含义——彩色只属于数据与状态，界面 90% 是无彩色仪器灰蓝。</p>
+            <div class="swatch-grid">
+                <div class="swatch glass glass-thin">
+                    <div class="bar" style="background:linear-gradient(135deg,#F2CD90,#B8863B);box-shadow:0 8px 28px -8px rgba(228,179,106,.55)"></div>
+                    <div class="name">日珥金</div>
+                    <div class="hex">#E4B36A</div>
+                    <div class="mean">太阳辐射 · 交互 / 选中</div>
+                </div>
+                <div class="swatch glass glass-thin">
+                    <div class="bar" style="background:linear-gradient(135deg,#8FB4E8,#3D5A8F);box-shadow:0 8px 28px -8px rgba(143,180,232,.55)"></div>
+                    <div class="name">冰川蓝</div>
+                    <div class="hex">#8FB4E8</div>
+                    <div class="mean">水体指数 · 信息</div>
+                </div>
+                <div class="swatch glass glass-thin">
+                    <div class="bar" style="background:linear-gradient(135deg,#8FBC9B,#3E6350);box-shadow:0 8px 28px -8px rgba(143,188,155,.55)"></div>
+                    <div class="name">苔原绿</div>
+                    <div class="hex">#8FBC9B</div>
+                    <div class="mean">植被指数 · 成功 / 健康</div>
+                </div>
+                <div class="swatch glass glass-thin">
+                    <div class="bar" style="background:linear-gradient(135deg,#E08A5A,#8A4A26);box-shadow:0 8px 28px -8px rgba(224,138,90,.55)"></div>
+                    <div class="name">余烬橙</div>
+                    <div class="hex">#E08A5A</div>
+                    <div class="mean">热红外 · 处理中 / 警告</div>
+                </div>
+                <div class="swatch glass glass-thin">
+                    <div class="bar" style="background:linear-gradient(135deg,#E07D7D,#7E3232);box-shadow:0 8px 28px -8px rgba(224,125,125,.55)"></div>
+                    <div class="name">朱砂红</div>
+                    <div class="hex">#E07D7D</div>
+                    <div class="mean">短波红外 · 错误 / 危险</div>
+                </div>
+                <div class="swatch glass glass-thin">
+                    <div class="bar" style="background:linear-gradient(135deg,#B7A5E8,#5A4491);box-shadow:0 8px 28px -8px rgba(183,165,232,.55)"></div>
+                    <div class="name">鸢尾紫</div>
+                    <div class="hex">#B7A5E8</div>
+                    <div class="mean">近红外 · AI 分析</div>
+                </div>
+            </div>
+            <div class="strip-row">
+                <div class="strip glass-thin"><div class="cell" style="background:#07090E"></div><div class="lbl">VOID-0</div></div>
+                <div class="strip glass-thin"><div class="cell" style="background:#0B0E15"></div><div class="lbl">VOID-1</div></div>
+                <div class="strip glass-thin"><div class="cell" style="background:#10141F"></div><div class="lbl">VOID-2</div></div>
+                <div class="strip glass-thin"><div class="cell" style="background:#171C2B"></div><div class="lbl">VOID-3</div></div>
+                <div class="strip glass-thin"><div class="cell" style="background:#F2EEE6"></div><div class="lbl">INK-HI</div></div>
+                <div class="strip glass-thin"><div class="cell" style="background:rgba(242,238,230,.62)"></div><div class="lbl">INK-MID</div></div>
+                <div class="strip glass-thin"><div class="cell" style="background:rgba(242,238,230,.38)"></div><div class="lbl">INK-LOW</div></div>
+            </div>
+        </section>
+
+
+        <!-- 02 玻璃材质 -->
+        <section class="section" id="materials" data-reveal>
+            <div class="sec-head">
+                <span class="idx">02</span>
+                <h2>三级玻璃材质</h2>
+                <span class="en">Material Grades</span>
+            </div>
+            <p class="sec-desc">暗色染底 + 背景模糊饱和 + 顶部镜面高光 + 深投影。指针在面板上移动，观察顶部高光的镜面反射效果。</p>
+            <div class="material-grid">
+                <div class="material-card glass glass-thin">
+                    <span class="tag chip chip-gold">THIN</span>
+                    <h3>薄纱 · material-thin</h3>
+                    <p>38% 染底 / 20px 模糊 —— 大面积浮层、分析舱背景，最大限度透出世界层。</p>
+                </div>
+                <div class="material-card glass">
+                    <span class="tag chip chip-glacier">REGULAR</span>
+                    <h3>仪器 · material-regular</h3>
+                    <p>55% 染底 / 28px 模糊 —— 面板、卡片、下拉菜单的标准材质。</p>
+                </div>
+                <div class="material-card glass glass-thick">
+                    <span class="tag chip chip-iris">THICK</span>
+                    <h3>聚焦 · material-thick</h3>
+                    <p>72% 染底 / 40px 模糊 —— 命令面板与模态，入场时世界微微退焦。</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- 03 字体 -->
+        <section class="section" id="typography" data-reveal>
+            <div class="sec-head">
+                <span class="idx">03</span>
+                <h2>字体系统</h2>
+                <span class="en">Typography</span>
+            </div>
+            <p class="sec-desc">Space Grotesk 负责拉丁显示，思源黑体负责中文正文，JetBrains Mono 负责一切数据读数——等宽数字跳动时不错位，是仪器感的关键。</p>
+            <div class="type-panel glass">
+                <div class="type-row">
+                    <span class="lbl spec">DISPLAY / SPACE GROTESK</span>
+                    <span class="type-display">Orbital Clarity 轨道级清晰</span>
+                </div>
+                <div class="type-row">
+                    <span class="lbl spec">BODY / NOTO SANS SC</span>
+                    <span class="type-body">以卫星视角，看见地表变化背后的答案。Sentinel-2 L2A 近期公开影像，云量 12.4%，重访周期 5 天。</span>
+                </div>
+                <div class="type-row">
+                    <span class="lbl spec">DATA / JETBRAINS MONO</span>
+                    <span class="type-mono" id="type-hud">108.3652°E · 22.8174°N · GSD 1.48 m/px</span>
+                </div>
+            </div>
+        </section>
+
+
+        <!-- 04 光效系统 -->
+        <section class="section" id="light" data-reveal>
+            <div class="sec-head">
+                <span class="idx">04</span>
+                <h2>光效系统</h2>
+                <span class="en">Light Physics</span>
+            </div>
+            <p class="sec-desc">光以三种形态存在：镜面反射（材质的真实感）、焦散流光（选中态）、呼吸脉冲（处理中）。彩色永远以光的形式存在，而不是面的形式。</p>
+            <div class="proto-grid">
+                <div class="proto-panel glass">
+                    <span class="spec">SPECULAR EDGE / 镜面高光</span>
+                    <p style="margin:0;font-size:13.5px;color:var(--ink-mid)">将指针沿本面板的顶部边缘缓慢移动——高光热点会实时跟随，如同真实玻璃反射环境光源。</p>
+                </div>
+                <div class="proto-panel glass is-selected">
+                    <span class="spec">CAUSTIC RING / 焦散选中环</span>
+                    <p style="margin:0;font-size:13.5px;color:var(--ink-mid)">本面板正处于选中态：一圈缓慢流动的光谱沿边缘旋转，代替生硬的纯色边框。</p>
+                </div>
+                <div class="proto-panel glass">
+                    <span class="spec">BREATHING / 呼吸状态光</span>
+                    <div class="comp-row">
+                        <div class="t-step active" style="flex:none">
+                            <span class="t-dot"><i class="ri-scan-2-line" aria-hidden="true"></i></span>
+                        </div>
+                        <p style="margin:0;font-size:13.5px;color:var(--ink-mid)">2 秒周期的呼吸脉冲表示处理中，不催促、不打扰。</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 05 组件库 -->
+        <section class="section" id="components" data-reveal>
+            <div class="sec-head">
+                <span class="idx">05</span>
+                <h2>组件库</h2>
+                <span class="en">Instruments</span>
+            </div>
+            <p class="sec-desc">每一个控件都是一件精密仪器：毛发级细线、焦点发光扫描、弹簧物理反馈。</p>
+            <div class="comp-grid">
+                <div class="comp-panel glass">
+                    <span class="spec">BUTTONS / 按钮</span>
+                    <div class="comp-row">
+                        <button class="btn btn-primary"><i class="ri-satellite-dish-line" aria-hidden="true"></i>获取影像</button>
+                        <button class="btn"><i class="ri-download-2-line" aria-hidden="true"></i>导出报告</button>
+                        <button class="btn btn-danger"><i class="ri-delete-bin-line" aria-hidden="true"></i>删除</button>
+                    </div>
+                </div>
+                <div class="comp-panel glass">
+                    <span class="spec">SEGMENTED / 影像源选择</span>
+                    <div class="seg" role="radiogroup">
+                        <span class="seg-thumb" aria-hidden="true"></span>
+                        <button aria-checked="true">高清底图 Mapbox</button>
+                        <button aria-checked="false">近期影像 Sentinel-2</button>
+                    </div>
+                </div>
+                <div class="comp-panel glass">
+                    <span class="spec">INPUT / 地点搜索</span>
+                    <div class="field">
+                        <i class="ri-search-line" aria-hidden="true"></i>
+                        <input type="text" placeholder="搜索地点，如：南宁市">
+                    </div>
+                </div>
+                <div class="comp-panel glass">
+                    <span class="spec">DROPDOWN / 分析模式</span>
+                    <div class="dropdown">
+                        <button class="dropdown-trigger">
+                            <span>precise · 精确模式</span>
+                            <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
+                        </button>
+                        <div class="menu glass glass-thick">
+                            <button aria-selected="true" data-value="precise · 精确模式">qwen3-vl-plus · 精确<i class="ri-check"></i></button>
+                            <button aria-selected="false" data-value="fast · 快速模式">qwen3-vl-flash · 快速<i class="ri-check"></i></button>
+                        </div>
+                    </div>
+                </div>
+                <div class="comp-panel glass">
+                    <span class="spec">SWITCH + SLIDER / 开关与滑杆</span>
+                    <div class="comp-row">
+                        <span class="switch" aria-checked="true" role="switch" tabindex="0"></span>
+                        <span style="font-size:13px;color:var(--ink-mid)">主动感知放大</span>
+                    </div>
+                    <div class="comp-row" style="margin-top:16px">
+                        <input type="range" class="slider" id="sl-cloud" min="0" max="100" value="20" style="flex:1">
+                        <span class="mono" data-slider-out="sl-cloud" style="color:var(--spectral-cyan)">20</span>
+                        <span class="spec">云量上限 %</span>
+                    </div>
+                </div>
+                <div class="comp-panel glass">
+                    <span class="spec">TAGS + TOOLTIP + TOAST</span>
+                    <div class="comp-row">
+                        <span class="chip chip-gold">SENTINEL-2</span>
+                        <span class="chip chip-ember">L2A</span>
+                        <button class="btn" data-tip="Element84 Earth Search + TiTiler"><i class="ri-information-line" aria-hidden="true"></i>溯源</button>
+                        <button class="btn" data-toast="影像场景已缓存，可直接进入分析"><i class="ri-notification-3-line" aria-hidden="true"></i>模拟通知</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+
+        <!-- 06 动效系统 -->
+        <section class="section" id="motion" data-reveal>
+            <div class="sec-head">
+                <span class="idx">06</span>
+                <h2>动效系统</h2>
+                <span class="en">Orbital Motion</span>
+            </div>
+            <p class="sec-desc">签名动效直接映射真实业务动作：影像获取与 AI 分析 = 传感器推扫光束，绝不使用无意义的转圈。</p>
+            <div class="stage scan-stage">
+                <div class="brackets" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+                <div class="scan-beam" aria-hidden="true"></div>
+                <span class="stage-readout mono">SWATH SCAN · 64%</span>
+                <span class="stage-caption spec">推扫扫描 · 影像获取 / AI 分析加载态</span>
+            </div>
+            <div class="comp-row" style="margin-top:20px">
+                <button class="btn" id="cascade-btn"><i class="ri-play-line" aria-hidden="true"></i>播放级联入场</button>
+                <button class="btn-portal"><span><i class="ri-rocket-2-line" aria-hidden="true"></i>进入工作台</span></button>
+            </div>
+            <div class="cascade-row">
+                <div class="cascade-item glass glass-thin">A1</div>
+                <div class="cascade-item glass glass-thin">A2</div>
+                <div class="cascade-item glass glass-thin">B1</div>
+                <div class="cascade-item glass glass-thin">B2</div>
+                <div class="cascade-item glass glass-thin">C1</div>
+                <div class="cascade-item glass glass-thin">C2</div>
+            </div>
+        </section>
+
+
+        <!-- 07 业务原型 -->
+        <section class="section" id="proto" data-reveal>
+            <div class="sec-head">
+                <span class="idx">07</span>
+                <h2>业务原型</h2>
+                <span class="en">Applied Prototypes</span>
+            </div>
+            <p class="sec-desc">设计系统落到真实业务界面的样子：区域卡片、Agent 时间线、分析对话、任务读数。</p>
+            <div class="proto-grid">
+                <div class="proto-panel glass">
+                    <span class="spec">REGION CARD / 区域卡片</span>
+                    <div class="region-card glass glass-thin is-selected">
+                        <div class="rc-thumb" style="background:radial-gradient(60% 45% at 30% 35%,rgba(52,120,80,.85),transparent 70%),radial-gradient(50% 60% at 75% 60%,rgba(30,80,120,.8),transparent 70%),radial-gradient(30% 25% at 60% 25%,rgba(120,110,70,.7),transparent 70%),#0A1420"></div>
+                        <div class="rc-body">
+                            <div class="rc-title">REGION_NN_A01</div>
+                            <div class="rc-meta">79.73 km² · 4.49 m/px</div>
+                            <span class="chip chip-gold">MAPBOX</span>
+                        </div>
+                    </div>
+                    <div class="region-card glass glass-thin">
+                        <div class="rc-thumb" style="background:radial-gradient(55% 50% at 65% 30%,rgba(40,90,110,.85),transparent 70%),radial-gradient(45% 55% at 25% 70%,rgba(60,110,75,.8),transparent 70%),#0A1420"></div>
+                        <div class="rc-body">
+                            <div class="rc-title">S2_L2A_20260409</div>
+                            <div class="rc-meta">云量 8.2% · 10 m/px</div>
+                            <span class="chip chip-glacier">SENTINEL-2</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="proto-panel glass">
+                    <span class="spec">AGENT TIMELINE / 调查进度</span>
+                    <div class="timeline">
+                        <div class="t-step"><span class="t-dot">01</span><span class="t-label">解析目标</span></div>
+                        <div class="t-step"><span class="t-dot">02</span><span class="t-label">定位区域</span></div>
+                        <div class="t-step"><span class="t-dot">03</span><span class="t-label">选择影像源</span></div>
+                        <div class="t-step"><span class="t-dot">04</span><span class="t-label">获取影像</span></div>
+                        <div class="t-step"><span class="t-dot">05</span><span class="t-label">NDWI 计算</span></div>
+                        <div class="t-step"><span class="t-dot">06</span><span class="t-label">AI 解译</span></div>
+                        <div class="t-step"><span class="t-dot">07</span><span class="t-label">复核结论</span></div>
+                    </div>
+                    <p style="margin:22px 0 0;font-size:12.5px;color:var(--ink-low)">时间线自动推进演示：公开可观察的进度，不暴露内部推理。</p>
+                </div>
+                <div class="proto-panel glass">
+                    <span class="spec">ANALYSIS CHAT / 分析对话</span>
+                    <div class="chat-demo">
+                        <div class="chat chat-user">这片区域的水体分布有什么变化？</div>
+                        <div class="chat chat-ai glass glass-thin">NDWI 显示该区域水体面积约 <strong>12.4 km²</strong>，占 15.6%。东北部存在一处季节性积水区，建议结合 Sentinel-2 时序影像进一步跟踪。</div>
+                        <div class="chat-typing glass glass-thin"><i></i><i></i><i></i></div>
+                    </div>
+                </div>
+                <div class="proto-panel glass">
+                    <span class="spec">MISSION HUD / 任务读数</span>
+                    <div class="hud glass glass-thin">
+                        <div class="h-item"><span class="h-k">经度</span><span class="h-v">108.3652<em>°E</em></span></div>
+                        <div class="h-item"><span class="h-k">纬度</span><span class="h-v">22.8174<em>°N</em></span></div>
+                        <div class="h-item"><span class="h-k">GSD</span><span class="h-v">1.48<em> m/px</em></span></div>
+                        <div class="h-item"><span class="h-k">面积</span><span class="h-v">79.73<em> km²</em></span></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 页脚 -->
+        <footer class="footer">
+            <div class="rule" aria-hidden="true"></div>
+            <p class="spec">SPECTRA · SatelliteSense Design System · Direction B 平流层玻璃</p>
+            <p>验收通过后，此系统将施加于 / 落地页与 /workbench/ 工作台</p>
+        </footer>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+    <script src="/static/design.js?v=1"></script>
+</body>
+</html>
+
