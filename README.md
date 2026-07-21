@@ -50,23 +50,34 @@ satellite_map/                Django project package
   env.py                      Shared .env loader
 
 map_api/                      Single Django app with all backend logic
-  views.py                    API orchestration (~3.4k lines)
+  views.py                    HTTP layer + AI analysis pipeline + reports (~1.5k lines)
+  orchestrator.py             RemoteSensingAgent session orchestration
+  sentinel_pipeline.py        Sentinel-2 selection / mosaic / render fallback / cache
+  payloads.py                 Response payload builders + output normalization
+  geo_math.py                 Pure bbox/GSD/no-data-crop math (no Django deps)
+  media_paths.py              SAVE_DIR/REPORT_DIR + path-traversal guard
+  middleware.py               Per-IP rate limiting for paid API endpoints
   models.py                   ChatHistory, DownloadTask, ImageryScene, AgentSession
   urls.py                     /api/ routes
-  tests.py                    Unit + API tests (manage.py test map_api)
+  tests.py                    162 tests: units + mocked Sentinel/Agent/report integration
   imagery_sources/            Provider abstraction: mapbox.py, earth_search.py
   utils/                      Download, preprocessing, query analysis, RemoteCLIP,
                               active perception, analysis strategy, Agent tools
   management/commands/
     smoke_pipeline.py         Project-level acceptance check
+    cleanup_stale_tasks.py    Mark zombie "downloading" tasks as error
+    cleanup_media.py          Age-based media cleanup (+ DB record sync)
 
 templates/
   home.html                   Landing page (route /)
   browser.html                Main workbench page (route /workbench/)
+  design.html                 SPECTRA design-system reference page (route /design/)
 
 static/
   home.css / home.js          Landing page assets (Three.js globe via CDN)
   browser.css / browser.js    Workbench UI styling and logic
+  workbench-ui.js             Workbench micro-interactions
+  design.css / design.js / spectra.css   Design page assets
   remixicon.css / .woff2      Local icon assets
 
 deploy/                       nginx config + systemd unit for the ECS
@@ -107,7 +118,15 @@ SENTINEL_MAX_MOSAIC_CANDIDATES=6
 AGENT_SENTINEL_CANDIDATE_LIMIT=15
 ```
 
-Defaults are defined in `map_api/views.py`. Do not commit real API keys.
+Rate limiting (protects paid endpoints; per IP per minute):
+
+```text
+RATELIMIT_API_PER_MINUTE=120
+RATELIMIT_AI_PER_MINUTE=30
+# RATELIMIT_DISABLED=1    # demo mode only
+```
+
+Defaults are defined in `map_api/sentinel_pipeline.py`, `map_api/orchestrator.py` and `map_api/middleware.py`. Do not commit real API keys.
 
 ## Run Locally
 
@@ -271,7 +290,7 @@ Current hardening:
 - If a mosaic still has large no-data edges, the request fails and tells the user to shrink range, expand dates, or switch to Mapbox.
 - Tiny edge crop is allowed only for small rendering artifacts. Large crop is treated as coverage failure.
 
-Relevant functions in `map_api/views.py`:
+Relevant functions (in `map_api/sentinel_pipeline.py` and `map_api/geo_math.py`; all re-exported from `map_api/views.py`):
 
 ```text
 select_sentinel_scene_candidates

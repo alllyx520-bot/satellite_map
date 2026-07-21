@@ -58,6 +58,7 @@ MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     'corsheaders.middleware.CorsMiddleware',  # 新增：跨域中间件，必须放在这
+    'map_api.middleware.RateLimitMiddleware',  # IP 限流：防公网滥用付费 API（须紧随 CORS，保证 429 也带 CORS 头）
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
@@ -96,6 +97,21 @@ DATABASES = {
         "NAME": BASE_DIR / "db.sqlite3",
     }
 }
+
+
+# SQLite 并发硬化(P-4):Web 读 + 后台下载/Agent 线程写共用一个库,
+# WAL 让并发读写不互相阻塞,避免 "database is locked"。内存测试库上自动无效,无副作用。
+from django.db.backends.signals import connection_created  # noqa: E402
+
+
+def _sqlite_pragmas(sender, connection, **kwargs):
+    if connection.vendor == "sqlite":
+        with connection.cursor() as cursor:
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+
+
+connection_created.connect(_sqlite_pragmas)
 
 
 # Password validation
@@ -153,14 +169,18 @@ LOGGING = {
     },
     "handlers": {
         "app_file": {
-            "class": "logging.FileHandler",
+            "class": "logging.handlers.RotatingFileHandler",
             "filename": os.path.join(LOG_DIR, "app.log"),
+            "maxBytes": 10 * 1024 * 1024,
+            "backupCount": 5,
             "encoding": "utf-8",
             "formatter": "default",
         },
         "ai_file": {
-            "class": "logging.FileHandler",
+            "class": "logging.handlers.RotatingFileHandler",
             "filename": os.path.join(LOG_DIR, "ai_calls.log"),
+            "maxBytes": 10 * 1024 * 1024,
+            "backupCount": 5,
             "encoding": "utf-8",
             "formatter": "default",
         },

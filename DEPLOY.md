@@ -6,7 +6,7 @@ This guide is based on the already verified deployment notes in
 Important server reality:
 
 - ECS login: `root@101.200.128.20`
-- Local SSH key path: `D:\Projects\AAAprojects\ERP\.codex-ssh\huixianglian_deploy_ed25519`
+- Local SSH key path: `D:\Projects\AAAprojects\ERP\private\showcase-ssh\huixianglian_deploy_ed25519`
 - Existing root site: `http://101.200.128.20/`
 - Existing ERP showcase: `http://101.200.128.20/showcase/`
 - Existing nginx config on server: `/etc/nginx/conf.d/imageflow.conf`
@@ -53,7 +53,7 @@ cause is that the Alibaba Cloud security group is not open yet.
 From Windows PowerShell:
 
 ```powershell
-$key = 'D:\Projects\AAAprojects\ERP\.codex-ssh\huixianglian_deploy_ed25519'
+$key = 'D:\Projects\AAAprojects\ERP\private\showcase-ssh\huixianglian_deploy_ed25519'
 ssh -i $key root@101.200.128.20 "echo SSH_OK && whoami && hostname"
 ```
 
@@ -65,7 +65,7 @@ This follows the ERP deployment style: package locally, upload the tarball, then
 extract on the server.
 
 ```powershell
-$key = 'D:\Projects\AAAprojects\ERP\.codex-ssh\huixianglian_deploy_ed25519'
+$key = 'D:\Projects\AAAprojects\ERP\private\showcase-ssh\huixianglian_deploy_ed25519'
 $src = 'D:\Projects\AAAprojects\satellite_mapV2'
 $deployDir = 'D:\Projects\AAAprojects\satellite_mapV2\.deploy'
 $archive = "$deployDir\satellitesense.tar.gz"
@@ -156,6 +156,11 @@ SENTINEL_MIN_COVERAGE_RATIO=0.92
 SENTINEL_MIN_VALID_IMAGE_RATIO=0.88
 SENTINEL_MAX_MOSAIC_CANDIDATES=6
 AGENT_SENTINEL_CANDIDATE_LIMIT=15
+
+# IP rate limiting (protects paid API endpoints; defaults shown)
+RATELIMIT_API_PER_MINUTE=120
+RATELIMIT_AI_PER_MINUTE=30
+# RATELIMIT_DISABLED=1   # uncomment only for offline demos
 EOF
 chmod 600 .env
 ```
@@ -277,7 +282,44 @@ python manage.py check
 chown -R www-data:www-data /opt/satellitesense
 systemctl restart satellitesense
 nginx -t && systemctl reload nginx
+# Restarting kills in-flight background download threads — mark their tasks as failed:
+python manage.py cleanup_stale_tasks --minutes 1
 ```
+
+## 12. Maintenance
+
+```bash
+cd /opt/satellitesense
+source .venv/bin/activate
+# Mark tasks stuck in "downloading" (worker was restarted mid-download) as error:
+python manage.py cleanup_stale_tasks --dry-run
+python manage.py cleanup_stale_tasks --minutes 10
+# Delete media files older than 30 days (+ their DB rows); preview first:
+python manage.py cleanup_media --age 30 --dry-run
+python manage.py cleanup_media --age 30
+```
+
+Recommended cron (daily 04:17):
+
+```cron
+17 4 * * * cd /opt/satellitesense && .venv/bin/python manage.py cleanup_stale_tasks --minutes 10 && .venv/bin/python manage.py cleanup_media --age 30
+```
+
+Application logs rotate by themselves (`media/logs/*.log`, 10MB×5).
+
+## 13. Security Hardening Notes
+
+- All API endpoints are unauthenticated by design (single-user demo product). The
+  built-in `RateLimitMiddleware` caps per-IP request rates (AI-scope 30/min by
+  default) so a public deployment cannot burn unlimited paid API quota, but it is
+  **not** access control. For anything beyond a demo, restrict access at the edge:
+  nginx `allow`/`deny` or basic auth in front of `:8083`, or keep port 8083 out of
+  the public security group and use an SSH tunnel / VPN.
+- The current deployment serves plain HTTP on 8083. If this becomes a lasting
+  service, terminate TLS at nginx (certbot) and set `DJANGO_CSRF_TRUSTED_ORIGINS`
+  to the `https://` origin.
+- `GET /api/system/health/` reports whether keys are configured but never prints
+  key values — safe to use as an uptime probe.
 
 ## Troubleshooting
 

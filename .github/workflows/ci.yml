@@ -1,0 +1,32 @@
+name: CI
+
+# 每次 push / PR 跑核心回归:单测 + 默认 smoke(全程 mock,不消耗任何外部 API 配额,无需密钥)。
+# live-* 冒烟需要真实 key 与配额,不在 CI 跑(按 CLAUDE.md 表格本地手动执行)。
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Unit tests
+        run: python manage.py test map_api
+
+      - name: Smoke pipeline (mocked core loop)
+        run: python manage.py smoke_pipeline
+
+      - name: Smoke pipeline (mocked agent loop)
+        run: python manage.py smoke_pipeline --agent

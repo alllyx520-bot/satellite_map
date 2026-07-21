@@ -1,4 +1,10 @@
 document.addEventListener('DOMContentLoaded', () => {
+    // CDN 兜底:Leaflet 不可达时给可读提示,而非整页脚本静默崩溃留下空白地图
+    if (typeof L === 'undefined') {
+        const m = document.getElementById('map');
+        if (m) m.innerHTML = '<div style="display:grid;place-items:center;height:100%;color:#E4B36A;font:500 15px/1.7 system-ui,sans-serif;text-align:center;padding:24px">地图组件未能加载（地图库 CDN 不可达），请检查网络后刷新页面。</div>';
+        return;
+    }
     const MAP_MAX_ZOOM = 18;
     const SATELLITE_MAX_NATIVE_ZOOM = 16;
     const FIT_BOUNDS_MAX_ZOOM = 16;
@@ -114,7 +120,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setTimeout(syncMapViewport, 250);
     window.addEventListener('resize', () => {
         clearTimeout(mapResizeTimer);
-        mapResizeTimer = setTimeout(syncMapViewport, 120);
+        mapResizeTimer = setTimeout(() => { applyWorkbenchLayout(); syncMapViewport(); }, 120);
     });
     document.addEventListener('visibilitychange', () => {
         if (!document.hidden) setTimeout(syncMapViewport, 80);
@@ -128,6 +134,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const agentResizer = document.getElementById('agent-sidebar-resizer');
     const workspaceResizer = document.getElementById('workspace-sidebar-resizer');
     const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+    // 窄屏下左右两栏(各最大 340px 叠层)物理上无法并存,触发手风琴/默认收起,避免重叠。桌面布局不受影响。
+    const narrowLayout = () => window.innerWidth < 720;
 
     function readWorkbenchLayout() {
         try {
@@ -145,21 +153,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function applyWorkbenchLayout() {
         const layout = readWorkbenchLayout();
+        let agentCollapsed = Boolean(layout.agentCollapsed);
+        let workspaceCollapsed = Boolean(layout.workspaceCollapsed);
+        if (narrowLayout() && !agentCollapsed && !workspaceCollapsed) {
+            workspaceCollapsed = true;
+            saveWorkbenchLayout({ workspaceCollapsed: true });
+        }
         const agentWidth = clamp(Number(layout.agentWidth) || 360, 300, 560);
         const workspaceWidth = clamp(Number(layout.workspaceWidth) || 388, 320, 560);
         document.documentElement.style.setProperty('--agent-sidebar-width', `${agentWidth}px`);
         document.documentElement.style.setProperty('--workspace-sidebar-width', `${workspaceWidth}px`);
-        document.body.classList.toggle('agent-collapsed', Boolean(layout.agentCollapsed));
-        document.body.classList.toggle('workspace-collapsed', Boolean(layout.workspaceCollapsed));
+        document.body.classList.toggle('agent-collapsed', agentCollapsed);
+        document.body.classList.toggle('workspace-collapsed', workspaceCollapsed);
         if (agentCollapseBtn) {
-            const collapsed = Boolean(layout.agentCollapsed);
-            agentCollapseBtn.title = collapsed ? '展开左侧 Agent' : '收起左侧 Agent';
-            agentCollapseBtn.innerHTML = `<i class="${collapsed ? 'ri-arrow-right-s-line' : 'ri-arrow-left-s-line'}" aria-hidden="true"></i>`;
+            agentCollapseBtn.title = agentCollapsed ? '展开左侧 Agent' : '收起左侧 Agent';
+            agentCollapseBtn.innerHTML = `<i class="${agentCollapsed ? 'ri-arrow-right-s-line' : 'ri-arrow-left-s-line'}" aria-hidden="true"></i>`;
         }
         if (workspaceCollapseBtn) {
-            const collapsed = Boolean(layout.workspaceCollapsed);
-            workspaceCollapseBtn.title = collapsed ? '展开右侧工作区' : '收起右侧工作区';
-            workspaceCollapseBtn.innerHTML = `<i class="${collapsed ? 'ri-arrow-left-s-line' : 'ri-arrow-right-s-line'}" aria-hidden="true"></i>`;
+            workspaceCollapseBtn.title = workspaceCollapsed ? '展开右侧工作区' : '收起右侧工作区';
+            workspaceCollapseBtn.innerHTML = `<i class="${workspaceCollapsed ? 'ri-arrow-left-s-line' : 'ri-arrow-right-s-line'}" aria-hidden="true"></i>`;
         }
         setTimeout(syncMapViewport, 220);
     }
@@ -194,12 +206,16 @@ document.addEventListener('DOMContentLoaded', () => {
     applyWorkbenchLayout();
     agentCollapseBtn?.addEventListener('click', () => {
         const collapsed = !document.body.classList.contains('agent-collapsed');
-        saveWorkbenchLayout({ agentCollapsed: collapsed });
+        const patch = { agentCollapsed: collapsed };
+        if (narrowLayout() && !collapsed) patch.workspaceCollapsed = true;  // 窄屏手风琴:展开一栏即收起另一栏
+        saveWorkbenchLayout(patch);
         applyWorkbenchLayout();
     });
     workspaceCollapseBtn?.addEventListener('click', () => {
         const collapsed = !document.body.classList.contains('workspace-collapsed');
-        saveWorkbenchLayout({ workspaceCollapsed: collapsed });
+        const patch = { workspaceCollapsed: collapsed };
+        if (narrowLayout() && !collapsed) patch.agentCollapsed = true;
+        saveWorkbenchLayout(patch);
         applyWorkbenchLayout();
     });
     agentResizer?.addEventListener('mousedown', (event) => startSidebarResize('agent', event));
@@ -1320,7 +1336,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             } else {
                 setRegionStage(itemEl, 'error', '影像失败');
-                status.innerHTML = '抓取失败：' + d.msg;
+                status.textContent = '抓取失败：' + d.msg;
                 showToast('抓取失败：' + d.msg, 'error');
             }
         } catch (e) {
@@ -1635,10 +1651,10 @@ document.addEventListener('DOMContentLoaded', () => {
         targets.forEach(t => {
             if (typeof t.lat !== 'number' || typeof t.lng !== 'number') return;
             const m = L.marker([t.lat, t.lng], { icon: aiTargetIcon }).addTo(map);
-            let popup = `<b>${t.label || 'AI 定位目标'}</b>`;
-            if (t.width_m != null) popup += `<br>尺寸约 ${t.width_m}m × ${t.height_m}m`;
-            if (t.area_m2 != null) popup += `<br>占地约 ${t.area_m2 >= 10000 ? (t.area_m2 / 10000).toFixed(2) + ' 公顷' : Math.round(t.area_m2) + ' m²'}`;
-            popup += `<br>${t.lat}°N, ${t.lng}°E`;
+            let popup = `<b>${escapeHtml(t.label || 'AI 定位目标')}</b>`;
+            if (t.width_m != null) popup += `<br>尺寸约 ${escapeHtml(String(t.width_m))}m × ${escapeHtml(String(t.height_m))}m`;
+            if (t.area_m2 != null) popup += `<br>占地约 ${t.area_m2 >= 10000 ? escapeHtml((t.area_m2 / 10000).toFixed(2)) + ' 公顷' : escapeHtml(String(Math.round(t.area_m2))) + ' m²'}`;
+            popup += `<br>${escapeHtml(String(t.lat))}°N, ${escapeHtml(String(t.lng))}°E`;
             m.bindPopup(popup);
             targetMarkers.push(m);
         });
@@ -1905,7 +1921,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         const name = item.name || item.display_name.split(',')[0];
                         const div = document.createElement('div');
                         div.className = 'search-result-item';
-                        div.innerHTML = `<div class="name">${name}</div><div class="detail">${item.display_name}</div>`;
+                        div.innerHTML = `<div class="name">${escapeHtml(name)}</div><div class="detail">${escapeHtml(item.display_name)}</div>`;
                         div.addEventListener('mousedown', (e) => {
                             e.preventDefault();
                             map.flyTo([item.lat, item.lon], 14, { duration: 1.2 });

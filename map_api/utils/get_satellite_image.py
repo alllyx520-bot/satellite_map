@@ -85,7 +85,7 @@ def _fetch_tile(url, proxies, retries=5):
             session.close()
             if resp.status_code == 200:
                 img = Image.open(BytesIO(resp.content))
-                if img.mode in ('RGBA', 'P'):
+                if img.mode != 'RGB':
                     img = img.convert('RGB')
                 _ensure_not_blank(img, "Mapbox tile")
                 return img

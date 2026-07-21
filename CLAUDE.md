@@ -16,12 +16,16 @@ C:\Users\Lenovo\anaconda3\envs\general\python.exe start.py
 # Migrations
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py makemigrations
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py migrate
-# Tests (pure-function unit tests for the core utils)
+# Tests (162 tests: pure-function units + mocked Sentinel/Agent/report integration; no external calls)
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py test map_api
 # Core loop smoke check: health → recommendation → AI → history → report
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline
 # Agent loop smoke check: adds mocked RemoteSensingAgent session → Sentinel-2 → NDWI → VL → DeepSeek review
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --agent
+# Maintenance: mark stuck "downloading" tasks as error (worker restarts kill background threads)
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py cleanup_stale_tasks [--minutes 10] [--dry-run]
+# Maintenance: delete media files older than N days (+ their DB records); same core as POST /api/satellite/cleanup/
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py cleanup_media [--age 7] [--all] [--dry-run]
 # Optional live dependency checks. These consume external services/API quota.
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-mapbox
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-sentinel
@@ -33,7 +37,7 @@ C:\Users\Lenovo\anaconda3\envs\general\python.exe scripts\download_remoteclip.py
 
 Deps: `requirements.txt` is a curated core list for local dev (`pip install -r requirements.txt`); `requirements-prod.txt` is the minimal production set. Key: Django 5.2, django-cors-headers, dashscope, Pillow, requests, numpy, python-docx, python-dotenv. **RemoteCLIP tile retrieval** needs `torch` (CUDA build for GPU — `pip install torch --index-url https://download.pytorch.org/whl/cu121`) + `open_clip_torch`; these are **optional** (commented out in `requirements.txt`) — without them the tile ranker falls back to a color/edge heuristic.
 
-Secrets in `.env` (gitignored, loaded by both `manage.py` and `start.py` via `load_dotenv` with absolute path): `MAPBOX_TOKEN`, `DASHSCOPE_API_KEY`, `AMAP_KEY`, `DEEPSEEK_API_KEY`.
+Secrets in `.env` (gitignored, loaded by both `manage.py` and `start.py` via `load_dotenv` with absolute path): `MAPBOX_TOKEN`, `DASHSCOPE_API_KEY`, `AMAP_KEY`, `DEEPSEEK_API_KEY`. Optional tuning: `TITILER_ENDPOINT`, `SENTINEL_MIN_COVERAGE_RATIO`, `SENTINEL_MIN_VALID_IMAGE_RATIO`, `SENTINEL_MAX_MOSAIC_CANDIDATES`, `AGENT_SENTINEL_CANDIDATE_LIMIT`, `REMOTECLIP_CKPT`. Rate limiting (see Constraints): `RATELIMIT_API_PER_MINUTE` (default 120), `RATELIMIT_AI_PER_MINUTE` (default 30), `RATELIMIT_DISABLED=1` turns it off (demo mode). Production settings are env-driven: `DJANGO_DEBUG`, `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS`, `DJANGO_CSRF_TRUSTED_ORIGINS`, `CORS_ALLOW_ALL_ORIGINS` (see `.deploy/server.env` template + `DEPLOY.md`).
 
 ## Verification / Smoke Checks
 
@@ -58,11 +62,14 @@ The command prints JSON with per-step `ok` values. It removes smoke images, repo
 |--------|------|---------|
 | GET | `/` | Landing page (`home.html`) |
 | GET | `/workbench/` | Main map workbench (`browser.html`) |
+| GET | `/design/` | SPECTRA design-system reference page (`design.html`, visual spec only) |
 | GET | `/api/system/health/` | Health/config report, imagery strategy, smart pipeline, source roles, and analysis modes |
 | POST | `/api/satellite/get-img/` | Start background download; returns `file_name`, `total_tiles`, GSD/area metadata |
 | POST | `/api/satellite/get-sentinel-img/` | Search recent Sentinel-2 L2A candidates, select the best renderable scene, return image + traceable metadata |
 | GET | `/api/satellite/show-img/?file=` | Serve a saved image (falls back to newest if no `file`) |
 | GET | `/api/satellite/progress/?file=` | Poll download progress |
+| POST | `/api/satellite/cleanup/` | Delete media older than `days` (or all with `all=true`) + sync DB records; shares core with `cleanup_media` command |
+| GET | `/api/imagery/search/` | Search scenes by source/date/coverage filters |
 | GET / POST | `/api/imagery/recommend-source/` | Recommend Mapbox vs Sentinel-2 from the user question and current source |
 | GET | `/api/imagery/scenes/` | List recent imagery scenes and metadata |
 | GET | `/api/imagery/scenes/<id>/` | Read one imagery scene and metadata |
@@ -79,7 +86,17 @@ The command prints JSON with per-step `ok` values. It removes smoke images, repo
 
 ## Architecture
 
-Single Django app `map_api`. Frontend is two server-rendered pages with no build step: a landing page (`templates/home.html` + `static/home.js` / `home.css`, Three.js globe via CDN) at `/`, and the main workbench (`templates/browser.html` + `static/browser.js` + `static/browser.css`) using Leaflet at `/workbench/`. All logic lives in `map_api/views.py` orchestrating the `utils/`, `imagery_sources/`, and management command modules. All dashscope calls go through `_call_qwen()` (centralizes the VL-only `vl_high_resolution_images` kwarg); all user-supplied filenames go through `safe_media_path()` (path-traversal guard).
+Single Django app `map_api`. Frontend is three server-rendered pages with no build step: a landing page (`templates/home.html` + `static/home.js` / `home.css`, Three.js globe via pinned CDN) at `/`, the main workbench (`templates/browser.html` + `static/browser.js` + `static/browser.css` + `static/workbench-ui.js`) using Leaflet at `/workbench/`, and a design-system reference page (`templates/design.html` + `static/design.js` / `design.css` / `spectra.css`) at `/design/`. HTTP handling lives in `map_api/views.py`; the domain logic is split into focused modules (all names re-exported from `views.py`, so `from map_api.views import X` and `patch("map_api.views.X")` keep working):
+
+- `map_api/views.py` — HTTP layer, the AI analysis pipeline, and Word report generation.
+- `map_api/orchestrator.py` — RemoteSensingAgent session orchestration (slots → locate → source → retrieve → quality gates → NDWI → VL → DeepSeek review). Patchable names (`resolve_district_bbox`, `compute_ndwi_*`, `call_deepseek`, `ai_query_region`, `generate_report`) are resolved via the `views` module **at call time**, so existing `patch("map_api.views.X")` tests stay valid.
+- `map_api/sentinel_pipeline.py` — Sentinel-2 candidate selection, render fallback chain, multi-scene mosaic, no-data cropping, caching, scene persistence.
+- `map_api/payloads.py` — response payload builders (imagery quality, confidence, source recommendation, scene, history, analysis method, `normalize_model_answer`).
+- `map_api/geo_math.py` — pure geometry/measurement functions (bbox ops, GSD plans, no-data crop); no Django dependency.
+- `map_api/media_paths.py` — single source of truth for `SAVE_DIR`/`REPORT_DIR` and `safe_media_path()` (path-traversal guard).
+- `map_api/middleware.py` — `RateLimitMiddleware` (per-IP sliding window; protects paid API endpoints).
+
+All dashscope calls go through `_call_qwen()` (centralizes the VL-only `vl_high_resolution_images` kwarg); all user-supplied filenames go through `safe_media_path()`.
 
 ### Imagery strategy
 
@@ -91,28 +108,29 @@ The current product strategy is **task-adaptive dual source**:
 
 ### RemoteSensingAgent
 
-The Agent layer is intentionally controlled rather than fully autonomous. A user can type a goal such as `帮我调查南宁市在2026年四月的水体情况`; the backend creates an `AgentSession`, asks DeepSeek (`deepseek-v4-flash`) to parse slots and plan, resolves the place through Gaode administrative district search, picks the image source, retrieves imagery, runs lightweight NDWI for water tasks, calls the existing Qwen VL analysis chain, and then asks DeepSeek to review the conclusion.
+The Agent layer is intentionally controlled rather than fully autonomous. A user can type a goal such as `帮我调查南宁市在2026年四月的水体情况`; the backend creates an `AgentSession`, asks DeepSeek (`deepseek-v4-flash`) to parse slots and plan — merged with deterministic rule-extracted slots (`deterministic_extract_slots` / `merge_agent_slots` in `utils/agent_tools.py`: relative dates like "今年四月" are resolved by rules and override model slots) — resolves the place through Gaode administrative district search, picks the image source, retrieves imagery, runs lightweight NDWI for water tasks, calls the existing Qwen VL analysis chain, and then asks DeepSeek to review the conclusion.
 
 - Default mode is `precise`: `deepseek-v4-flash` controller + `qwen3-vl-plus` vision model.
 - Fast mode is `fast`: `deepseek-v4-flash` controller + `qwen3-vl-flash` vision model.
-- Missing `DEEPSEEK_API_KEY` fails immediately. There is no rule-only fallback for Agent planning.
+- Missing `DEEPSEEK_API_KEY` fails immediately. There is no rule-only fallback for Agent planning (rules only refine/override individual slot fields).
 - Sentinel-2 is used for water, vegetation, agriculture, macro land-use, timeliness, and change-screening tasks. Mapbox is used for buildings, roads, facilities, small targets, and detail-heavy visual interpretation.
-- First version uses administrative `bbox` screening, not exact polygon clipping, and selects one best Sentinel-2 candidate rather than doing monthly compositing.
+- First version uses administrative `bbox` screening, not exact polygon clipping. Scene selection prefers a single best candidate; when no single scene covers the bbox (`SENTINEL_MIN_COVERAGE_RATIO`, default 0.92), same-date then multi-date greedy-cover **mosaics** (≤ `SENTINEL_MAX_MOSAIC_CANDIDATES`, default 6) are composed — this is coverage mosaicking, not radiometric monthly compositing. Quality gates can pause the session for user confirmation: requested-date mismatch and cloud cover > 30%.
 - Frontend polls the session and renders `observer`: current stage, public reasoning summary, what the Agent is doing, the next step, and per-plan-step status. This is the Codex-like progress view; never expose private chain-of-thought.
 
 ### Two main request flows
 
 **1. Image download** (`POST /api/satellite/get-img/` → `get_satellite_img_api`)
 - Picks resolution from the region's haversine diagonal if not given (1280 / 2048 / 3072, clamped to 4096).
-- Returns immediately with a `file_name` and `total_tiles`, then downloads in a **background thread**. Frontend polls `GET /api/satellite/progress/?file=` against the shared in-memory `_download_progress` dict (`prune_progress()` caps it at 50 entries).
+- Returns immediately with a `file_name` and `total_tiles`, then downloads in a **background thread**. Frontend polls `GET /api/satellite/progress/?file=`; progress is dual-tracked: an in-memory `_download_progress` dict (same-worker hot path, `prune_progress()` caps it at 50 entries) mirrored per-tile into the `DownloadTask` DB row (`_persist_progress`, thread-safe via `close_old_connections`) so polling from another gunicorn worker still sees correct state. If a worker restart kills a thread, the task is stuck at `downloading` — `manage.py cleanup_stale_tasks` marks such zombies as `error`.
 - `fetch_satellite_image` splits large scenes into a ≤1280px grid, fetches cells **in parallel** (`ThreadPoolExecutor`, 4 workers; `_fetch_tile` retries/backoff; progress increment lock-protected), stitches with PIL. Spatial metadata (GSD m/px, area km²) computed in the view and returned.
 
-**1b. Sentinel-2 optional source** (`POST /api/satellite/get-sentinel-img/` → `get_sentinel_img_api`)
+**1b. Sentinel-2 optional source** (`POST /api/satellite/get-sentinel-img/` → `get_sentinel_img_api`, core in `sentinel_pipeline.py`)
 - Normalizes bbox and validates `max_cloud`, `target_resolution`, and `candidate_limit`.
 - Searches recent Sentinel-2 L2A candidates through Element84 Earth Search.
-- Sorts candidates by `suitability_score` and acquisition time, then attempts rendering in rank order. If the best candidate cannot render, it falls back to the next candidate and records `render_fallback_errors`.
-- Creates an `ImageryScene` with product id, acquisition date, cloud percent, GSD, license, score reasons, candidate pool size, selected rank, and TiTiler render metadata.
-- Reuses local cached Sentinel scenes when bbox/product/render parameters match.
+- Selects scenes by coverage: a single candidate covering ≥ `min_coverage` wins; otherwise greedy-cover mosaics (same-date preferred, then multi-date, ≤6 scenes) are composed pixel-by-pixel (`compose_sentinel_mosaic` fills valid pixels first-come).
+- Renders through TiTiler in suitability order; unrenderable/low-valid-pixel/too-much-no-data candidates are skipped and recorded in `render_fallback_errors`. Rendered output gets automatic no-data border cropping (`crop_sentinel_nodata_border`) with an effective-bbox/GSD recompute; crops removing > `SENTINEL_MAX_AUTO_CROP_RATIO` (3%) are rejected as coverage-insufficient.
+- Creates an `ImageryScene` with product id, acquisition date, cloud percent, GSD, license, score reasons, candidate pool size, selected rank, mosaic candidate list, and TiTiler render metadata.
+- Reuses local cached Sentinel scenes when a content-hash cache key (candidate assets + bbox + render size) matches; cached scenes are re-postprocessed for no-data crop on hit.
 
 **2. AI analysis** (`POST /api/ai/query-region/` → `ai_query_region`) — the core pipeline:
 ```
@@ -145,14 +163,22 @@ analyze_query(question)              # smart_query_analyzer.py — intent, entit
 - `chat_history_list` / `chat_history_detail` — CRUD over the single `ChatHistory` model (`update_or_create` keyed on `image_file`).
 
 ### Storage
-- `media/satellite_imgs/` — downloaded + preprocessed images (`_hd`/`_overview`/`_tile_*`/`_crop_*`/`_stage1_*` derivatives accumulate here). **Gitignored; grows unbounded — clean periodically.**
-- `media/reports/` — generated `.docx`. `db.sqlite3` holds chat history.
+- `media/satellite_imgs/` — downloaded + preprocessed images (`_hd`/`_overview`/`_tile_*`/`_crop_*`/`_stage1_*` derivatives accumulate here). **Gitignored; grows unbounded** — clean with `manage.py cleanup_media --age N` (or `POST /api/satellite/cleanup/`), which also deletes the matching `ImageryScene`/`DownloadTask`/`ChatHistory` rows.
+- `media/reports/` — generated `.docx` (cleaned by the same commands). `db.sqlite3` holds chat history (WAL mode enabled via a `connection_created` signal in `settings.py` so background threads and web requests don't lock each other). Logs: `media/logs/app.log` + `media/logs/ai_calls.log` (rotating, 10MB×5).
 
 ## Constraints (do not break)
 
 - **Mapbox proxy bypass**: every outbound `requests` call passes `proxies={"http": None, "https": None}` to bypass a system VPN. Removing it breaks downloads.
-- **CORS middleware order**: `corsheaders.middleware.CorsMiddleware` must sit between `SessionMiddleware` and `CommonMiddleware` (`settings.py:48`).
+- **CORS middleware order**: `corsheaders.middleware.CorsMiddleware` must sit between `SessionMiddleware` and `CommonMiddleware`, and `map_api.middleware.RateLimitMiddleware` immediately after CORS (so 429 responses carry CORS headers).
+- **Response convention**: every API returns JSON `{code, msg, data}` with a semantically matching HTTP status; the frontend branches on `code`. Keep both in sync when adding endpoints.
+- **Module re-export contract**: `views.py` re-exports the moved domain functions by original name. Tests (and future patches) target `map_api.views.X`; don't remove the re-exports, and in `orchestrator.py` keep the patchable names resolved through the `views` module at call time.
 - **`start.py` uses `--noreload`** (required for PyInstaller exe builds). Use `manage.py runserver` for hot reload during dev.
 - **VL-only kwarg**: `vl_high_resolution_images=True` is added only for `qwen3-vl-*` / `qwen-vl-*` models — do not send it to unified models.
-- Images converted RGBA/P → RGB before JPEG save throughout; resolution clamped to `[1, 4096]`.
-- `DEBUG=True` and `SECRET_KEY` are dev defaults in `settings.py` — not production-ready.
+- Images converted to RGB before JPEG save throughout (any non-RGB mode); resolution clamped to `[1, 4096]`.
+- Production settings are env-driven (`DJANGO_DEBUG`/`DJANGO_SECRET_KEY`/`DJANGO_ALLOWED_HOSTS`/`CORS_ALLOW_ALL_ORIGINS`); the checked-in defaults are dev-only and insecure — production must set them via `.deploy/server.env` (see `DEPLOY.md`).
+
+## Known limitations (documented, not bugs)
+
+- Geo math (GSD/area/bbox) assumes a locally flat, non-polar region and does not handle bboxes crossing the 180° meridian; the workbench map is bounded to China (`maxBounds [[-10,70],[65,140]]`), which keeps real usage inside the valid range.
+- Sentinel-2 mosaics are coverage composites of true-color renders — not radiometrically consistent monthly composites; per-scene date/cloud/color differences remain (noted in scene `limitations`).
+- Cost ceiling per interaction: one AI query ≤ 4 VL calls (stage-1 + ≤2 zoom re-queries + optional self-check); one Agent session adds 3 DeepSeek calls (slots/plan, review) plus one embedded AI query. The rate limiter caps abuse exposure at 30 AI-scope requests/min per IP by default.

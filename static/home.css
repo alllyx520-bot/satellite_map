@@ -73,6 +73,7 @@
   color: var(--gold-hi);
   text-decoration: none;
   font: 400 12.5px var(--font-body);
+  white-space: nowrap;
   transition: all var(--dur-ui) var(--ease-orbital);
 }
 
@@ -378,8 +379,11 @@
 /* ---------------------------------------------------------------- 响应式 */
 @media (max-width: 720px) {
   .page { padding: 0 20px; }
+  .nav { gap: 10px; padding: 10px 12px; }
+  .nav .mark b { font-size: 13px; }
   .nav-link { display: none; }
   .hero { padding-top: 30px; }
+  .hero h1 { font-size: clamp(32px, 12vw, 60px); }
   .hero-actions { flex-wrap: wrap; }
   .hero-footer { display: none; }
   .chapter { padding: 8vh 0; }

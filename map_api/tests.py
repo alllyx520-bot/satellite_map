@@ -3,18 +3,19 @@
 只覆盖不依赖数据库/网络/外部 API 的纯逻辑函数,可直接运行:
     python manage.py test map_api
 """
-from django.test import Client, SimpleTestCase, TestCase
+from django.test import Client, SimpleTestCase, TestCase, TransactionTestCase
 from django.conf import settings
 from django.core.management import call_command
 from django.utils import timezone
 import os
 import json
 import tempfile
+import time
 from http import HTTPStatus
 from io import BytesIO, StringIO
 from datetime import date, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import numpy as np
 import requests
 from PIL import Image
@@ -26,7 +27,7 @@ from map_api.utils.agent_tools import (
 )
 from map_api.utils.active_perception import (
     extract_bbox_from_response, extract_answer_text, measure_bbox, pixel_bbox_to_geo,
-    map_bbox_to_original
+    map_bbox_to_original, cut_image_geom, resize_image, model_wants_zoom
 )
 from map_api.utils.get_satellite_image import fetch_satellite_image, haversine_distance
 from map_api.utils.analysis_strategy import build_analysis_strategy
@@ -39,8 +40,10 @@ from map_api.views import (
     run_agent_session, select_best_sentinel_candidate, bbox_intersection_ratio,
     bbox_union_coverage_ratio, compose_sentinel_mosaic, image_valid_ratio,
     crop_sentinel_nodata_border, image_plan_for_bbox_and_size,
-    select_sentinel_scene_candidates, sentinel_retrieval_result, _download_progress
+    select_sentinel_scene_candidates, sentinel_retrieval_result, _download_progress,
+    safe_media_path, normalize_model_answer, _stage1_scale, _measure_and_locate
 )
+from map_api.middleware import reset_rate_limit_state
 from satellite_map.env import load_project_env
 
 
@@ -448,7 +451,7 @@ class AgentToolTests(SimpleTestCase):
             "render_candidate_jpeg": lambda self, c, bbox, width, height: buf.getvalue()
         })()
 
-        with patch("map_api.views.find_cached_sentinel_scene", return_value=None):
+        with patch("map_api.sentinel_pipeline.find_cached_sentinel_scene", return_value=None):
             with self.assertRaises(ValueError) as ctx:
                 sentinel_retrieval_result(
                     fake_provider,
@@ -1051,7 +1054,7 @@ class HistoryApiTests(TestCase):
             data={"image_file": "__compare__", "messages": []},
             content_type="application/json",
         )
-        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.status_code, 400)
         self.assertEqual(r.json()["code"], 400)
 
     def test_upserts_history_by_image_file(self):
@@ -2310,3 +2313,447 @@ class ReportSceneTests(TestCase):
         self.assertIn("qwen3-vl-flash", text)
         os.remove(img_path)
         os.remove(report_path)
+
+
+class SafeMediaPathSecurityTests(SimpleTestCase):
+    """safe_media_path 对抗性测试:路径穿越的各种姿势都必须被拒绝或限制在 base 内。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = self._tmp.name
+
+    def check(self, name):
+        result = safe_media_path(self.base, name, (".jpg", ".jpeg", ".png"))
+        if result is not None:
+            base_real = os.path.realpath(self.base)
+            self.assertTrue(
+                result == base_real or result.startswith(base_real + os.sep),
+                f"路径逃逸出 base:{name!r} -> {result!r}",
+            )
+        return result
+
+    def test_dotdot_forward_slash(self):
+        self.assertIsNone(self.check("../../etc/passwd"))
+
+    def test_dotdot_backslash(self):
+        # 反斜杠穿越:要么拒绝,要么落在 base 内(Linux 下反斜杠是合法文件名字符)
+        self.assertIsNone(self.check("..\\..\\windows\\system32\\cmd.exe"))
+
+    def test_absolute_unix(self):
+        self.assertIsNone(self.check("/etc/passwd"))
+
+    def test_absolute_windows(self):
+        self.assertIsNone(self.check("C:\\Windows\\System32\\cmd.exe"))
+
+    def test_bare_dotdot(self):
+        self.assertIsNone(self.check(".."))
+
+    def test_trailing_dotdot_component(self):
+        self.assertIsNone(self.check("sat_1.jpg/.."))
+
+    def test_empty_and_none(self):
+        self.assertIsNone(self.check(""))
+        self.assertIsNone(self.check(None))
+
+    def test_disallowed_extension(self):
+        self.assertIsNone(self.check("shell.php"))
+        self.assertIsNone(self.check("page.html"))
+
+    def test_null_byte(self):
+        self.assertIsNone(self.check("a.jpg\x00.php"))
+
+    def test_uppercase_extension_allowed_inside_base(self):
+        result = self.check("A.JPG")
+        self.assertIsNotNone(result)
+        self.assertEqual(os.path.basename(result), "A.JPG")
+
+    def test_double_extension_stays_inside_base(self):
+        self.assertIsNotNone(self.check("evil.php.jpg"))
+
+    def test_valid_name_resolves_inside_base(self):
+        result = self.check("sat_abc123.jpg")
+        self.assertIsNotNone(result)
+        self.assertEqual(os.path.basename(result), "sat_abc123.jpg")
+
+
+class RateLimitMiddlewareTests(TestCase):
+    """IP 限流中间件:防公网滥用付费 API(R1)。"""
+
+    def setUp(self):
+        reset_rate_limit_state()
+
+    def _post_ai(self):
+        return self.client.post("/api/ai/query-region/", data={}, content_type="application/json")
+
+    def test_ai_endpoint_rate_limited(self):
+        with patch.dict(os.environ, {"RATELIMIT_AI_PER_MINUTE": "2"}):
+            r1 = self._post_ai()
+            r2 = self._post_ai()
+            r3 = self._post_ai()
+        self.assertEqual(r1.status_code, 400)  # 前两次到达视图(问题为空 → 400)
+        self.assertEqual(r2.status_code, 400)
+        self.assertEqual(r3.status_code, 429)  # 第三次被限流
+        self.assertEqual(r3.json()["code"], 429)
+        self.assertFalse(r3.json()["ok"])
+        self.assertTrue(r3.has_header("Retry-After"))
+
+    def test_regular_api_scope_limited_independently(self):
+        with patch.dict(os.environ, {"RATELIMIT_API_PER_MINUTE": "2", "RATELIMIT_AI_PER_MINUTE": "100"}):
+            self._post_ai()  # ai scope 计数,不影响 api scope
+            ok = self.client.get("/api/imagery/scenes/")
+            self.assertEqual(ok.status_code, 200)
+            self.client.get("/api/imagery/scenes/")
+            blocked = self.client.get("/api/imagery/scenes/")
+        self.assertEqual(blocked.status_code, 429)
+
+    def test_health_endpoint_exempt(self):
+        with patch.dict(os.environ, {"RATELIMIT_API_PER_MINUTE": "1"}):
+            responses = [self.client.get("/api/system/health/") for _ in range(3)]
+        self.assertTrue(all(r.status_code == 200 for r in responses))
+
+    def test_disabled_flag_turns_limiter_off(self):
+        with patch.dict(os.environ, {"RATELIMIT_DISABLED": "1", "RATELIMIT_AI_PER_MINUTE": "1"}):
+            statuses = [self._post_ai().status_code for _ in range(3)]
+        self.assertNotIn(429, statuses)
+
+    def test_zero_limit_disables_scope(self):
+        with patch.dict(os.environ, {"RATELIMIT_AI_PER_MINUTE": "0"}):
+            statuses = [self._post_ai().status_code for _ in range(3)]
+        self.assertNotIn(429, statuses)
+
+
+class CoordinateChainEndToEndTests(SimpleTestCase):
+    """R6:主动感知坐标链端到端数值验证。
+
+    链路:stage1 缩略图(1024px)→ 模型 bbox ×ap_scale → 原图坐标 → cut_image_geom 裁剪
+    → 模型在裁剪图再给 bbox → map_bbox_to_original 回溯 → pixel_bbox_to_geo 经纬度。
+    用合成影像 + 手算精确值验证每一级换算,任何一级缩放系数写错都会挂。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = self._tmp.name
+
+    def _make_image(self, w, h, name="src.jpg"):
+        path = os.path.join(self.dir, name)
+        Image.new("RGB", (w, h), (40, 90, 140)).save(path, "JPEG")
+        return path
+
+    def test_two_level_zoom_round_trip_to_geo(self):
+        # 原图 2000×1500,地理范围 108.0–108.4 E / 22.5–22.8 N;
+        # 目标像素 (1250,1000) 精确对应 (108.25E, 22.6N)。
+        orig = self._make_image(2000, 1500)
+        geo_bbox = {"min_lng": 108.0, "max_lng": 108.4, "min_lat": 22.5, "max_lat": 22.8}
+
+        # ── 第 1 级:stage1 缩略图 1024×768,模型定位框 [600,470,680,554] ──
+        stage1 = resize_image(orig, max_size=1024)
+        with Image.open(stage1) as im:
+            self.assertEqual(im.size, (1024, 768))
+        self.assertEqual(_stage1_scale(stage1, 2000), 2000 / 1024)
+        model_text = '<think>目标在影像右中部 [{"bbox_2d": [600, 470, 680, 554], "label": "可疑设施"}]</think>'
+        boxes = extract_bbox_from_response(model_text, scale_factor=2000 / 1024)
+        self.assertEqual(boxes, [[1171, 917, 1328, 1082]])
+
+        # ── 裁剪(小于 512 自动扩到 512)──
+        crop_path, orig_box, saved_w, saved_h = cut_image_geom(orig, boxes[0])
+        self.assertIsNotNone(crop_path)
+        self.addCleanup(lambda: os.path.exists(crop_path) and os.remove(crop_path))
+        self.assertEqual(orig_box, (993, 743, 1505, 1255))
+        self.assertEqual((saved_w, saved_h), (512, 512))
+
+        # ── 第 2 级:模型在 512×512 裁剪图上给 [200,200,314,314] → 回溯原图 ──
+        orig_bbox = map_bbox_to_original([200, 200, 314, 314], orig_box, saved_w, saved_h)
+        self.assertEqual(orig_bbox, [1193, 943, 1307, 1057])
+
+        # ── 反算经纬度:中心必须精确回到 (108.25, 22.6) ──
+        geo = pixel_bbox_to_geo(orig_bbox, 2000, 1500, geo_bbox)
+        self.assertIsNotNone(geo)
+        self.assertAlmostEqual(geo[0], 108.25, places=9)
+        self.assertAlmostEqual(geo[1], 22.6, places=9)
+
+        # ── GSD 测量闭环:gsd=2.0 → 228m × 228m,target 带经纬度 ──
+        note, target = _measure_and_locate(orig_bbox, 2.0, {"orig_w": 2000, "orig_h": 1500}, geo_bbox)
+        self.assertEqual(target["width_m"], 228.0)
+        self.assertEqual(target["height_m"], 228.0)
+        self.assertEqual(target["area_m2"], 51984.0)
+        self.assertEqual(target["lng"], 108.25)
+        self.assertEqual(target["lat"], 22.6)
+        self.assertIn("228.0m × 228.0m", note)
+
+    def test_large_crop_downscale_maps_center_back(self):
+        # 裁剪框超过 3584 会缩小落盘;缩小后的坐标必须仍能映射回原图
+        orig = self._make_image(4000, 3000, name="big.jpg")
+        crop_path, orig_box, saved_w, saved_h = cut_image_geom(orig, [100, 100, 3900, 2900])
+        self.addCleanup(lambda: os.path.exists(crop_path) and os.remove(crop_path))
+        self.assertEqual(orig_box, (100, 100, 3900, 2900))
+        self.assertEqual((saved_w, saved_h), (3584, 2640))
+        # 裁剪图中心点 [1792,1320] 应映射回原图裁剪框中心 (2000,1500)
+        mapped = map_bbox_to_original([1792, 1320, 1792, 1320], orig_box, saved_w, saved_h)
+        self.assertAlmostEqual((mapped[0] + mapped[2]) / 2, 2000, delta=1)
+        self.assertAlmostEqual((mapped[1] + mapped[3]) / 2, 1500, delta=1)
+
+    def test_no_zoom_intent_yields_empty_bbox(self):
+        text = "<think>全局宏观问题,无需放大</think><answer>植被覆盖度约 40%</answer>"
+        self.assertEqual(extract_bbox_from_response(text), [])
+        self.assertFalse(model_wants_zoom(text))
+
+
+class NormalizeModelAnswerTests(SimpleTestCase):
+    """C2:模型输出归一化的对抗样本——任何格式偏差都必须有确定的兜底行为。"""
+
+    def test_structured_answer(self):
+        out = normalize_model_answer("<think>推理</think><answer>结论A</answer>")
+        self.assertEqual(out["answer"], "结论A")
+        self.assertTrue(out["quality"]["structured_answer"])
+        self.assertFalse(out["quality"]["fallback_used"])
+
+    def test_empty_string_falls_back(self):
+        out = normalize_model_answer("")
+        self.assertIn("模型未返回有效文字结果", out["answer"])
+        self.assertTrue(out["quality"]["fallback_used"])
+
+    def test_none_falls_back(self):
+        self.assertTrue(normalize_model_answer(None)["quality"]["fallback_used"])
+
+    def test_whitespace_only_falls_back(self):
+        self.assertTrue(normalize_model_answer("   \n\t  ")["quality"]["fallback_used"])
+
+    def test_plain_text_kept_but_flagged_fallback(self):
+        out = normalize_model_answer("没有标签包裹的裸结论")
+        self.assertEqual(out["answer"], "没有标签包裹的裸结论")
+        self.assertFalse(out["quality"]["structured_answer"])
+        self.assertTrue(out["quality"]["fallback_used"])
+        self.assertTrue(out["quality"]["warnings"])
+
+    def test_think_only_takes_post_think_text(self):
+        out = normalize_model_answer("<think>推理过程</think>最终结论")
+        self.assertEqual(out["answer"], "最终结论")
+        self.assertTrue(out["quality"]["fallback_used"])
+
+    def test_multiple_answer_tags_takes_first(self):
+        out = normalize_model_answer("<answer>第一</answer><answer>第二</answer>")
+        self.assertEqual(out["answer"], "第一")
+        self.assertTrue(out["quality"]["structured_answer"])
+
+    def test_answer_with_surrounding_whitespace(self):
+        out = normalize_model_answer("  <answer>\n  结论B  \n</answer>  ")
+        self.assertEqual(out["answer"], "结论B")
+
+
+class ReportChainEdgeCaseTests(TestCase):
+    """C4:报告链边界——对比模式(无单图)、超长回答、emoji 都必须正常出 docx。"""
+
+    def test_compare_mode_report_without_image(self):
+        from docx import Document
+
+        messages = [
+            {"role": "user", "content": "对比两个区域的土地利用差异"},
+            {"role": "ai", "content": "🛰️ 区域A以建设用地为主 🏙️，区域B以耕地为主 🌾\n\n" + "逐地块对比细节说明。" * 300},
+        ]
+        r = self.client.post(
+            "/api/report/generate/",
+            data={
+                "file_name": "__compare__",
+                "title": "双区域对比报告",
+                "messages": messages,
+                "spatial_context": "",
+                "bbox": {},
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["code"], 200)
+        report_name = body["data"]["file_name"]
+        report_path = os.path.join(settings.MEDIA_ROOT, report_name)
+        self.assertTrue(os.path.exists(report_path))
+        doc = Document(report_path)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        self.assertIn("🛰️", text)
+        self.assertIn("逐地块对比细节说明。", text)
+        os.remove(report_path)
+
+
+class FaultMatrixTests(TestCase):
+    """R-1/R7:外部依赖故障矩阵——6 个依赖各自的失败行为必须清晰、不静默挂起。"""
+
+    def setUp(self):
+        reset_rate_limit_state()
+
+    # 1. Mapbox:持续 429 → 重试耗尽后抛清晰异常(不静默卡死)
+    def test_mapbox_429_retry_exhaustion_raises(self):
+        from map_api.utils.get_satellite_image import _fetch_tile
+
+        fake_session = MagicMock()
+        fake_session.get.return_value = SimpleNamespace(status_code=429, content=b"")
+        with patch("map_api.utils.get_satellite_image.requests.Session", return_value=fake_session), \
+                patch("map_api.utils.get_satellite_image.time.sleep"):
+            with self.assertRaises(Exception) as ctx:
+                _fetch_tile("https://api.mapbox.com/tile.png",
+                            proxies={"http": None, "https": None}, retries=3)
+        self.assertIn("tile fetch failed after 3 attempts", str(ctx.exception))
+
+    # 2. Earth Search:STAC 500 → HTTPError 向上传播(由调用方降级)
+    def test_earth_search_stac_500_raises(self):
+        provider = EarthSearchProvider()
+        fake_resp = MagicMock()
+        fake_resp.raise_for_status.side_effect = requests.exceptions.HTTPError("500 Server Error")
+        with patch("map_api.imagery_sources.earth_search.requests.post", return_value=fake_resp):
+            with self.assertRaises(requests.exceptions.HTTPError):
+                provider.search({"min_lng": 108.0, "min_lat": 22.5, "max_lng": 108.3, "max_lat": 22.8})
+
+    # 3. TiTiler:返回非图片 → ValueError(触发候选回退链)
+    def test_titiler_non_image_response_raises(self):
+        provider = EarthSearchProvider()
+        candidate = SimpleNamespace(assets={"visual": {"href": "https://example.com/cog.tif"}})
+        fake_resp = MagicMock()
+        fake_resp.raise_for_status.return_value = None
+        fake_resp.headers = {"content-type": "application/json"}
+        with patch("map_api.imagery_sources.earth_search.requests.get", return_value=fake_resp):
+            with self.assertRaises(ValueError) as ctx:
+                provider.render_candidate_jpeg(
+                    candidate, {"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4}, 256, 256)
+        self.assertIn("未返回图片", str(ctx.exception))
+
+    # 4. DashScope:配额耗尽/非 200 → 500 JSON 带失败原因(不把异常吞成空回答)
+    def test_dashscope_quota_error_returns_500_json(self):
+        save_dir = os.path.join(settings.MEDIA_ROOT, "satellite_imgs")
+        os.makedirs(save_dir, exist_ok=True)
+        img_path = os.path.join(save_dir, "sat_fm_quota.jpg")
+        Image.new("RGB", (64, 64), (80, 120, 160)).save(img_path, "JPEG")
+        self.addCleanup(lambda: os.path.exists(img_path) and os.remove(img_path))
+
+        fake_resp = SimpleNamespace(status_code=429, message="Throttling.RateQuota")
+        with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-key"}, clear=False), \
+                patch("map_api.views._call_qwen", return_value=fake_resp):
+            r = self.client.post(
+                "/api/ai/query-region/",
+                data={"file_name": "sat_fm_quota.jpg", "question": "这张图里有什么", "active_perception": False},
+                content_type="application/json",
+            )
+        self.assertEqual(r.status_code, 500)
+        self.assertIn("AI 调用失败", r.json()["msg"])
+        self.assertIn("Throttling", r.json()["msg"])
+
+    # 5. DeepSeek:返回非 JSON → ValueError 带清晰消息(上层有规则兜底)
+    def test_deepseek_malformed_json_raises_valueerror(self):
+        from map_api.utils.agent_tools import call_deepseek_json
+
+        with patch("map_api.utils.agent_tools.call_deepseek", return_value="这不是 JSON {"):
+            with self.assertRaises(ValueError) as ctx:
+                call_deepseek_json([{"role": "user", "content": "解析槽位"}])
+        self.assertIn("DeepSeek 未返回有效 JSON", str(ctx.exception))
+
+    # 6a. 高德:缺 key → 立即失败,不发网络请求
+    def test_amap_missing_key_fails_fast(self):
+        from map_api.utils.agent_tools import resolve_district_bbox
+
+        with patch.dict(os.environ, {"AMAP_KEY": ""}, clear=False):
+            with self.assertRaises(ValueError) as ctx:
+                resolve_district_bbox("南宁市")
+        self.assertIn("AMAP_KEY", str(ctx.exception))
+
+    # 6b. 高德:查无此行政区 → 清晰错误
+    def test_amap_empty_districts_raises(self):
+        from map_api.utils.agent_tools import resolve_district_bbox
+
+        fake_resp = MagicMock()
+        fake_resp.raise_for_status.return_value = None
+        fake_resp.json.return_value = {"districts": []}
+        with patch.dict(os.environ, {"AMAP_KEY": "test-amap-key"}, clear=False), \
+                patch("map_api.utils.agent_tools.requests.get", return_value=fake_resp):
+            with self.assertRaises(ValueError) as ctx:
+                resolve_district_bbox("不存在省")
+        self.assertIn("未找到行政区", str(ctx.exception))
+
+    # 7. RemoteCLIP:打分器异常 → 静默回退颜色启发式(不影响主流程)
+    def test_clip_failure_falls_back_to_heuristic(self):
+        from map_api.utils.smart_query_analyzer import rank_tiles
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for i, color in enumerate([(20, 120, 30), (140, 140, 140), (30, 60, 160)]):
+                p = os.path.join(tmp, f"tile_{i}.jpg")
+                Image.new("RGB", (64, 64), color).save(p, "JPEG")
+                paths.append(p)
+            with patch("map_api.utils.clip_retriever.score_tiles", side_effect=RuntimeError("torch 不可用")):
+                selected, analysis = rank_tiles(paths, "识别植被覆盖的农田区域", tile_cols=3, tile_rows=1)
+        self.assertEqual(analysis["_ranker"], "heuristic")
+        self.assertTrue(selected)
+        self.assertTrue(all(p in paths for p in selected))
+
+
+class BackgroundTaskFaultTests(TransactionTestCase):
+    """R-3:后台线程异常必须落库为 error 状态,不能让任务永远 downloading。
+
+    用 TransactionTestCase 而非 TestCase:后台线程走独立数据库连接,
+    TestCase 的未提交事务对它不可见,update 会静默落空。
+    patch 必须覆盖整个等待期——线程在 POST 返回后才真正执行 fetch。
+    """
+
+    def test_download_exception_marks_task_error(self):
+        with patch.dict(os.environ, {"MAPBOX_TOKEN": "test-token"}, clear=False), \
+                patch("map_api.views.fetch_satellite_image", side_effect=RuntimeError("boom-429")):
+            r = self.client.post(
+                "/api/satellite/get-img/",
+                data={"min_lng": 108.0, "min_lat": 22.5, "max_lng": 108.05, "max_lat": 22.55},
+                content_type="application/json",
+            )
+            self.assertEqual(r.status_code, 200)
+            file_name = r.json()["data"]["file_name"]
+
+            task = DownloadTask.objects.get(file_name=file_name)
+            deadline = time.time() + 5
+            while task.status == "downloading" and time.time() < deadline:
+                time.sleep(0.05)
+                task.refresh_from_db()
+        self.assertEqual(task.status, "error")
+        self.assertIn("boom-429", task.error_message)
+
+
+class StaleTaskCleanupTests(TestCase):
+    """P-1:僵尸下载任务(后台线程被杀)必须能被识别并标记为 error。"""
+
+    def _make_task(self, file_name, status="downloading"):
+        return DownloadTask.objects.create(
+            file_name=file_name,
+            status=status,
+            min_lng=108.0, min_lat=22.5, max_lng=108.1, max_lat=22.6,
+        )
+
+    def test_stale_downloading_task_marked_error(self):
+        task = self._make_task("sat_stale.jpg")
+        # auto_now 字段只能通过 queryset.update 改成旧时间
+        DownloadTask.objects.filter(id=task.id).update(
+            updated_at=timezone.now() - timedelta(minutes=30)
+        )
+        call_command("cleanup_stale_tasks", "--minutes", "10")
+        task.refresh_from_db()
+        self.assertEqual(task.status, "error")
+        self.assertIn("重新框选", task.error_message)
+
+    def test_recent_downloading_task_untouched(self):
+        task = self._make_task("sat_fresh.jpg")
+        call_command("cleanup_stale_tasks", "--minutes", "10")
+        task.refresh_from_db()
+        self.assertEqual(task.status, "downloading")
+
+    def test_done_task_never_touched(self):
+        task = self._make_task("sat_done.jpg", status="done")
+        DownloadTask.objects.filter(id=task.id).update(
+            updated_at=timezone.now() - timedelta(minutes=60)
+        )
+        call_command("cleanup_stale_tasks", "--minutes", "10")
+        task.refresh_from_db()
+        self.assertEqual(task.status, "done")
+
+    def test_dry_run_changes_nothing(self):
+        task = self._make_task("sat_dry.jpg")
+        DownloadTask.objects.filter(id=task.id).update(
+            updated_at=timezone.now() - timedelta(minutes=30)
+        )
+        call_command("cleanup_stale_tasks", "--minutes", "10", "--dry-run")
+        task.refresh_from_db()
+        self.assertEqual(task.status, "downloading")

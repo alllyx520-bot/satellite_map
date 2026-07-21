@@ -13,9 +13,14 @@
 #stars {
   position: fixed;
   inset: 0;
+  width: 100%;
+  height: 100%;
   z-index: var(--z-ambient);
   pointer-events: none;
 }
+
+/* 装饰层(星空/极光/光晕)可能越界,裁剪横向溢出不产生滚动容器、不影响 sticky */
+html { overflow-x: clip; }
 
 /* ---------------------------------------------------------------- 导航 */
 .nav {
