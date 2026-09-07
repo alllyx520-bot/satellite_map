@@ -686,6 +686,22 @@ class AgentToolTests(SimpleTestCase):
         self.assertEqual(coverage, 1.0)
         self.assertEqual(method, "same_day_mosaic")
 
+    def test_cross_date_mosaic_is_rejected_by_default(self):
+        provider = EarthSearchProvider()
+        def candidate(item_id, when, bounds):
+            return provider.candidate_from_item({
+                "id": item_id, "collection": "sentinel-2-l2a", "bbox": bounds,
+                "properties": {"datetime": when, "eo:cloud_cover": 5, "s2:product_uri": item_id},
+                "assets": {"visual": {"href": f"https://example.com/{item_id}.tif", "gsd": 10}},
+            })
+        left = candidate("S2_DATE_A", "2026-04-12T03:17:00Z", [0, 0, 1, 2])
+        right = candidate("S2_DATE_B", "2026-04-13T03:17:00Z", [1, 0, 2, 2])
+        with self.assertRaisesRegex(ValueError, "跨日期拼接"):
+            sentinel_retrieval_result(
+                provider, [left, right], {"min_lng": 0, "min_lat": 0, "max_lng": 2, "max_lat": 2},
+                {"total_w": 256, "total_h": 256, "gsd_m": 10, "area_km2": 1}, 256,
+            )
+
     def test_sentinel_retrieval_rejects_large_nodata_single_render(self):
         provider = EarthSearchProvider()
         candidate = provider.candidate_from_item({

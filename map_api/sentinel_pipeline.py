@@ -456,6 +456,8 @@ def scene_from_sentinel_mosaic(
         "target_coverage_ratio": target_coverage_ratio,
         "valid_image_ratio": valid_image_ratio,
         "sentinel_mosaic_cache_key": cache_key,
+        "temporal_consistency": "same_date" if len({c.acquired_at.date().isoformat() for c in candidates if c.acquired_at}) <= 1 else "mixed_dates",
+        "change_detection_allowed": len({c.acquired_at.date().isoformat() for c in candidates if c.acquired_at}) <= 1,
     }
     if render_errors:
         metadata["render_fallback_errors"] = render_errors
@@ -536,6 +538,11 @@ def sentinel_retrieval_result(
         min_coverage=min_coverage,
         max_mosaic_candidates=max_mosaic_candidates,
     )
+    if selection_method == "multi_date_mosaic" and str(os.environ.get("SENTINEL_ALLOW_CROSS_DATE_MOSAIC", "0")).strip().lower() not in {"1", "true", "yes"}:
+        raise ValueError(
+            "Sentinel-2 覆盖需要跨日期拼接；为避免混淆时相，默认拒绝该结果。"
+            "请扩大同一日期覆盖、缩小范围，或明确开启 SENTINEL_ALLOW_CROSS_DATE_MOSAIC。"
+        )
     coverage_errors = []
     for candidate in sorted_sentinel_candidates(candidates):
         coverage = bbox_intersection_ratio(bbox, candidate.bbox)
