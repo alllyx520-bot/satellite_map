@@ -17,6 +17,12 @@ BLANK_PIXEL_THRESHOLD = 10
 MIN_VALID_PIXEL_RATIO = 0.02
 logger = logging.getLogger(__name__)
 
+
+def request_proxies():
+    """默认遵循当前进程代理；显式设置直连时才绕过代理。"""
+    direct = os.environ.get("SATELLITESENSE_DIRECT_HTTP", "").strip().lower()
+    return {"http": None, "https": None} if direct in {"1", "true", "yes"} else None
+
 _download_progress = {}
 MAX_PROGRESS_ENTRIES = 50
 
@@ -71,32 +77,43 @@ def _save_jpeg_atomic(img, full_save_path, quality):
             os.remove(tmp_path)
 
 
-def _fetch_tile(url, proxies, retries=5):
+def _fetch_tile(url, proxies, retries=3, timeout=30):
     last_err = None
+    retries = max(1, int(retries))
+    attempts_made = 0
     for attempt in range(retries):
         if attempt > 0:
-            time.sleep(2.0 * attempt)
+            time.sleep(min(0.5 * (2 ** (attempt - 1)), 4.0))
+        session = None
         try:
+            attempts_made += 1
             session = requests.Session()
-            retry_strategy = Retry(total=1, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+            # 重试由本函数统一控制，避免外层重试再叠加 urllib3 的隐式重试。
+            retry_strategy = Retry(total=0)
             adapter = HTTPAdapter(max_retries=retry_strategy)
             session.mount("https://", adapter)
-            resp = session.get(url, timeout=60, proxies=proxies)
-            session.close()
+            resp = session.get(url, timeout=timeout, proxies=proxies)
             if resp.status_code == 200:
                 img = Image.open(BytesIO(resp.content))
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
                 _ensure_not_blank(img, "Mapbox tile")
                 return img
-            raise Exception(f"tile fetch failed: {resp.status_code}")
+            if resp.status_code not in (429, 500, 502, 503, 504):
+                raise Exception(f"tile fetch failed: HTTP {resp.status_code}")
+            raise Exception(f"tile fetch failed: HTTP {resp.status_code}")
         except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as e:
             last_err = str(e)[:120]
             continue
         except Exception as e:
             last_err = str(e)[:120]
+            if "HTTP 429" not in last_err and not any(f"HTTP {code}" in last_err for code in (500, 502, 503, 504)):
+                break
             continue
-    raise Exception(f"tile fetch failed after {retries} attempts: {last_err}")
+        finally:
+            if session is not None:
+                session.close()
+    raise Exception(f"tile fetch failed after {attempts_made} attempts: {last_err}")
 
 def _notify(progress_callback, file_name, info):
     if progress_callback:
@@ -117,6 +134,10 @@ def _update_progress(file_name, updates, progress_callback=None):
 
 def _mapbox_token():
     return os.environ.get('MAPBOX_TOKEN', '')
+
+
+def _mapbox_static_base_url():
+    return os.environ.get("MAPBOX_STATIC_BASE_URL", "https://api.mapbox.com").rstrip("/")
 
 
 def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_name="satellite_result.jpg",
@@ -140,7 +161,12 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
     os.makedirs(save_dir, exist_ok=True)
     full_save_path = os.path.join(save_dir, file_name)
 
-    proxies = {"http": None, "https": None}
+    if not token:
+        _set_progress(file_name, {"total": 0, "done": 0, "failed": 1, "status": "error", "error": "缺少 MAPBOX_TOKEN"}, progress_callback)
+        logger.warning("Mapbox token missing")
+        return None
+
+    proxies = request_proxies()
     retina = "@2x" if ultra_hd else ""
 
     # Single tile if small enough
@@ -148,9 +174,14 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
         actual_w = total_w * 2 if ultra_hd else total_w
         actual_h = total_h * 2 if ultra_hd else total_h
         _set_progress(file_name, {"total": 1, "done": 0, "failed": 0, "status": "downloading"}, progress_callback)
-        url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{min_lon},{min_lat},{max_lon},{max_lat}]/{actual_w}x{actual_h}{retina}?access_token={token}"
+        url = f"{_mapbox_static_base_url()}/styles/v1/mapbox/satellite-v9/static/[{min_lon},{min_lat},{max_lon},{max_lat}]/{actual_w}x{actual_h}{retina}?access_token={token}"
         try:
-            img = _fetch_tile(url, proxies)
+            img = _fetch_tile(
+                url,
+                proxies,
+                retries=max(1, int(os.environ.get("MAPBOX_TILE_RETRIES", "3"))),
+                timeout=max(1, int(os.environ.get("MAPBOX_TILE_TIMEOUT", "30"))),
+            )
             _ensure_not_blank(img, "Mapbox image")
             _save_jpeg_atomic(img, full_save_path, quality=95)
             _set_progress(file_name, {"total": 1, "done": 1, "failed": 0, "status": "done"}, progress_callback)
@@ -186,10 +217,15 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
         ch = cell_h if r < rows - 1 else total_h - r * cell_h
         cw = max(1, cw); ch = max(1, ch)
 
-        url = f"https://api.mapbox.com/styles/v1/mapbox/satellite-v9/static/[{c_min_lon},{c_min_lat},{c_max_lon},{c_max_lat}]/{cw}x{ch}{retina}?access_token={token}"
+        url = f"{_mapbox_static_base_url()}/styles/v1/mapbox/satellite-v9/static/[{c_min_lon},{c_min_lat},{c_max_lon},{c_max_lat}]/{cw}x{ch}{retina}?access_token={token}"
         failed = False
         try:
-            tile = _fetch_tile(url, proxies)
+            tile = _fetch_tile(
+                url,
+                proxies,
+                retries=max(1, int(os.environ.get("MAPBOX_TILE_RETRIES", "3"))),
+                timeout=max(1, int(os.environ.get("MAPBOX_TILE_TIMEOUT", "30"))),
+            )
             logger.info("Mapbox tile (%s/%s,%s/%s) OK", r + 1, rows, c + 1, cols)
         except Exception as e:
             logger.warning("Mapbox tile (%s/%s,%s/%s) failed: %s", r + 1, rows, c + 1, cols, e)

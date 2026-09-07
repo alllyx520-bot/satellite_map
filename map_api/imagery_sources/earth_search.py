@@ -1,8 +1,11 @@
 from datetime import datetime, timezone
+import os
+import time
 
 import requests
 
 from .base import ImageryCandidate, ImageryProvider
+from ..utils.service_health import check_service, record_failure, record_success, service_key
 
 
 EARTH_SEARCH_URL = "https://earth-search.aws.element84.com/v1/search"
@@ -14,6 +17,12 @@ EARTH_SEARCH_LIMITATIONS = (
     "本身不等同于本地行政证据链，且空间分辨率、云影、重访周期和公开服务可用性会限制"
     "结论可靠性，不应单独作为执法或行政裁量证据。"
 )
+
+
+def request_proxies():
+    """默认遵循当前进程代理；仅显式要求时才强制直连。"""
+    direct = os.environ.get("SATELLITESENSE_DIRECT_HTTP", "").strip().lower()
+    return {"http": None, "https": None} if direct in {"1", "true", "yes"} else None
 
 
 def parse_stac_datetime(value):
@@ -118,6 +127,8 @@ class EarthSearchProvider(ImageryProvider):
         self.timeout = timeout
 
     def search(self, bbox, start_date=None, end_date=None, max_cloud=30, limit=10, collection=DEFAULT_COLLECTION):
+        health_key = service_key("earth-search", self.endpoint)
+        check_service(health_key)
         payload = {
             "collections": [collection],
             "bbox": [bbox["min_lng"], bbox["min_lat"], bbox["max_lng"], bbox["max_lat"]],
@@ -130,17 +141,68 @@ class EarthSearchProvider(ImageryProvider):
         if max_cloud is not None:
             payload["query"] = {"eo:cloud_cover": {"lte": float(max_cloud)}}
 
-        response = requests.post(
-            self.endpoint,
-            json=payload,
-            timeout=self.timeout,
-            proxies={"http": None, "https": None},
-        )
-        response.raise_for_status()
-        data = response.json()
+        retries = max(0, min(3, int(os.environ.get("EARTH_SEARCH_RETRIES", "2"))))
+        response = None
+        for attempt in range(retries + 1):
+            try:
+                response = requests.post(
+                    self.endpoint,
+                    json=payload,
+                    timeout=self.timeout,
+                    proxies=request_proxies(),
+                )
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if attempt >= retries:
+                    record_failure(
+                        health_key,
+                        exc,
+                        threshold=int(os.environ.get("EARTH_SEARCH_CIRCUIT_FAILURES", "2")),
+                        cooldown_seconds=int(os.environ.get("EARTH_SEARCH_CIRCUIT_SECONDS", "30")),
+                    )
+                    raise
+                time.sleep(min(2 ** attempt, 4))
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            try:
+                status = int(getattr(response, "status_code", 0) or 0)
+                server_error = status >= 500 or status in (408, 425, 429)
+            except (TypeError, ValueError):
+                server_error = False
+            if server_error:
+                record_failure(
+                    health_key,
+                    exc,
+                    threshold=int(os.environ.get("EARTH_SEARCH_CIRCUIT_FAILURES", "2")),
+                    cooldown_seconds=int(os.environ.get("EARTH_SEARCH_CIRCUIT_SECONDS", "30")),
+                )
+            raise
+        try:
+            data = response.json()
+        except ValueError as exc:
+            record_failure(
+                health_key,
+                exc,
+                threshold=int(os.environ.get("EARTH_SEARCH_CIRCUIT_FAILURES", "2")),
+                cooldown_seconds=int(os.environ.get("EARTH_SEARCH_CIRCUIT_SECONDS", "30")),
+            )
+            raise ValueError("Earth Search 返回了无效 JSON") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("features"), list):
+            error = ValueError("Earth Search 返回了无效 STAC 响应结构")
+            record_failure(
+                health_key,
+                error,
+                threshold=int(os.environ.get("EARTH_SEARCH_CIRCUIT_FAILURES", "2")),
+                cooldown_seconds=int(os.environ.get("EARTH_SEARCH_CIRCUIT_SECONDS", "30")),
+            )
+            raise error
+        record_success(health_key)
         return [self.candidate_from_item(item) for item in data.get("features", [])]
 
     def render_candidate_jpeg(self, candidate, bbox, width, height):
+        health_key = service_key("titiler", self.titiler_endpoint)
+        check_service(health_key)
         visual_asset = candidate.assets.get("visual") or {}
         cog_url = visual_asset.get("href")
         if not cog_url:
@@ -150,16 +212,56 @@ class EarthSearchProvider(ImageryProvider):
             f"{bbox['min_lng']},{bbox['min_lat']},{bbox['max_lng']},{bbox['max_lat']}/"
             f"{width}x{height}.jpg"
         )
-        response = requests.get(
-            endpoint,
-            params={"url": cog_url},
-            timeout=max(self.timeout, 60),
-            proxies={"http": None, "https": None},
-        )
-        response.raise_for_status()
+        retries = max(0, min(2, int(os.environ.get("TITILER_RETRIES", "1"))))
+        response = None
+        for attempt in range(retries + 1):
+            try:
+                response = requests.get(
+                    endpoint,
+                    params={"url": cog_url},
+                    # TiTiler 正常响应通常在秒级；失败时不应让一个候选阻塞整条
+                    # Agent 流程一分钟。保留足够的网络余量，但将单候选上限控制在
+                    # 20 秒以内，后续候选仍可继续尝试。
+                    timeout=max(self.timeout, 20),
+                    proxies=request_proxies(),
+                )
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if attempt >= retries:
+                    record_failure(
+                        health_key,
+                        exc,
+                        threshold=int(os.environ.get("TITILER_CIRCUIT_FAILURES", "2")),
+                        cooldown_seconds=int(os.environ.get("TITILER_CIRCUIT_SECONDS", "30")),
+                    )
+                    raise
+                time.sleep(min(2 ** attempt, 3))
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            try:
+                status = int(getattr(response, "status_code", 0) or 0)
+                server_error = status >= 500 or status in (408, 425, 429)
+            except (TypeError, ValueError):
+                server_error = False
+            if server_error:
+                record_failure(
+                    health_key,
+                    exc,
+                    threshold=int(os.environ.get("TITILER_CIRCUIT_FAILURES", "2")),
+                    cooldown_seconds=int(os.environ.get("TITILER_CIRCUIT_SECONDS", "30")),
+                )
+            raise
         content_type = response.headers.get("content-type", "")
         if "image" not in content_type:
+            record_failure(
+                health_key,
+                "TiTiler 返回非图片响应",
+                threshold=int(os.environ.get("TITILER_CIRCUIT_FAILURES", "2")),
+                cooldown_seconds=int(os.environ.get("TITILER_CIRCUIT_SECONDS", "30")),
+            )
             raise ValueError("影像渲染服务未返回图片")
+        record_success(health_key)
         return response.content
 
     def candidate_from_item(self, item):

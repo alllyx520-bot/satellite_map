@@ -19,6 +19,8 @@ def normalize_bbox(data):
     raw_min_lat = float(data['min_lat'])
     raw_max_lng = float(data['max_lng'])
     raw_max_lat = float(data['max_lat'])
+    if not all(math.isfinite(value) for value in (raw_min_lng, raw_min_lat, raw_max_lng, raw_max_lat)):
+        raise ValueError("经纬度必须是有限数字")
     min_lng, max_lng = sorted((raw_min_lng, raw_max_lng))
     min_lat, max_lat = sorted((raw_min_lat, raw_max_lat))
     if max_lng - min_lng <= 0 or max_lat - min_lat <= 0:
@@ -126,16 +128,9 @@ def image_valid_ratio(image_bytes, threshold=8):
     return round(valid / total, 4)
 
 
-def image_plan_for_bbox_and_size(bbox, width, height):
-    min_lng = float(bbox["min_lng"])
-    min_lat = float(bbox["min_lat"])
-    max_lng = float(bbox["max_lng"])
-    max_lat = float(bbox["max_lat"])
+def _image_plan_from_spans(lon_span, lat_span, center_lat_rad, width, height):
     width = max(1, int(width))
     height = max(1, int(height))
-    lon_span = max_lng - min_lng
-    lat_span = max_lat - min_lat
-    center_lat_rad = math.radians((min_lat + max_lat) / 2)
     gsd_lon = (lon_span * 111320 * math.cos(center_lat_rad)) / width if width else 0
     gsd_lat_val = (lat_span * 110574) / height if height else 0
     area_km2 = (lon_span * 111320 * math.cos(center_lat_rad)) * (lat_span * 110574) / 1e6
@@ -146,6 +141,17 @@ def image_plan_for_bbox_and_size(bbox, width, height):
         "gsd_m": (gsd_lon + gsd_lat_val) / 2,
         "area_km2": area_km2,
     }
+
+
+def image_plan_for_bbox_and_size(bbox, width, height):
+    min_lng = float(bbox["min_lng"])
+    min_lat = float(bbox["min_lat"])
+    max_lng = float(bbox["max_lng"])
+    max_lat = float(bbox["max_lat"])
+    lon_span = max_lng - min_lng
+    lat_span = max_lat - min_lat
+    center_lat_rad = math.radians((min_lat + max_lat) / 2)
+    return _image_plan_from_spans(lon_span, lat_span, center_lat_rad, width, height)
 
 
 def bbox_for_image_crop(bbox, crop_box, original_size):
@@ -213,12 +219,15 @@ def crop_sentinel_nodata_border(image_bytes, bbox, threshold=8, min_removed_rati
     cropped_bytes = buf.getvalue()
     cropped_bbox = bbox_for_image_crop(bbox, (left, top, right, bottom), (width, height))
     cropped_plan = image_plan_for_bbox_and_size(cropped_bbox, cropped.width, cropped.height)
+    cropped_mask = mask[top:bottom, left:right]
+    cropped_total = cropped.width * cropped.height
+    cropped_valid_ratio = round(float(cropped_mask.sum()) / cropped_total, 4) if cropped_total else 0
     metadata.update({
         "applied": True,
         "crop_box_px": {"left": left, "top": top, "right": right, "bottom": bottom},
         "cropped_size_px": {"width": cropped.width, "height": cropped.height},
         "effective_bbox": cropped_bbox,
-        "valid_image_ratio_after_crop": image_valid_ratio(cropped_bytes, threshold=threshold),
+        "valid_image_ratio_after_crop": cropped_valid_ratio,
     })
     return {
         "image_bytes": cropped_bytes,
@@ -226,6 +235,44 @@ def crop_sentinel_nodata_border(image_bytes, bbox, threshold=8, min_removed_rati
         "plan": cropped_plan,
         "metadata": metadata,
     }
+
+
+def clip_image_to_polygon(image_bytes, bbox, polygon, outside_value=0):
+    """按行政区多环 polygon 裁切影像，返回 JPEG 字节和掩膜覆盖率。"""
+    if not polygon:
+        return image_bytes, 1.0
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    arr = np.asarray(image).copy()
+    mask = polygon_mask_for_bbox(polygon, bbox, arr.shape[:2])
+    if mask is None or not mask.any():
+        raise ValueError("行政区 polygon 与影像 bbox 无有效相交")
+    arr[~mask] = outside_value
+    out = BytesIO()
+    Image.fromarray(arr).save(out, "JPEG", quality=92, optimize=True)
+    return out.getvalue(), float(mask.mean())
+
+
+def polygon_mask_for_bbox(polygon, bbox, shape):
+    """纯 numpy 栅格化行政区多环 polygon。"""
+    if not polygon or len(shape) != 2:
+        return None
+    h, w = int(shape[0]), int(shape[1])
+    xs = np.linspace(float(bbox["min_lng"]), float(bbox["max_lng"]), w, endpoint=False)
+    ys = np.linspace(float(bbox["max_lat"]), float(bbox["min_lat"]), h, endpoint=False)
+    xx, yy = np.meshgrid(xs + (xs[1]-xs[0] if w > 1 else 0)/2, ys - (ys[0]-ys[1] if h > 1 else 0)/2)
+    mask = np.zeros((h, w), dtype=bool)
+    for ring in polygon:
+        if not ring or len(ring) < 3:
+            continue
+        inside = np.zeros((h, w), dtype=bool)
+        x0, y0 = ring[-1]
+        for x1, y1 in ring:
+            crosses = ((y1 > yy) != (y0 > yy))
+            denom = (y0 - y1) if y0 != y1 else 1e-12
+            inside ^= crosses & (xx < (x0 - x1) * (yy - y1) / denom + x1)
+            x0, y0 = x1, y1
+        mask |= inside
+    return mask
 
 
 def sentinel_nodata_crop_too_large(crop_metadata, max_removed_ratio=None):

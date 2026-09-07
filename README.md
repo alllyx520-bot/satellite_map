@@ -13,8 +13,8 @@ Core direction:
 - Keep Mapbox high-resolution basemap as the default visual-detail workflow.
 - Add Sentinel-2 L2A recent public imagery as an optional traceable source.
 - Keep only two analysis modes:
-  - `precise`: `deepseek-v4-flash` controller + `qwen3-vl-plus`
-  - `fast`: `deepseek-v4-flash` controller + `qwen3-vl-flash`
+  - `precise`: `glm-5.3-flash` controller + `qwen3-vl-plus`
+  - `fast`: `glm-5.3-flash` controller + `qwen3-vl-flash`
 - Default mode is `precise`.
 - Focus on the product and analysis chain first. Do not prioritize slides, reports, or defense materials before the tool itself is stable.
 - Important product principle: users should not be forced to manually verify image-source suitability. The system should choose, validate, and explain image sources as much as possible.
@@ -24,7 +24,7 @@ Core direction:
 - Backend: Django 5.2
 - Frontend: server-rendered HTML, plain JavaScript, Leaflet, local CSS
 - AI/VL: DashScope Qwen VL
-- Agent controller: DeepSeek API
+- Agent controller: GLM-5.3-Flash (BigModel API); `DEEPSEEK_API_KEY` is legacy compatibility only
 - Map source:
   - Mapbox static satellite imagery
   - Sentinel-2 L2A through Element84 Earth Search + TiTiler
@@ -65,7 +65,7 @@ map_api/                      Single Django app with all backend logic
                               active perception, analysis strategy, Agent tools
   management/commands/
     smoke_pipeline.py         Project-level acceptance check
-    cleanup_stale_tasks.py    Mark zombie "downloading" tasks as error
+    cleanup_stale_tasks.py    Mark zombie downloads error; release stale Agent leases for recovery
     cleanup_media.py          Age-based media cleanup (+ DB record sync)
 
 templates/
@@ -80,7 +80,7 @@ static/
   design.css / design.js / spectra.css   Design page assets
   remixicon.css / .woff2      Local icon assets
 
-deploy/                       nginx config + systemd unit for the ECS
+deploy/                       nginx config + Gunicorn/Agent worker systemd units for the ECS
 scripts/                      One-off utilities (RemoteCLIP weight download)
 
 models/                       RemoteCLIP weights, ignored by git
@@ -123,8 +123,17 @@ Rate limiting (protects paid endpoints; per IP per minute):
 ```text
 RATELIMIT_API_PER_MINUTE=120
 RATELIMIT_AI_PER_MINUTE=30
+# database 为默认值，多个 Web worker 共享同一令牌桶；本地纯演示可设 memory
+RATELIMIT_BACKEND=database
 # RATELIMIT_DISABLED=1    # demo mode only
+# 生产建议由持久化 worker 执行 Agent，避免 Web 进程重启丢任务：
+AGENT_EXECUTION_MODE=queue
 ```
+
+`queue` 模式下，Agent 调查、Mapbox 影像下载和 Word 报告都会先持久化到数据库，再由
+`run_agent_worker` 执行。Web 进程重启不会丢失任务；报告 worker 被中断后，
+过期租约会被后续 worker 接管。影像先写 worker 专属临时文件，通过所有权
+校验后才原子切换为正式图片，旧 worker 不能覆盖接管者结果。
 
 Defaults are defined in `map_api/sentinel_pipeline.py`, `map_api/orchestrator.py` and `map_api/middleware.py`. Do not commit real API keys.
 
@@ -228,7 +237,7 @@ User can type something like:
 The controlled Agent flow:
 
 1. Create `AgentSession`.
-2. DeepSeek parses goal into structured slots.
+2. GLM-5.3-Flash parses goal into structured slots.
 3. Gaode resolves place to administrative bbox.
 4. Agent picks image source.
 5. Sentinel-2 is used for water, vegetation, agriculture, land-use, timeliness, and change-screening tasks.
@@ -236,7 +245,7 @@ The controlled Agent flow:
 7. Sentinel imagery is retrieved and quality-checked.
 8. Water tasks compute lightweight NDWI.
 9. Qwen VL interprets image.
-10. DeepSeek reviews the final conclusion.
+10. GLM-5.3-Flash reviews the final conclusion; Qwen VL remains the primary specialist interpreter.
 11. User can generate a Word report after completion.
 
 The frontend shows a Codex-like public progress view: current stage, what the Agent is doing, and next step. Do not expose private chain-of-thought.
@@ -255,6 +264,7 @@ APIs:
 
 ```text
 GET  /api/system/health/
+GET  /api/analysis/indices/
 POST /api/satellite/get-img/
 POST /api/satellite/get-sentinel-img/
 GET  /api/satellite/show-img/?file=...
@@ -324,10 +334,10 @@ fast    -> qwen3-vl-flash
 Agent controller:
 
 ```text
-deepseek-v4-flash
+glm-5.3-flash
 ```
 
-If `DEEPSEEK_API_KEY` is missing, Agent creation should fail clearly. Do not silently fall back to rule-only planning for Agent mode.
+If `GLM_API_KEY` is missing, Agent creation should fail clearly. `DEEPSEEK_API_KEY` may be read only for legacy deployments. Do not silently fall back to rule-only planning for Agent mode.
 
 ## Frontend Design State
 

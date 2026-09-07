@@ -6,19 +6,17 @@
     <title>SPECTRA · 光谱设计系统</title>
     <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/unbounded@5/600.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/fraunces@5/400.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/fraunces@5/600.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/fraunces@5/500.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/fraunces@5/700.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-serif-sc@5/600.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@5/500.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@5/700.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5/400.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5/500.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/300.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/400.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/500.css">
     <link rel="stylesheet" href="/static/remixicon.css?v=1">
-    <link rel="stylesheet" href="/static/spectra.css?v=1">
-    <link rel="stylesheet" href="/static/design.css?v=2">
+    <link rel="stylesheet" href="/static/spectra.css?v=4">
+    <link rel="stylesheet" href="/static/design.css?v=4">
 </head>
 <body>
     <!-- 环境层：极光光场 / 星点 / 暗角 / 噪点 -->
@@ -106,7 +104,7 @@
                 <div class="strip glass-thin"><div class="cell" style="background:#171C2B"></div><div class="lbl">VOID-3</div></div>
                 <div class="strip glass-thin"><div class="cell" style="background:#F2EEE6"></div><div class="lbl">INK-HI</div></div>
                 <div class="strip glass-thin"><div class="cell" style="background:rgba(242,238,230,.62)"></div><div class="lbl">INK-MID</div></div>
-                <div class="strip glass-thin"><div class="cell" style="background:rgba(242,238,230,.38)"></div><div class="lbl">INK-LOW</div></div>
+                <div class="strip glass-thin"><div class="cell" style="background:var(--ink-low)"></div><div class="lbl">INK-LOW</div></div>
             </div>
         </section>
 
@@ -145,10 +143,10 @@
                 <h2>字体系统</h2>
                 <span class="en">Typography</span>
             </div>
-            <p class="sec-desc">Space Grotesk 负责拉丁显示，思源黑体负责中文正文，JetBrains Mono 负责一切数据读数——等宽数字跳动时不错位，是仪器感的关键。</p>
+            <p class="sec-desc">Fraunces 负责拉丁显示，思源黑体负责中文正文，JetBrains Mono 负责一切数据读数——等宽数字跳动时不错位，是仪器感的关键。</p>
             <div class="type-panel glass">
                 <div class="type-row">
-                    <span class="lbl spec">DISPLAY / SPACE GROTESK</span>
+                    <span class="lbl spec">DISPLAY / FRAUNCES</span>
                     <span class="type-display">Orbital Clarity 轨道级清晰</span>
                 </div>
                 <div class="type-row">
@@ -174,11 +172,11 @@
             <div class="proto-grid">
                 <div class="proto-panel glass">
                     <span class="spec">SPECULAR EDGE / 镜面高光</span>
-                    <p style="margin:0;font-size:13.5px;color:var(--ink-mid)">将指针沿本面板的顶部边缘缓慢移动——高光热点会实时跟随，如同真实玻璃反射环境光源。</p>
+                    <p class="proto-note">将指针沿本面板的顶部边缘缓慢移动——高光热点会实时跟随，如同真实玻璃反射环境光源。</p>
                 </div>
                 <div class="proto-panel glass is-selected">
                     <span class="spec">CAUSTIC RING / 焦散选中环</span>
-                    <p style="margin:0;font-size:13.5px;color:var(--ink-mid)">本面板正处于选中态：一圈缓慢流动的光谱沿边缘旋转，代替生硬的纯色边框。</p>
+                    <p class="proto-note">本面板正处于选中态：一圈缓慢流动的光谱沿边缘旋转，代替生硬的纯色边框。</p>
                 </div>
                 <div class="proto-panel glass">
                     <span class="spec">BREATHING / 呼吸状态光</span>
@@ -186,7 +184,7 @@
                         <div class="t-step active" style="flex:none">
                             <span class="t-dot"><i class="ri-scan-2-line" aria-hidden="true"></i></span>
                         </div>
-                        <p style="margin:0;font-size:13.5px;color:var(--ink-mid)">2 秒周期的呼吸脉冲表示处理中，不催促、不打扰。</p>
+                        <p class="proto-note">2 秒周期的呼吸脉冲表示处理中，不催促、不打扰。</p>
                     </div>
                 </div>
             </div>
@@ -211,10 +209,10 @@
                 </div>
                 <div class="comp-panel glass">
                     <span class="spec">SEGMENTED / 影像源选择</span>
-                    <div class="seg" role="radiogroup">
+                    <div class="seg" role="radiogroup" aria-label="影像源选择">
                         <span class="seg-thumb" aria-hidden="true"></span>
-                        <button aria-checked="true">高清底图 Mapbox</button>
-                        <button aria-checked="false">近期影像 Sentinel-2</button>
+                        <button role="radio" aria-checked="true">高清底图 Mapbox</button>
+                        <button role="radio" aria-checked="false" tabindex="-1">近期影像 Sentinel-2</button>
                     </div>
                 </div>
                 <div class="comp-panel glass">
@@ -227,13 +225,13 @@
                 <div class="comp-panel glass">
                     <span class="spec">DROPDOWN / 分析模式</span>
                     <div class="dropdown">
-                        <button class="dropdown-trigger">
-                            <span>precise · 精确模式</span>
+                        <button class="dropdown-trigger" aria-haspopup="listbox" aria-expanded="false">
+                            <span>qwen3-vl-plus · 精确模式</span>
                             <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
                         </button>
-                        <div class="menu glass glass-thick">
-                            <button aria-selected="true" data-value="precise · 精确模式">qwen3-vl-plus · 精确<i class="ri-check"></i></button>
-                            <button aria-selected="false" data-value="fast · 快速模式">qwen3-vl-flash · 快速<i class="ri-check"></i></button>
+                        <div class="menu glass glass-thick" role="listbox" aria-label="分析模式">
+                            <button role="option" aria-selected="true" data-value="qwen3-vl-plus · 精确模式">qwen3-vl-plus · 精确模式<i class="ri-check-line" aria-hidden="true"></i></button>
+                            <button role="option" aria-selected="false" data-value="qwen3-vl-flash · 快速模式">qwen3-vl-flash · 快速模式<i class="ri-check-line" aria-hidden="true"></i></button>
                         </div>
                     </div>
                 </div>
@@ -244,8 +242,8 @@
                         <span style="font-size:13px;color:var(--ink-mid)">主动感知放大</span>
                     </div>
                     <div class="comp-row" style="margin-top:16px">
-                        <input type="range" class="slider" id="sl-cloud" min="0" max="100" value="20" style="flex:1">
-                        <span class="mono" data-slider-out="sl-cloud" style="color:var(--spectral-cyan)">20</span>
+                        <input type="range" class="slider" id="sl-cloud" min="0" max="100" value="20" style="flex:1" aria-label="云量上限百分比">
+                        <span class="mono" data-slider-out="sl-cloud" style="color:var(--glacier)">20</span>
                         <span class="spec">云量上限 %</span>
                     </div>
                 </div>
@@ -254,7 +252,7 @@
                     <div class="comp-row">
                         <span class="chip chip-gold">SENTINEL-2</span>
                         <span class="chip chip-ember">L2A</span>
-                        <button class="btn" data-tip="Element84 Earth Search + TiTiler"><i class="ri-information-line" aria-hidden="true"></i>溯源</button>
+                        <button class="btn" data-tip="Element84 Earth Search + TiTiler" data-tip-pos="bottom" aria-label="影像数据源溯源信息"><i class="ri-information-line" aria-hidden="true"></i>溯源</button>
                         <button class="btn" data-toast="影像场景已缓存，可直接进入分析"><i class="ri-notification-3-line" aria-hidden="true"></i>模拟通知</button>
                     </div>
                 </div>
@@ -273,12 +271,12 @@
             <div class="stage scan-stage">
                 <div class="brackets" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
                 <div class="scan-beam" aria-hidden="true"></div>
-                <span class="stage-readout mono">SWATH SCAN · 64%</span>
+                <span class="stage-readout mono" id="scan-readout">SWATH SCAN · 0%</span>
                 <span class="stage-caption spec">推扫扫描 · 影像获取 / AI 分析加载态</span>
             </div>
             <div class="comp-row" style="margin-top:20px">
                 <button class="btn" id="cascade-btn"><i class="ri-play-line" aria-hidden="true"></i>播放级联入场</button>
-                <button class="btn-portal"><span><i class="ri-rocket-2-line" aria-hidden="true"></i>进入工作台</span></button>
+                <a class="btn-portal" href="/workbench/"><span><i class="ri-rocket-2-line" aria-hidden="true"></i>进入工作台</span></a>
             </div>
             <div class="cascade-row">
                 <div class="cascade-item glass glass-thin">A1</div>
@@ -322,13 +320,13 @@
                 <div class="proto-panel glass">
                     <span class="spec">AGENT TIMELINE / 调查进度</span>
                     <div class="timeline">
-                        <div class="t-step"><span class="t-dot">01</span><span class="t-label">解析目标</span></div>
-                        <div class="t-step"><span class="t-dot">02</span><span class="t-label">定位区域</span></div>
-                        <div class="t-step"><span class="t-dot">03</span><span class="t-label">选择影像源</span></div>
-                        <div class="t-step"><span class="t-dot">04</span><span class="t-label">获取影像</span></div>
-                        <div class="t-step"><span class="t-dot">05</span><span class="t-label">NDWI 计算</span></div>
-                        <div class="t-step"><span class="t-dot">06</span><span class="t-label">AI 解译</span></div>
-                        <div class="t-step"><span class="t-dot">07</span><span class="t-label">复核结论</span></div>
+                        <div class="t-step"><span class="t-dot">01</span><span class="t-label">解析</span></div>
+                        <div class="t-step"><span class="t-dot">02</span><span class="t-label">定位</span></div>
+                        <div class="t-step"><span class="t-dot">03</span><span class="t-label">选源</span></div>
+                        <div class="t-step"><span class="t-dot">04</span><span class="t-label">取像</span></div>
+                        <div class="t-step"><span class="t-dot">05</span><span class="t-label">NDWI</span></div>
+                        <div class="t-step"><span class="t-dot">06</span><span class="t-label">解译</span></div>
+                        <div class="t-step"><span class="t-dot">07</span><span class="t-label">复核</span></div>
                     </div>
                     <p style="margin:22px 0 0;font-size:12.5px;color:var(--ink-low)">时间线自动推进演示：公开可观察的进度，不暴露内部推理。</p>
                 </div>
@@ -356,12 +354,12 @@
         <footer class="footer">
             <div class="rule" aria-hidden="true"></div>
             <p class="spec">SPECTRA · SatelliteSense Design System · Direction B 平流层玻璃</p>
-            <p>验收通过后，此系统将施加于 / 落地页与 /workbench/ 工作台</p>
+            <p>本系统已上线，正施加于 / 落地页与 /workbench/ 工作台</p>
         </footer>
     </main>
 
     <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
-    <script src="/static/design.js?v=1"></script>
+    <script src="/static/design.js?v=2"></script>
 </body>
 </html>
 

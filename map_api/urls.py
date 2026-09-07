@@ -3,6 +3,9 @@ from . import views
 
 urlpatterns = [
     path('system/health/', views.system_health, name='system_health'),
+    path('system/dependencies/', views.system_dependencies, name='system_dependencies'),
+    path('system/dependencies/probe/', views.system_dependencies_probe, name='system_dependencies_probe'),
+    path('analysis/indices/', views.spectral_indices_catalog, name='spectral_indices_catalog'),
     path('satellite/get-img/', views.get_satellite_img_api, name='get_satellite_img'),
     path('satellite/get-sentinel-img/', views.get_sentinel_img_api, name='get_sentinel_img'),
     path('satellite/show-img/', views.show_satellite_image, name='show_satellite_image'),
@@ -14,6 +17,9 @@ urlpatterns = [
     path('imagery/scenes/<int:scene_id>/', views.imagery_scene_detail, name='imagery_scene_detail'),
     path('agent/sessions/', views.agent_session_list, name='agent_session_list'),
     path('agent/sessions/<int:session_id>/', views.agent_session_detail, name='agent_session_detail'),
+    path('agent/sessions/<int:session_id>/events/', views.agent_session_events, name='agent_session_events'),
+    path('agent/sessions/<int:session_id>/events/stream/', views.agent_session_events_stream, name='agent_session_events_stream'),
+    path('agent/sessions/<int:session_id>/transcript/', views.agent_session_transcript, name='agent_session_transcript'),
     path('agent/sessions/<int:session_id>/messages/', views.agent_session_messages, name='agent_session_messages'),
     path('ai/query-region/', views.ai_query_region, name='ai_query_region'),
     path('ai/history/', views.chat_history_list, name='chat_history_list'),

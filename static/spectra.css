@@ -29,7 +29,7 @@
   /* 墨色：玻璃上的暖白 */
   --ink-hi: #F2EEE6;
   --ink-mid: rgba(242, 238, 230, .62);
-  --ink-low: rgba(242, 238, 230, .38);
+  --ink-low: rgba(242, 238, 230, .5);
   --ink-faint: rgba(242, 238, 230, .22);
 
   /* 三级玻璃材质 */
@@ -88,7 +88,8 @@ body {
   font: 300 15px/1.7 var(--font-body);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  overflow-x: hidden;
+  /* clip 不产生滚动容器，保住后代 sticky（原 hidden 会杀死 sticky） */
+  overflow-x: clip;
 }
 
 ::selection { background: rgba(228, 179, 106, .3); color: #FFF8EA; }
@@ -280,7 +281,8 @@ body {
 
 .btn:active { transform: translateY(0) scale(.97); }
 
-.btn .ri { font-size: 15px; }
+/* remixicon 无基类 .ri，图标类名均为 ri-*，用属性选择器命中 */
+.btn [class^="ri-"], .btn [class*=" ri-"] { font-size: 15px; }
 
 .btn-primary {
   background: linear-gradient(135deg, rgba(228, 179, 106, .2), rgba(224, 138, 90, .12));
@@ -298,17 +300,22 @@ body {
   box-shadow: 0 0 24px -6px rgba(224, 125, 125, .4);
 }
 
-/* 传送门按钮：流光描边 CTA */
+/* 传送门按钮：流光描边 CTA（可作 <button> 或 <a> 使用） */
 .btn-portal {
   position: relative;
+  display: inline-block;
   border: none;
   padding: 1px;
   border-radius: var(--r-pill);
+  text-decoration: none;
   background: conic-gradient(from var(--caustic-angle),
       rgba(228, 179, 106, .85), rgba(183, 165, 232, .5),
       rgba(224, 138, 90, .8), rgba(228, 179, 106, .85));
   animation: caustic-spin 6s linear infinite;
   cursor: pointer;
+  transition: transform var(--dur-ui) var(--ease-orbital),
+              box-shadow var(--dur-ui) var(--ease-orbital),
+              filter var(--dur-ui) var(--ease-orbital);
 }
 
 .btn-portal > span {
@@ -322,6 +329,12 @@ body {
   font: 400 14px var(--font-body);
   letter-spacing: .05em;
   transition: background var(--dur-ui);
+}
+
+.btn-portal:hover {
+  transform: translateY(-2px);
+  filter: brightness(1.15);
+  box-shadow: 0 10px 34px -8px rgba(228, 179, 106, .55);
 }
 
 .btn-portal:hover > span { background: rgba(20, 20, 30, .78); }
@@ -388,7 +401,7 @@ body {
   box-shadow: 0 0 0 3px rgba(228, 179, 106, .08), 0 0 24px -8px rgba(228, 179, 106, .35);
 }
 
-.field .ri { color: var(--ink-low); font-size: 15px; }
+.field [class^="ri-"], .field [class*=" ri-"] { color: var(--ink-low); font-size: 15px; }
 
 .field input {
   flex: 1;
@@ -423,9 +436,10 @@ body {
 
 .dropdown-trigger:hover { border-color: rgba(228, 179, 106, .35); }
 
-.dropdown-trigger .ri { color: var(--ink-low); transition: transform var(--dur-ui); }
+.dropdown-trigger [class^="ri-"], .dropdown-trigger [class*=" ri-"] { color: var(--ink-low); transition: transform var(--dur-ui); }
 
-.dropdown.open .dropdown-trigger .ri { transform: rotate(180deg); }
+.dropdown.open .dropdown-trigger [class^="ri-"],
+.dropdown.open .dropdown-trigger [class*=" ri-"] { transform: rotate(180deg); }
 
 .menu {
   position: absolute;
@@ -468,9 +482,9 @@ body {
   transform: translateX(3px);
 }
 
-.menu button .ri-check { margin-left: auto; opacity: 0; color: var(--gold); }
+.menu button .ri-check-line { margin-left: auto; opacity: 0; color: var(--gold); }
 .menu button[aria-selected="true"] { color: var(--gold); }
-.menu button[aria-selected="true"] .ri-check { opacity: 1; }
+.menu button[aria-selected="true"] .ri-check-line { opacity: 1; }
 /* --------------------------------------------------------------------------
    组件：开关
    -------------------------------------------------------------------------- */
@@ -566,6 +580,10 @@ body {
    -------------------------------------------------------------------------- */
 [data-tip] { position: relative; }
 
+/* 按钮自身 backdrop-filter 会建层叠上下文困住 ::after，触发时提升本体压住后续兄弟 */
+[data-tip]:hover,
+[data-tip]:focus-visible { z-index: var(--z-transient); }
+
 [data-tip]::after {
   content: attr(data-tip);
   position: absolute;
@@ -588,7 +606,21 @@ body {
   z-index: var(--z-transient);
 }
 
-[data-tip]:hover::after {
+[data-tip]:hover::after,
+[data-tip]:focus-visible::after {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* 下方弹出变体：避免压住面板上方的标签 */
+[data-tip-pos="bottom"]::after {
+  bottom: auto;
+  top: calc(100% + 10px);
+  transform: translateX(-50%) translateY(-4px);
+}
+
+[data-tip-pos="bottom"]:hover::after,
+[data-tip-pos="bottom"]:focus-visible::after {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
@@ -598,7 +630,7 @@ body {
    -------------------------------------------------------------------------- */
 .toast-zone {
   position: fixed;
-  top: 28px;
+  top: 86px;
   left: 50%;
   transform: translateX(-50%);
   z-index: var(--z-transient);
@@ -618,8 +650,9 @@ body {
   animation: toast-in var(--dur-scene) var(--ease-spring);
 }
 
-.toast .ri { color: var(--sage); font-size: 16px; }
-.toast-amber .ri { color: var(--ember); }
+.toast [class^="ri-"], .toast [class*=" ri-"] { color: var(--sage); font-size: 16px; }
+.toast-amber [class^="ri-"], .toast-amber [class*=" ri-"] { color: var(--ember); }
+.toast-error [class^="ri-"], .toast-error [class*=" ri-"] { color: var(--cinnabar); }
 
 .toast.out {
   opacity: 0;
@@ -630,6 +663,19 @@ body {
 
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(-16px) scale(.94); filter: blur(8px); }
+}
+
+/* --------------------------------------------------------------------------
+   移动端性能：玻璃降模糊（backdrop-filter 是移动端大头），极光同步降模糊
+   -------------------------------------------------------------------------- */
+@media (max-width: 720px) {
+  :root {
+    --glass-thin-blur: 12px;
+    --glass-regular-blur: 14px;
+    --glass-thick-blur: 16px;
+  }
+
+  .aurora i { filter: blur(44px); }
 }
 
 /* --------------------------------------------------------------------------

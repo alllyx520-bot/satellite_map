@@ -21,6 +21,10 @@ http://101.200.128.20:8083/
 The external nginx port is `8083`; Gunicorn stays internal on
 `127.0.0.1:8010`.
 
+生产 Agent 建议在 `.env` 开启 `AGENT_AUTO_SOURCE_FALLBACK=1`：Sentinel-2
+检索失败或覆盖不足时，Agent 会自动尝试 Mapbox，并在结果中保留降级原因。
+执行事件可通过 `/api/agent/sessions/<id>/events/?after=<cursor>` 断线续传。
+
 Never commit, upload to git, paste, or print the private key content. It is OK
 to use the key path in local commands.
 
@@ -148,7 +152,9 @@ CORS_ALLOW_ALL_ORIGINS=true
 
 MAPBOX_TOKEN=replace-me
 DASHSCOPE_API_KEY=replace-me
-DEEPSEEK_API_KEY=replace-me
+GLM_API_KEY=replace-me
+AGENT_MODEL=glm-5.3-flash
+GLM_CHAT_URL=https://open.bigmodel.cn/api/paas/v4/chat/completions
 AMAP_KEY=replace-me
 TITILER_ENDPOINT=https://titiler.xyz
 
@@ -160,10 +166,22 @@ AGENT_SENTINEL_CANDIDATE_LIMIT=15
 # IP rate limiting (protects paid API endpoints; defaults shown)
 RATELIMIT_API_PER_MINUTE=120
 RATELIMIT_AI_PER_MINUTE=30
+RATELIMIT_BACKEND=database
 # RATELIMIT_DISABLED=1   # uncomment only for offline demos
+# Agent 长任务交给持久化 worker；不要依赖 Web 进程 daemon thread
+AGENT_EXECUTION_MODE=queue
 EOF
 chmod 600 .env
 ```
+
+`RATELIMIT_BACKEND=database` 使用共享令牌桶，Gunicorn 多 worker 不会各自放大额度。
+客户端标识以 `DJANGO_SECRET_KEY` 做 HMAC 后入库，不保存原始 IP。数据库临时不可用时
+会记录 warning 并降级到进程内限流，不会因此让全部业务接口返回 500。
+
+该设置同时覆盖 Agent 调查、Mapbox 影像下载和 Agent Word 报告。报告任务使用
+数据库中的 `ReportJob` 持久化，下载使用 `DownloadTask` 租约和临时文件原子发布；
+worker 异常退出后会按 `--claim-timeout` 接管。不要把
+生产值改回 `thread`，否则 Web reload 会中断进程内任务。
 
 Generate a Django secret if needed:
 
@@ -218,10 +236,14 @@ Stop the manual Gunicorn process with `Ctrl+C`.
 id www-data || useradd --system --no-create-home --shell /sbin/nologin www-data
 chown -R www-data:www-data /opt/satellitesense
 cp /opt/satellitesense/deploy/satellitesense.service /etc/systemd/system/satellitesense.service
+cp /opt/satellitesense/deploy/satellitesense-agent-worker.service /etc/systemd/system/satellitesense-agent-worker.service
 systemctl daemon-reload
 systemctl enable satellitesense
+systemctl enable satellitesense-agent-worker
 systemctl restart satellitesense
+systemctl restart satellitesense-agent-worker
 systemctl status satellitesense --no-pager
+systemctl status satellitesense-agent-worker --no-pager
 ```
 
 Logs:
@@ -282,7 +304,8 @@ python manage.py check
 chown -R www-data:www-data /opt/satellitesense
 systemctl restart satellitesense
 nginx -t && systemctl reload nginx
-# Restarting kills in-flight background download threads — mark their tasks as failed:
+# Restarting kills in-flight background threads: mark downloads failed and release Agent leases,
+# the persistent worker service will recover released Agent sessions.
 python manage.py cleanup_stale_tasks --minutes 1
 ```
 
@@ -291,9 +314,10 @@ python manage.py cleanup_stale_tasks --minutes 1
 ```bash
 cd /opt/satellitesense
 source .venv/bin/activate
-# Mark tasks stuck in "downloading" (worker was restarted mid-download) as error:
+# Mark stuck downloads error and release stale Agent leases for worker recovery:
 python manage.py cleanup_stale_tasks --dry-run
 python manage.py cleanup_stale_tasks --minutes 10
+# satellitesense-agent-worker.service continuously scans and recovers released sessions.
 # Delete media files older than 30 days (+ their DB rows); preview first:
 python manage.py cleanup_media --age 30 --dry-run
 python manage.py cleanup_media --age 30
@@ -365,7 +389,7 @@ curl http://127.0.0.1:8010/api/system/health/
 Verify `.env` contains:
 
 ```text
-DEEPSEEK_API_KEY
+GLM_API_KEY
 DASHSCOPE_API_KEY
 AMAP_KEY
 ```

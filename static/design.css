@@ -33,7 +33,7 @@ html { overflow-x: clip; }
   margin: 18px auto 0;
   padding: 10px 18px;
   border-radius: var(--r-pill);
-  max-width: 1160px;
+  width: min(1160px, calc(100vw - 32px));
 }
 
 .nav .mark {
@@ -44,7 +44,7 @@ html { overflow-x: clip; }
   color: var(--ink-hi);
 }
 
-.nav .mark .ri {
+.nav .mark [class^="ri-"], .nav .mark [class*=" ri-"] {
   font-size: 19px;
   color: var(--gold);
   filter: drop-shadow(0 0 8px rgba(228, 179, 106, .7));
@@ -113,6 +113,8 @@ html { overflow-x: clip; }
   letter-spacing: .35em;
   display: block;
   margin-top: 14px;
+  /* 末字符 trailing letter-spacing 会把居中拉偏，负右边距补偿 */
+  margin-right: -.35em;
   background: none;
   color: var(--ink-mid);
   -webkit-text-fill-color: var(--ink-mid);
@@ -254,13 +256,19 @@ html { overflow-x: clip; }
 .comp-panel { padding: 30px 32px; }
 .comp-panel + .comp-panel { margin-top: 16px; }
 
+/* .glass 的 isolation:isolate 会困住菜单层叠，面板打开下拉时整体提升 */
+.comp-panel:has(.dropdown.open) {
+  position: relative;
+  z-index: var(--z-transient);
+}
+
 .comp-panel > .spec { display: block; margin-bottom: 18px; }
 
 .comp-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 
 .comp-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
   gap: 16px;
 }
 
@@ -279,14 +287,14 @@ html { overflow-x: clip; }
 
 .stage .stage-caption {
   position: absolute;
-  left: 18px;
+  left: 42px;
   bottom: 14px;
   z-index: 3;
 }
 
 .stage .stage-readout {
   position: absolute;
-  right: 18px;
+  right: 42px;
   top: 14px;
   z-index: 3;
   font: 500 12px var(--font-mono);
@@ -361,7 +369,7 @@ html { overflow-x: clip; }
 /* ---------------------------------------------------------------- 业务原型 */
 .proto-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(330px, 100%), 1fr));
   gap: 16px;
   align-items: start;
 }
@@ -369,8 +377,19 @@ html { overflow-x: clip; }
 .proto-panel { padding: 24px; }
 .proto-panel > .spec { display: block; margin-bottom: 16px; }
 
+/* 原型面板内的说明文字 */
+.proto-note { margin: 0; font-size: 13.5px; color: var(--ink-mid); }
+
 /* 时间线 */
-.timeline { display: flex; align-items: flex-start; padding: 8px 0 2px; }
+.timeline {
+  display: flex;
+  align-items: flex-start;
+  padding: 8px 0 2px;
+  transition: opacity .45s var(--ease-orbital);
+}
+
+/* 一轮走完后的淡出重置态 */
+.timeline.tl-reset { opacity: 0; }
 
 .t-step {
   flex: 1;
@@ -421,7 +440,7 @@ html { overflow-x: clip; }
   animation: breathe 2s ease-in-out infinite;
 }
 
-.t-label { font: 300 11.5px var(--font-body); color: var(--ink-low); line-height: 1.4; }
+.t-label { font: 300 11.5px var(--font-body); color: var(--ink-low); line-height: 1.4; white-space: nowrap; }
 .t-step.active .t-label { color: var(--ink-hi); }
 
 @keyframes breathe {
@@ -518,7 +537,7 @@ html { overflow-x: clip; }
 .h-item { display: flex; flex-direction: column; gap: 3px; }
 
 .h-k {
-  font: 500 9.5px var(--font-mono);
+  font: 500 10.5px var(--font-mono);
   letter-spacing: .16em;
   color: var(--ink-low);
   text-transform: uppercase;
@@ -539,10 +558,22 @@ html { overflow-x: clip; }
 
 .footer p { margin: 6px 0; font-size: 12.5px; }
 
+/* ---------------------------------------------------------------- 滚动揭示
+   仅当 JS 武装（.reveal-armed）后才隐藏：IO 不可用 / 未触发时保底可见 */
+[data-reveal].reveal-armed { opacity: 0; }
+
+@media print {
+  [data-reveal] { opacity: 1 !important; transform: none !important; filter: none !important; }
+}
+
 /* ---------------------------------------------------------------- 响应式 */
 @media (max-width: 720px) {
   .page { padding: 0 18px 100px; }
   .hero { padding: 70px 0 60px; }
+  .hero .kicker { letter-spacing: .18em; }
+  .nav { gap: 10px; padding: 10px 14px; }
+  /* 次要 chip 让位，保住「返回首页」 */
+  .nav .chip { display: none; }
   .type-panel, .comp-panel { padding: 22px; }
   .type-display { font-size: 28px; }
   .timeline { flex-wrap: wrap; gap: 14px; }

@@ -40,6 +40,11 @@ class Command(BaseCommand):
             help="Also call the public Sentinel-2 search/render service. This depends on external network availability.",
         )
         parser.add_argument(
+            "--live-agent-grid",
+            action="store_true",
+            help="调用 Agent 的大范围 Sentinel 网格检索/拼接路径。耗时较长，依赖公开 Earth Search/TiTiler。",
+        )
+        parser.add_argument(
             "--live-mapbox",
             action="store_true",
             help="Also call the live Mapbox download workflow and poll progress. Requires MAPBOX_TOKEN.",
@@ -58,6 +63,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         keep_artifacts = options["keep_artifacts"]
         live_sentinel = options["live_sentinel"]
+        live_agent_grid = options["live_agent_grid"]
         live_mapbox = options["live_mapbox"]
         live_ai = options["live_ai"]
         run_agent = options["agent"]
@@ -66,6 +72,7 @@ class Command(BaseCommand):
         file_name = f"smoke_{smoke_id}.jpg"
         report_name = ""
         live_sentinel_file = ""
+        live_agent_grid_file = ""
         live_mapbox_file = ""
         agent_session_id = None
         agent_file = ""
@@ -140,6 +147,16 @@ class Command(BaseCommand):
                 ChatHistory.objects.filter(image_file=live_sentinel_file).delete()
                 ImageryScene.objects.filter(file_name=live_sentinel_file).delete()
                 _download_progress.pop(live_sentinel_file, None)
+            if live_agent_grid_file:
+                grid_path = os.path.join(save_dir, live_agent_grid_file)
+                if os.path.exists(grid_path):
+                    os.remove(grid_path)
+                grid_scene = ImageryScene.objects.filter(file_name=live_agent_grid_file).first()
+                if grid_scene:
+                    DownloadTask.objects.filter(scene=grid_scene).delete()
+                    ChatHistory.objects.filter(scene=grid_scene).delete()
+                    grid_scene.delete()
+                _download_progress.pop(live_agent_grid_file, None)
             if live_mapbox_file:
                 live_path = os.path.join(save_dir, live_mapbox_file)
                 if os.path.exists(live_path):
@@ -234,6 +251,8 @@ class Command(BaseCommand):
                     steps.append(("live_mapbox", lambda: self._check_live_mapbox(client, require, response_json)))
                 if live_sentinel:
                     steps.append(("live_sentinel", lambda: self._check_live_sentinel(client, require, response_json)))
+                if live_agent_grid:
+                    steps.append(("live_agent_grid", lambda: self._check_live_agent_grid(require)))
                 if run_agent:
                     steps.append(("agent", lambda: self._check_agent(client, require, response_json)))
 
@@ -247,19 +266,22 @@ class Command(BaseCommand):
                         report_name = results[-1]["data"]["report_name"]
                     if step_id == "live_sentinel":
                         live_sentinel_file = results[-1]["data"]["file_name"]
+                    if step_id == "live_agent_grid":
+                        live_agent_grid_file = results[-1]["data"]["file_name"]
                     if step_id == "live_mapbox":
                         live_mapbox_file = results[-1]["data"]["file_name"]
                     if step_id == "agent":
                         agent_session_id = results[-1]["data"]["session_id"]
                         agent_file = results[-1]["data"].get("file_name", "")
 
-            expected_steps = 5 + int(live_mapbox) + int(live_sentinel) + int(run_agent)
+            expected_steps = 5 + int(live_mapbox) + int(live_sentinel) + int(live_agent_grid) + int(run_agent)
             status = "passed" if all(item["ok"] for item in results) and len(results) == expected_steps else "failed"
             output = {
                 "status": status,
                 "smoke_id": smoke_id,
                 "kept_artifacts": keep_artifacts,
                 "live_sentinel": live_sentinel,
+                "live_agent_grid": live_agent_grid,
                 "live_mapbox": live_mapbox,
                 "live_ai": live_ai,
                 "agent": run_agent,
@@ -270,6 +292,7 @@ class Command(BaseCommand):
                     "history_id": history_id,
                     "report_file": report_name,
                     "live_sentinel_file": live_sentinel_file,
+                    "live_agent_grid_file": live_agent_grid_file,
                     "live_mapbox_file": live_mapbox_file,
                     "agent_session_id": agent_session_id,
                     "agent_file": agent_file,
@@ -411,6 +434,42 @@ class Command(BaseCommand):
             "selection": payload["scene"].get("selection"),
         }
 
+    def _check_live_agent_grid(self, require):
+        from map_api.orchestrator import _agent_fetch_sentinel
+        from map_api.agent.tools import _tool_compute_ndwi
+
+        # 南宁市级 bbox，用于触发 Agent 大范围网格策略；不经过 mock。
+        bbox = {"min_lng": 107.45, "min_lat": 22.35, "max_lng": 108.75, "max_lat": 23.05}
+        scene, candidate, retrieval = _agent_fetch_sentinel(bbox, {"date_start": None, "date_end": None}, force_grid=True)
+        require(scene is not None, "Agent 网格未生成场景")
+        metadata = scene.metadata or {}
+        require(metadata.get("grid_mosaic") is True, "大范围未触发 grid_mosaic")
+        grid_shape = metadata.get("grid_shape") or {}
+        require(int(grid_shape.get("columns", 0)) >= 2 and int(grid_shape.get("rows", 0)) >= 2, "网格形状无效")
+        items = metadata.get("mosaic_items") or []
+        with_bbox = [item for item in items if isinstance(item, dict) and item.get("tile_bbox")]
+        require(len(with_bbox) == len(items) and len(items) >= 2, "mosaic_items 缺少完整 tile_bbox")
+        require(float(metadata.get("target_coverage_ratio") or 0) >= 0.60, "网格覆盖率低于门禁")
+        require(float(metadata.get("valid_image_ratio") or 0) >= 0.60, "网格有效像素率低于门禁")
+        ndwi = _tool_compute_ndwi(
+            {"scene_id": scene.id, "file_name": scene.file_name, "bbox": bbox},
+            {},
+        ).get("result") or {}
+        require(ndwi.get("available") is True, f"网格 NDWI 失败: {ndwi}")
+        require(int(ndwi.get("grid_count") or 0) >= 2, "网格 NDWI 未按多个网格汇总")
+        return {
+            "file_name": scene.file_name,
+            "scene_id": scene.id,
+            "grid_shape": grid_shape,
+            "grid_items": len(items),
+            "target_coverage_ratio": metadata.get("target_coverage_ratio"),
+            "valid_image_ratio": metadata.get("valid_image_ratio"),
+            "candidate_count": (retrieval or {}).get("candidate_count"),
+            "ndwi_water_percent": ndwi.get("water_percent"),
+            "ndwi_grid_count": ndwi.get("grid_count"),
+            "ndwi_sample_size_px": ndwi.get("sample_size_px"),
+        }
+
     def _check_live_mapbox(self, client, require, response_json):
         resp = client.post(
             "/api/satellite/get-img/",
@@ -448,6 +507,37 @@ class Command(BaseCommand):
             "done": progress_data.get("done"),
             "failed": progress_data.get("failed"),
         }
+
+    def _agent_smoke_script(self):
+        steps_for = {
+            "geocode_place": "locate",
+            "search_sentinel_imagery": "retrieve_imagery",
+            "compute_ndwi": "ndwi",
+            "analyze_imagery": "vl_analysis",
+        }
+
+        def call(name, current_step=None):
+            return {
+                "thought": f"调用 {name}",
+                "current_step": current_step or steps_for.get(name, "understand"),
+                "plan": None,
+                "tool_call": {"name": name, "args": {}},
+                "final_answer": None,
+            }
+
+        return [
+            call("geocode_place", "locate"),
+            call("search_sentinel_imagery", "retrieve_imagery"),
+            call("compute_ndwi", "ndwi"),
+            call("analyze_imagery", "vl_analysis"),
+            {
+                "thought": "整理复核结论",
+                "current_step": "complete",
+                "plan": None,
+                "tool_call": None,
+                "final_answer": "Agent 复核结论：水体线索明确，NDWI 仅作辅助筛查。",
+            },
+        ]
 
     def _check_agent(self, client, require, response_json):
         buf_path = None
@@ -504,7 +594,7 @@ class Command(BaseCommand):
                     "limitations": "轻量 NDWI 仅用于 bbox 内水体线索筛查。",
                 }), \
                 patch("map_api.views._call_qwen", return_value=_fake_qwen_response("<answer>水体主要分布在河道和坑塘。</answer>")), \
-                patch("map_api.views.call_deepseek", return_value="Agent 复核结论：水体线索明确，NDWI 仅作辅助筛查。"):
+                patch("map_api.agent.loop.agent_step", side_effect=self._agent_smoke_script()):
             resp = client.post(
                 "/api/agent/sessions/",
                 data={"goal": "帮我调查南宁市在2026年四月的水体情况", "sync": True},

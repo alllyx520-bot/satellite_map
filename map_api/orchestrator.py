@@ -2,7 +2,7 @@
 
 受控而非全自主的调查流水线:槽位/计划解析 → 行政区定位 → 源选择 →
 影像检索(Sentinel-2 多景拼接/Mapbox 高清)→ 质量门控(时相/云量,可等待用户确认)→
-NDWI 轻量量化 → VL 解译 → DeepSeek 复核 → 结果整理与历史落库。
+NDWI 轻量量化 → Qwen VL 专业解译 → GLM-5.3-Flash 复核 → 结果整理与历史落库。
 observer 只给公开推理摘要(current_label/public_thought/doing/next/plan_steps),
 私有思维链一律不外泄。
 
@@ -15,15 +15,23 @@ import logging
 import os
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
 import requests
 
-from django.db import close_old_connections
+from django.db import close_old_connections, transaction
 from django.utils import timezone
 
-from . import views as _views   # 运行时查找可 patch 名;仅调用期访问属性,无循环导入
-from .geo_math import compute_image_plan
+class _ViewsProxy:
+    """惰性访问 views，避免 orchestrator/agent.tools/views 顶层循环导入。"""
+    def __getattr__(self, name):
+        from . import views
+        return getattr(views, name)
+
+
+_views = _ViewsProxy()
+from .geo_math import compute_image_plan, bbox_intersection_ratio, bbox_union_coverage_ratio, crop_sentinel_nodata_border, image_valid_ratio
 from .imagery_sources.earth_search import EarthSearchProvider
 from .imagery_sources.mapbox import MapboxProvider
 from .media_paths import SAVE_DIR
@@ -32,7 +40,10 @@ from .payloads import (
     _scene_source_key, imagery_quality_payload, scene_brief_payload,
     scene_payload, sentinel_retrieval_timeline_payload,
 )
-from .sentinel_pipeline import sentinel_retrieval_result
+from .sentinel_pipeline import (
+    sentinel_retrieval_result, compose_sentinel_grid, scene_from_sentinel_mosaic,
+    create_done_download_task, sentinel_mosaic_cache_key,
+)
 from .utils.agent_tools import AGENT_MODEL, build_agent_plan
 from .utils.get_satellite_image import _download_progress, fetch_satellite_image
 
@@ -50,7 +61,7 @@ AGENT_STAGE_PUBLIC_THOUGHTS = {
     "quality_check": "我会先检查时相、云量、分辨率和证据等级，防止用不合适的影像做过度结论。",
     "ndwi": "水体任务需要一个轻量定量线索，所以我会计算 NDWI，但只把它作为筛查指标。",
     "vl_analysis": "我把影像和上下文交给视觉模型解译，让它给出可见地物、空间格局和风险线索。",
-    "review": "我用 DeepSeek 对视觉结论做复核，重点检查证据边界、时效性和是否夸大。",
+    "review": "我用 GLM 对视觉结论做复核，重点检查证据边界、时效性和是否夸大。",
     "complete": "我正在把影像、量化结果、模型结论和限制条件整理成可保存、可报告的结果。",
     "failed": "我已经停止当前调查，并把失败原因保留下来，方便继续排查。",
 }
@@ -61,15 +72,28 @@ AGENT_OBSERVER_DEFAULT_STEPS = [
     {"id": "retrieve_imagery", "label": "检索并生成影像"},
     {"id": "quality_check", "label": "检查影像质量"},
     {"id": "vl_analysis", "label": "视觉模型解译"},
-    {"id": "review", "label": "DeepSeek 结论复核"},
+    {"id": "review", "label": "GLM 结论复核"},
     {"id": "complete", "label": "整理结果"},
 ]
 
 
 def agent_session_payload(session):
+    artifacts = dict(session.artifacts or {})
+    # 行政区 polygon 可能有数千点；完整几何保留在数据库供计算，公开轮询只返回摘要。
+    public_scene = artifacts.get("scene")
+    if isinstance(public_scene, dict):
+        public_scene = dict(public_scene)
+        metadata = dict(public_scene.get("metadata") or {})
+        polygon = metadata.pop("district_polygon", None)
+        if polygon is not None:
+            metadata["district_polygon_points"] = sum(len(r) for r in polygon if isinstance(r, list))
+        public_scene["metadata"] = metadata
+        artifacts["scene"] = public_scene
     return {
         "id": session.id,
+        "request_id": session.request_id,
         "status": session.status,
+        "cancel_requested": bool(session.cancel_requested),
         "goal": session.goal,
         "mode": session.mode,
         "slots": session.slots,
@@ -77,7 +101,7 @@ def agent_session_payload(session):
         "timeline": session.timeline,
         "observer": (session.artifacts or {}).get("observer") or {},
         "messages": session.messages,
-        "artifacts": session.artifacts,
+        "artifacts": artifacts,
         "error": session.error,
         "scene_id": session.scene_id,
         "history_id": session.history_id,
@@ -86,9 +110,46 @@ def agent_session_payload(session):
     }
 
 
+def execution_events_payload(session, after=None, limit=100):
+    """为断线重连 UI 提供单调游标事件流。"""
+    from .models import ExecutionEvent
+    qs = ExecutionEvent.objects.filter(session_id=session.id).order_by("sequence")
+    if after is not None:
+        try:
+            qs = qs.filter(sequence__gt=max(-1, int(after)))
+        except (TypeError, ValueError):
+            pass
+    rows = list(qs[: max(1, min(int(limit or 100), 200))])
+    from .agent.events import event_dict
+    return {
+        "events": [event_dict(e) for e in rows],
+        "next_cursor": rows[-1].sequence if rows else after,
+    }
+
+
 def _agent_observer_payload(session, step_id, label, status, message, data=None):
     plan_steps = []
-    raw_steps = (session.plan or {}).get("steps") or AGENT_OBSERVER_DEFAULT_STEPS
+    raw_steps = (session.plan or {}).get("steps") or []
+    default_ids = [item["id"] for item in AGENT_OBSERVER_DEFAULT_STEPS]
+    if (session.slots or {}).get("task") == "water" and "ndwi" not in default_ids:
+        default_ids.insert(default_ids.index("vl_analysis"), "ndwi")
+    raw_ids = [item.get("id") for item in raw_steps if isinstance(item, dict)]
+    # 初始 deterministic 计划只是兼容数据，不是模型真实动态计划；
+    # 若它完整等同固定阶段列表，则只投影已发生的 timeline/current 步骤。
+    if raw_ids == default_ids:
+        raw_steps = []
+    if not raw_steps:
+        # 没有模型计划时仅投影已经写入 timeline 的步骤和当前步骤，
+        # 不再向用户展示未来固定 pending 阶段。
+        seen = []
+        for item in (session.timeline or []):
+            sid = item.get("id") if isinstance(item, dict) else None
+            if sid and sid not in seen:
+                seen.append(sid)
+        if step_id and step_id not in seen:
+            seen.append(step_id)
+        labels = {item["id"]: item["label"] for item in AGENT_OBSERVER_DEFAULT_STEPS}
+        raw_steps = [{"id": sid, "label": labels.get(sid, sid)} for sid in seen]
     timeline = session.timeline or []
     for step in raw_steps:
         if not step:
@@ -136,51 +197,103 @@ def _agent_observer_payload(session, step_id, label, status, message, data=None)
 
 
 def _agent_set_observer(session, step_id, label, status, message="", data=None):
-    artifacts = dict(session.artifacts or {})
-    artifacts["observer"] = _agent_observer_payload(session, step_id, label, status, message, data)
-    session.artifacts = artifacts
-    session.save(update_fields=["artifacts", "updated_at"])
+    # 读-计算-写必须整体持有行锁；单独 refresh 后 save 仍有竞态窗口。
+    with transaction.atomic():
+        locked = AgentSession.objects.select_for_update().get(id=session.id)
+        artifacts = dict(locked.artifacts or {})
+        artifacts["observer"] = _agent_observer_payload(locked, step_id, label, status, message, data)
+        locked.artifacts = artifacts
+        locked.save(update_fields=["artifacts", "updated_at"])
+        session = locked
 
 
-def _agent_step(session, step_id, label, status="done", message="", data=None):
-    timeline = list(session.timeline or [])
-    item = {
-        "id": step_id,
-        "label": label,
-        "status": status,
-        "message": message,
-        "time": timezone.now().isoformat(),
-    }
-    if data is not None:
-        item["data"] = data
-    timeline.append(item)
-    session.timeline = timeline
-    artifacts = dict(session.artifacts or {})
-    artifacts["observer"] = _agent_observer_payload(session, step_id, label, status, message, data)
-    session.artifacts = artifacts
-    session.save(update_fields=["timeline", "artifacts", "updated_at"])
+def _agent_step(session, step_id, label, status="done", message="", data=None, expected_claim=None):
+    with transaction.atomic():
+        locked = AgentSession.objects.select_for_update().get(id=session.id)
+        if expected_claim and (locked.artifacts or {}).get("worker_claim") != expected_claim:
+            return False
+        timeline = list(locked.timeline or [])
+        item = {
+            "id": step_id,
+            "label": label,
+            "status": status,
+            "message": message,
+            "time": timezone.now().isoformat(),
+        }
+        if data is not None:
+            item["data"] = data
+        timeline.append(item)
+        locked.timeline = timeline
+        artifacts = dict(locked.artifacts or {})
+        artifacts["observer"] = _agent_observer_payload(locked, step_id, label, status, message, data)
+        locked.artifacts = artifacts
+        locked.save(update_fields=["timeline", "artifacts", "updated_at"])
+        session = locked
+    try:
+        from .agent.events import emit
+        emit(session.id, "quality_check" if step_id == "quality_check" else "checkpoint", {
+            "phase": step_id, "status": status, "summary": message or label,
+            "facts": data if isinstance(data, dict) else {},
+        }, expected_claim=expected_claim)
+    except Exception:
+        logger.debug("unable to append observer event", exc_info=True)
+    return True
 
 
 def _agent_fail(session, message):
-    _agent_set_observer(session, "failed", "任务失败", "failed", message)
-    session.status = AgentSession.STATUS_FAILED
-    session.error = message
-    messages = list(session.messages or [])
-    messages.append({"role": "assistant", "content": f"任务失败：{message}"})
-    session.messages = messages
-    session.save(update_fields=["status", "error", "messages", "updated_at"])
+    try:
+        with transaction.atomic():
+            locked = AgentSession.objects.select_for_update().get(id=session.id)
+            if locked.status == AgentSession.STATUS_COMPLETED:
+                return
+            timeline = list(locked.timeline or [])
+            artifacts = dict(locked.artifacts or {})
+            artifacts["observer"] = _agent_observer_payload(locked, "failed", "任务失败", "failed", message)
+            artifacts.pop("worker_claim", None)
+            artifacts.pop("worker_claimed_at", None)
+            locked.status = AgentSession.STATUS_FAILED
+            locked.error = message
+            locked.messages = list(locked.messages or []) + [{"role": "assistant", "content": f"任务失败：{message}"}]
+            locked.timeline = timeline
+            locked.artifacts = artifacts
+            locked.save(update_fields=["status", "error", "messages", "artifacts", "timeline", "updated_at"])
+            session = locked
+        try:
+            from .agent.events import emit
+            emit(session.id, "task_failed", {"phase": "failed", "status": "failed", "summary": message, "error": message})
+        except Exception:
+            logger.debug("unable to append failure event", exc_info=True)
+    except AgentSession.DoesNotExist:
+        logger.info("Agent session deleted before failure persistence: session=%s", getattr(session, "id", None))
+        return
 
 
-def _agent_wait(session, message, options=None, data=None, step_id="waiting_user", label="等待用户确认"):
-    session.status = AgentSession.STATUS_WAITING_USER
-    artifacts = dict(session.artifacts or {})
-    artifacts["waiting"] = {"message": message, "options": options or [], "data": data or {}}
-    artifacts["observer"] = _agent_observer_payload(session, step_id, label, "waiting_user", message, data)
-    session.artifacts = artifacts
-    messages = list(session.messages or [])
-    messages.append({"role": "assistant", "content": message, "options": options or []})
-    session.messages = messages
-    session.save(update_fields=["status", "artifacts", "messages", "updated_at"])
+def _agent_wait(session, message, options=None, data=None, step_id="waiting_user", label="等待用户确认", expected_claim=None):
+    with transaction.atomic():
+        locked = AgentSession.objects.select_for_update().get(id=session.id)
+        if locked.status in (AgentSession.STATUS_COMPLETED, AgentSession.STATUS_FAILED):
+            return
+        if expected_claim and (locked.artifacts or {}).get("worker_claim") != expected_claim:
+            return False
+        locked.status = AgentSession.STATUS_WAITING_USER
+        artifacts = dict(locked.artifacts or {})
+        artifacts["waiting"] = {"message": message, "options": options or [], "data": data or {}}
+        artifacts["observer"] = _agent_observer_payload(locked, step_id, label, "waiting_user", message, data)
+        artifacts.pop("worker_claim", None)
+        artifacts.pop("worker_claimed_at", None)
+        locked.artifacts = artifacts
+        locked.messages = list(locked.messages or []) + [{"role": "assistant", "content": message, "options": options or []}]
+        locked.save(update_fields=["status", "artifacts", "messages", "updated_at"])
+        session = locked
+    try:
+        from .agent.events import emit
+        emit(session.id, "user_confirmation_required", {
+            "phase": step_id, "status": "waiting_user", "summary": message,
+            "options": options or [], "data": data or {},
+        })
+    except Exception:
+        logger.debug("unable to append waiting event", exc_info=True)
+    return True
 
 
 def _agent_store_scene_artifacts(session, scene, bbox):
@@ -221,30 +334,51 @@ def _candidate_from_mosaic_metadata(item):
     })()
 
 
-def _run_agent_background(session_id, context=None):
-    threading.Thread(target=run_agent_session, args=(session_id, context or {}), daemon=True).start()
+def _run_agent_background(session_id, context=None, runner=None):
+    """启动 Agent 后台执行。
+
+    ``AGENT_EXECUTION_MODE=queue`` 时只保留数据库中的 running 租约，
+    由持久化 run_agent_worker 接管，避免 Web 进程重启丢失长任务。
+    默认 thread 模式保持本地开发兼容。
+    """
+    mode = str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower()
+    if mode in {"queue", "worker", "persistent"}:
+        return False
+    threading.Thread(target=runner or run_agent_session, args=(session_id, context or {}), daemon=True).start()
+    return True
 
 
-def _agent_internal_ai_query(payload):
-    class Request:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-    response = _views.ai_query_region(Request())
-    data = json.loads(response.content.decode("utf-8"))
-    return response.status_code, data
+def _cloud_sort_value(candidate):
+    return 100.0 if candidate.cloud_percent is None else float(candidate.cloud_percent)
 
 
-def _agent_internal_report(payload):
-    class Request:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        method = "POST"
+def _sort_sentinel_preview_candidates(candidates):
+    """预判阶段按云量优先，其次新鲜度和综合分排序。"""
+    return sorted(
+        candidates,
+        key=lambda c: (
+            _cloud_sort_value(c),
+            -(c.acquired_at.timestamp() if c.acquired_at else 0),
+            -(c.suitability_score or 0),
+        ),
+    )
 
-    response = _views.generate_report(Request())
-    data = json.loads(response.content.decode("utf-8"))
-    return response.status_code, data
+
+def _rank_sentinel_grid_candidates(candidates, tile):
+    """网格选景先保证空间交集，再在同等覆盖下优先低云量。"""
+    return sorted(
+        candidates,
+        key=lambda c: (
+            bbox_intersection_ratio(tile, c.bbox),
+            -_cloud_sort_value(c),
+            c.acquired_at.timestamp() if c.acquired_at else 0,
+            c.suitability_score or 0,
+        ),
+        reverse=True,
+    )
 
 
-def _agent_fetch_sentinel(bbox, slots):
+def _agent_fetch_sentinel(bbox, slots, force_grid=False):
     resolution = 1024
     plan = compute_image_plan(bbox["min_lng"], bbox["min_lat"], bbox["max_lng"], bbox["max_lat"], resolution)
     provider = EarthSearchProvider(titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
@@ -253,11 +387,21 @@ def _agent_fetch_sentinel(bbox, slots):
         start_date=slots.get("date_start"),
         end_date=slots.get("date_end"),
         max_cloud=60,
-        limit=int(os.environ.get("AGENT_SENTINEL_CANDIDATE_LIMIT", "15")),
+        limit=int(os.environ.get("AGENT_SENTINEL_CANDIDATE_LIMIT", "40")) if plan["area_km2"] >= 1000 else int(os.environ.get("AGENT_SENTINEL_CANDIDATE_LIMIT", "15")),
         collection="sentinel-2-l2a",
     )
     if not candidates:
         return None, None, None
+    large_area = plan["area_km2"] >= 1000
+    has_full_candidate = any(bbox_intersection_ratio(bbox, c.bbox) >= 0.85 for c in candidates)
+    # 与 sentinel_pipeline 的正式选景保持一致：云量是首要质量信号，
+    # 综合评分只用于同云量候选打平，避免预判阶段选入高云量影像。
+    preview_candidates = _sort_sentinel_preview_candidates(candidates)[:4]
+    union_coverage = bbox_union_coverage_ratio(bbox, [c.bbox for c in preview_candidates])
+    # 普通大范围行政区使用同一 bbox 的多景 mosaic，避免网格切片后的 no-data
+    # 边缘把完整行政区误判为覆盖不足；仅显式 force_grid 才走网格实验路径。
+    if force_grid or (large_area and not has_full_candidate and union_coverage < 0.85 and os.environ.get("AGENT_SENTINEL_GRID", "0") == "1"):
+        return _agent_fetch_sentinel_grid(provider, candidates, bbox, plan, resolution, polygon=(slots.get("resolved_place") or {}).get("polygon"))
     retrieval = sentinel_retrieval_result(
         provider,
         candidates,
@@ -265,8 +409,97 @@ def _agent_fetch_sentinel(bbox, slots):
         plan,
         resolution,
         file_prefix="agent_sentinel",
+        # 大范围 bbox 不能用单景 60% 覆盖就算成功：那会把城市北/南侧
+        # 直接裁掉，再错误降级成 Mapbox。优先要求多景拼接达到 98% 覆盖。
+        min_coverage=0.98 if large_area else 0.85,
+        min_valid_ratio=0.60 if large_area else 0.80,
+        max_auto_crop_ratio=0.40 if large_area else 0.03,
+        max_mosaic_candidates=int(os.environ.get("AGENT_SENTINEL_MAX_MOSAIC_CANDIDATES", "12")) if large_area else None,
+        polygon=(slots.get("resolved_place") or {}).get("polygon"),
     )
     return retrieval["scene"], retrieval["candidate"], retrieval
+
+
+def _agent_fetch_sentinel_grid(provider, candidates, bbox, plan, resolution, polygon=None):
+    """大范围行政区按网格独立渲染，再进行空间拼接。"""
+    # 2×2 已能覆盖大多数城市级 bbox；只有极大区域才升到 3×3，
+    # 避免一次任务触发 9 次 TiTiler 网络请求。
+    columns = rows = 2 if plan["area_km2"] < 100000 else 3
+    lon_step = (bbox["max_lng"] - bbox["min_lng"]) / columns
+    lat_step = (bbox["max_lat"] - bbox["min_lat"]) / rows
+    errors = []
+    used = []
+    jobs = []
+    for gy in range(rows):
+        for gx in range(columns):
+            tile = {
+                "min_lng": bbox["min_lng"] + gx * lon_step,
+                "max_lng": bbox["min_lng"] + (gx + 1) * lon_step,
+                "min_lat": bbox["min_lat"] + gy * lat_step,
+                "max_lat": bbox["min_lat"] + (gy + 1) * lat_step,
+            }
+            ranked = _rank_sentinel_grid_candidates(candidates, tile)
+            candidate = next((c for c in ranked if bbox_intersection_ratio(tile, c.bbox) >= 0.20), None)
+            if candidate:
+                jobs.append((gx, gy, tile, candidate))
+            else:
+                errors.append(f"网格 {gx},{gy} 无覆盖候选")
+    def render_job(job):
+        gx, gy, tile, candidate = job
+        tile_w = max(256, int(round(plan["total_w"] / columns)))
+        tile_h = max(256, int(round(plan["total_h"] / rows)))
+        image_bytes = provider.render_candidate_jpeg(candidate, tile, tile_w, tile_h)
+        if image_valid_ratio(image_bytes) < 0.25:
+            raise ValueError("网格有效像素率过低")
+        return {"candidate": candidate, "image_bytes": image_bytes, "coverage_ratio": bbox_intersection_ratio(tile, candidate.bbox), "grid_x": gx, "grid_y": gy, "tile_bbox": tile}
+    rendered = []
+    with ThreadPoolExecutor(max_workers=min(3, len(jobs) or 1)) as pool:
+        futures = {pool.submit(render_job, job): job for job in jobs}
+        for future in as_completed(futures):
+            gx, gy, tile, candidate = futures[future]
+            try:
+                item = future.result()
+                rendered.append(item)
+                if candidate not in used:
+                    used.append(candidate)
+            except (requests.RequestException, ValueError) as exc:
+                errors.append(f"{candidate.product_id or candidate.item_id} 网格 {gx},{gy}: {str(exc)[:120]}")
+    min_tiles = max(2, int((columns * rows) * 0.50 + 0.999))
+    if len(rendered) < min_tiles:
+        raise ValueError("Sentinel-2 候选覆盖不足：" + "；".join(errors))
+    mosaic_bytes, valid_ratio, item_summaries = compose_sentinel_grid(
+        rendered, plan["total_w"], plan["total_h"], columns, rows,
+    )
+    processed = crop_sentinel_nodata_border(mosaic_bytes, bbox)
+    if polygon:
+        from .geo_math import clip_image_to_polygon
+        mosaic_bytes, polygon_coverage = clip_image_to_polygon(processed["image_bytes"], processed["bbox"], polygon)
+        processed["image_bytes"] = mosaic_bytes
+    if float(processed["metadata"].get("removed_pixel_ratio") or 0) > 0.40:
+        raise ValueError("Sentinel-2 候选覆盖不足：网格拼接后有效区域过小")
+    effective_bbox = processed["bbox"]
+    effective_plan = processed["plan"]
+    used_coverage = bbox_union_coverage_ratio(bbox, [c.bbox for c in used])
+    if used_coverage < 0.60 or valid_ratio < 0.60:
+        raise ValueError(f"Sentinel-2 候选覆盖不足：网格拼接质量不足，覆盖率 {used_coverage:.1%}、有效像素率 {valid_ratio:.1%}")
+    # 所有质量门禁通过后才落盘，避免失败候选留下无法关联的孤儿图片。
+    file_name = f"agent_sentinel_grid_{uuid.uuid4().hex[:8]}.jpg"
+    full_path = os.path.join(SAVE_DIR, file_name)
+    with open(full_path, "wb") as f:
+        f.write(processed["image_bytes"])
+    scene = scene_from_sentinel_mosaic(
+        file_name, used, effective_bbox, effective_plan["area_km2"],
+        effective_plan["gsd_m"], sentinel_mosaic_cache_key(used, bbox, plan["total_w"], plan["total_h"]),
+        {"width": plan["total_w"], "height": plan["total_h"]},
+        used_coverage, valid_ratio,
+        render_errors=errors, item_summaries=item_summaries,
+    )
+    metadata = dict(scene.metadata or {})
+    metadata.update({"grid_mosaic": True, "grid_shape": {"columns": columns, "rows": rows}, "requested_bbox": bbox, "no_data_crop": processed["metadata"]})
+    scene.metadata = metadata
+    scene.save(update_fields=["metadata", "updated_at"])
+    create_done_download_task(scene, file_name, effective_bbox, effective_plan, resolution, total=len(rendered))
+    return scene, used[0], {"scene": scene, "candidate": used[0], "selected_candidates": used, "plan": effective_plan, "candidate_count": len(candidates), "cache_hit": False, "mosaic": True, "selection_method": "grid_mosaic", "target_coverage_ratio": used_coverage, "valid_image_ratio": valid_ratio, "no_data_crop": processed["metadata"], "render_errors": errors}
 
 
 def _agent_fetch_mapbox(bbox):
@@ -280,6 +513,17 @@ def _agent_fetch_mapbox(bbox):
     result_path = fetch_satellite_image(min_lng, min_lat, max_lng, max_lat, SAVE_DIR, file_name, target_resolution=resolution)
     if not result_path:
         raise ValueError("Mapbox 高清底图下载失败，请检查 MAPBOX_TOKEN、网络或配额")
+    progress = _download_progress.get(file_name) or {}
+    if progress.get("status") == "partial" or int(progress.get("failed", 0) or 0) > 0:
+        # Agent 结果会直接进入 VL 解译和报告，不能把带深灰占位瓦片的拼接图
+        # 当成完整证据。手动下载流程仍可保留 partial 结果供用户检查。
+        try:
+            os.remove(result_path)
+        except OSError:
+            pass
+        raise ValueError(
+            f"Mapbox 高清底图仅完成部分瓦片（失败 {progress.get('failed', 0)}），请重试或改用 Sentinel-2"
+        )
     metadata = MapboxProvider().metadata_for_bbox(bbox).as_dict()
     scene = ImageryScene.objects.create(
         file_name=file_name,
@@ -318,320 +562,14 @@ def _agent_fetch_mapbox(bbox):
     return scene, {"plan": plan}
 
 
-def run_agent_session(session_id, context=None):
-    close_old_connections()
-    context = context or {}
-    session = AgentSession.objects.get(id=session_id)
-    try:
-        existing_slots = dict(session.slots or {})
-        resume_with_scene = bool(context.get("resume_with_scene"))
-        _agent_step(session, "understand", "理解调查目标", "running", "正在解析地点、时间、任务类型和图像源")
-        plan = build_agent_plan(session.goal, mode=session.mode)
-        slots = dict(plan.get("slots") or {})
-        slots.update(existing_slots)
-        plan["slots"] = slots
-        if context.get("bbox"):
-            slots["bbox"] = context["bbox"]
-            slots["place_name"] = slots.get("place_name") or "当前框选区域"
-        session.slots = slots
-        session.plan = plan
-        session.save(update_fields=["slots", "plan", "updated_at"])
-        _agent_step(session, "understand", "理解调查目标", "done", "已完成任务槽位解析", slots)
 
-        scene = None
-        candidate = None
-        file_name = context.get("file_name")
-        if context.get("scene_id") or (resume_with_scene and session.scene_id):
-            scene_id = context.get("scene_id") or session.scene_id
-            scene = ImageryScene.objects.filter(id=scene_id).first()
-            if scene:
-                file_name = scene.file_name
-        elif context.get("file_name"):
-            scene = ImageryScene.objects.filter(file_name=os.path.basename(context.get("file_name") or "")).first()
-            if scene:
-                file_name = scene.file_name
-        if context.get("scene_id") and not scene:
-            scene = ImageryScene.objects.filter(id=context["scene_id"]).first()
-            if scene:
-                file_name = scene.file_name
-
-        if scene:
-            bbox = {
-                "min_lng": scene.min_lng,
-                "min_lat": scene.min_lat,
-                "max_lng": scene.max_lng,
-                "max_lat": scene.max_lat,
-            }
-            slots["bbox"] = bbox
-            slots["source"] = _scene_source_key(scene)
-            session.slots = slots
-            session.scene = scene
-            session.save(update_fields=["slots", "scene", "updated_at"])
-            _agent_step(session, "locate", "定位调查范围", "done", "使用当前已框选区域", bbox)
-        else:
-            _agent_step(session, "locate", "定位调查范围", "running", "正在查询行政区边界")
-            if not slots.get("place_name"):
-                _agent_wait(
-                    session,
-                    "我还缺少调查地点，请补充城市、区县或框选区域。",
-                    ["补充地点", "取消任务"],
-                    step_id="locate",
-                    label="定位调查范围",
-                )
-                return
-            location = _views.resolve_district_bbox(slots["place_name"])
-            bbox = location["bbox"]
-            slots["bbox"] = bbox
-            slots["resolved_place"] = location
-            session.slots = slots
-            session.save(update_fields=["slots", "updated_at"])
-            _agent_step(session, "locate", "定位调查范围", "done", f"已定位 {location['name']}，采用行政区 bbox 筛查", location)
-
-        source = slots.get("source") or "sentinel2"
-        _agent_step(session, "select_source", "选择图像源", "done", f"已选择 {source}", {"source": source, "mode": session.mode})
-
-        if not scene:
-            _agent_step(session, "retrieve_imagery", "检索并生成影像", "running", "正在获取影像")
-            if source == "sentinel2":
-                try:
-                    scene, candidate, retrieval = _agent_fetch_sentinel(bbox, slots)
-                except (requests.RequestException, ValueError) as exc:
-                    _agent_wait(
-                        session,
-                        f"Sentinel-2 公开影像检索暂时不可用或无可渲染候选：{str(exc)[:160]}",
-                        ["扩大时间范围", "切换高清底图", "取消任务"],
-                        {"bbox": bbox, "slots": slots, "error": str(exc)[:300]},
-                        step_id="retrieve_imagery",
-                        label="检索并生成影像",
-                    )
-                    return
-                if not scene:
-                    _agent_wait(
-                        session,
-                        "未找到符合时间和云量条件的 Sentinel-2 影像。",
-                        ["扩大时间范围", "切换高清底图", "取消任务"],
-                        {"bbox": bbox, "slots": slots},
-                        step_id="retrieve_imagery",
-                        label="检索并生成影像",
-                    )
-                    return
-            else:
-                scene, retrieval = _agent_fetch_mapbox(bbox)
-            file_name = scene.file_name
-            session.scene = scene
-            session.save(update_fields=["scene", "updated_at"])
-            _agent_step(
-                session,
-                "retrieve_imagery",
-                "检索并生成影像",
-                "done",
-                "影像已生成",
-                {"scene": scene_brief_payload(scene), **sentinel_retrieval_timeline_payload(retrieval)},
-            )
-        else:
-            metadata = scene.metadata or {}
-            if source == "sentinel2" and metadata.get("assets"):
-                candidate = type("Candidate", (), {"assets": metadata.get("assets")})()
-            if source == "sentinel2" and metadata.get("mosaic_candidates"):
-                candidate = _candidate_from_mosaic_metadata((metadata.get("mosaic_candidates") or [{}])[0])
-            _agent_step(session, "retrieve_imagery", "检索并生成影像", "done", "复用当前区域影像", {"scene": scene_brief_payload(scene)})
-
-        quality = imagery_quality_payload(scene)
-        _agent_step(session, "quality_check", "检查影像质量", "done", quality.get("summary", "") if quality else "", quality)
-        date_matched, date_issue = _scene_matches_requested_dates(scene, slots)
-        if scene.source == "sentinel2" and not date_matched and not context.get("force_continue"):
-            _agent_store_scene_artifacts(session, scene, bbox)
-            _agent_wait(
-                session,
-                f"{date_issue} 继续分析会降低结论时效性，是否扩大时间范围或切换高清底图？",
-                ["扩大时间范围", "切换高清底图", "继续分析", "取消任务"],
-                {"scene": scene_brief_payload(scene), "date_issue": date_issue, "slots": slots},
-                step_id="quality_check",
-                label="检查影像质量",
-            )
-            return
-        if scene.source == "sentinel2" and scene.cloud_percent is not None and scene.cloud_percent > 30 and not context.get("force_continue"):
-            _agent_store_scene_artifacts(session, scene, bbox)
-            _agent_wait(
-                session,
-                f"当前 Sentinel-2 候选云量为 {scene.cloud_percent:g}%，可能影响水体判读。是否继续？",
-                ["继续分析", "扩大时间范围", "切换高清底图"],
-                {"scene": scene_brief_payload(scene)},
-                step_id="quality_check",
-                label="检查影像质量",
-            )
-            return
-
-        ndwi = None
-        if slots.get("task") == "water" and scene.source == "sentinel2":
-            _agent_step(session, "ndwi", "轻量 NDWI 水体量化", "running", "正在计算 NDWI")
-            metadata = scene.metadata or {}
-            if metadata.get("mosaic") and metadata.get("mosaic_candidates"):
-                ndwi_candidates = [_candidate_from_mosaic_metadata(item) for item in metadata.get("mosaic_candidates") or []]
-                ndwi = _views.compute_ndwi_mosaic_summary(
-                    ndwi_candidates,
-                    bbox,
-                    os.environ.get("TITILER_ENDPOINT") or "https://titiler.xyz",
-                )
-            else:
-                if not candidate:
-                    candidate = type("Candidate", (), {"assets": metadata.get("assets") or {}})()
-                ndwi = _views.compute_ndwi_summary(candidate, bbox, os.environ.get("TITILER_ENDPOINT") or "https://titiler.xyz")
-            _agent_step(session, "ndwi", "轻量 NDWI 水体量化", "done", "NDWI 量化完成" if ndwi.get("available") else "NDWI 未能计算", ndwi)
-
-        _agent_step(session, "vl_analysis", "视觉模型解译", "running", "正在调用视觉模型")
-        analysis_question = session.goal
-        if ndwi:
-            analysis_question += (
-                "\n\n## NDWI 辅助量化\n"
-                + json.dumps(ndwi, ensure_ascii=False)
-                + "\n请把 NDWI 作为辅助线索，不要把它表述为精确制图结果。"
-            )
-        ai_payload = {
-            "file_name": file_name,
-            "scene_id": scene.id,
-            "question": analysis_question,
-            "mode": session.mode,
-            "active_perception": _views.ANALYSIS_MODES.get(session.mode, _views.ANALYSIS_MODES["precise"])["active_perception"],
-            "history": [],
-            "gsd": scene.gsd_m,
-            "bbox": bbox,
-        }
-        status_code, ai_data = _agent_internal_ai_query(ai_payload)
-        if status_code != 200 or ai_data.get("code") != 200:
-            raise ValueError(ai_data.get("msg", "视觉模型解译失败"))
-        vision_answer = ai_data["data"]["answer"]
-        analysis_method = ai_data["data"].get("analysis_method")
-        output_quality = (analysis_method or {}).get("output_quality") or {}
-        if output_quality.get("fallback_used") and not context.get("force_continue"):
-            artifacts = dict(session.artifacts or {})
-            artifacts.update({
-                "file_name": file_name,
-                "image_url": f"/api/satellite/show-img/?file={file_name}",
-                "scene": scene_payload(scene),
-                "bbox": bbox,
-                "ndwi": ndwi,
-                "vision_answer": vision_answer,
-                "analysis_method": analysis_method,
-            })
-            session.artifacts = artifacts
-            session.save(update_fields=["artifacts", "updated_at"])
-            _agent_wait(
-                session,
-                "视觉模型没有返回稳定的结构化解译结果。继续复核可能只是在总结限制条件，是否改用快速模式重试、切换高清底图或仍继续？",
-                ["快速模式重试", "切换高清底图", "继续分析", "取消任务"],
-                {"output_quality": output_quality, "scene": scene_brief_payload(scene)},
-                step_id="vl_analysis",
-                label="视觉模型解译",
-            )
-            return
-        _agent_step(session, "vl_analysis", "视觉模型解译", "done", "视觉模型解译完成", {"analysis_method": analysis_method})
-
-        _agent_step(session, "review", "DeepSeek 结论复核", "running", "正在复核证据边界和结论稳定性")
-        review_prompt = (
-            "请作为遥感调查 Agent 的结论复核器，基于以下信息输出面向政府决策辅助的最终中文结论。"
-            "必须区分可见事实、模型推断、数据限制；不要夸大 bbox 筛查和 NDWI 的精度。\n\n"
-            f"用户目标：{session.goal}\n"
-            f"任务槽位：{json.dumps(slots, ensure_ascii=False)}\n"
-            f"影像质量：{json.dumps(quality, ensure_ascii=False)}\n"
-            f"NDWI：{json.dumps(ndwi, ensure_ascii=False)}\n"
-            f"视觉模型结论：{vision_answer}"
-        )
-        reviewed_answer = _views.call_deepseek([
-            {"role": "system", "content": "你是严谨的遥感智能解译复核 Agent。"},
-            {"role": "user", "content": review_prompt},
-        ])
-        _agent_step(session, "review", "DeepSeek 结论复核", "done", "复核完成")
-
-        messages = [
-            {"role": "user", "content": session.goal},
-            {"role": "ai", "content": reviewed_answer, "analysis_method": analysis_method},
-        ]
-        history, _ = ChatHistory.objects.update_or_create(
-            image_file=file_name,
-            defaults={
-                "scene": scene,
-                "messages": messages,
-                "spatial_context": f"Agent 调查：{slots.get('place_name', '当前区域')}",
-                "bbox": bbox,
-            },
-        )
-        artifacts = {
-            **(session.artifacts or {}),
-            "file_name": file_name,
-            "image_url": f"/api/satellite/show-img/?file={file_name}",
-            "scene": scene_payload(scene),
-            "bbox": bbox,
-            "ndwi": ndwi,
-            "vision_answer": vision_answer,
-            "final_answer": reviewed_answer,
-            "analysis_method": analysis_method,
-            "history_id": history.id,
-            "report_available": True,
-        }
-        session.status = AgentSession.STATUS_COMPLETED
-        session.history = history
-        session.messages = messages + [{
-            "role": "assistant",
-            "content": "调查已完成。需要正式 Word 报告时，可以继续发送“生成报告”。",
-            "options": ["生成报告"],
-        }]
-        session.artifacts = artifacts
-        session.save(update_fields=["status", "history", "messages", "artifacts", "updated_at"])
-        _agent_step(session, "complete", "整理结果", "done", "调查完成", {"history_id": history.id})
-    except Exception as exc:
-        logger.exception("agent session failed id=%s", session_id)
-        _agent_fail(session, str(exc)[:500])
-    finally:
-        close_old_connections()
+# 模型驱动工具循环已移至 map_api/agent/loop.py。使用惰性包装保持旧导出名，
+# 同时避免导入 orchestrator 时再次拉起 loop → views 的循环依赖。
+def run_agent_session(*args, **kwargs):
+    from .agent.loop import run_agent_loop
+    return run_agent_loop(*args, **kwargs)
 
 
-def resume_waiting_agent_session(session, action):
-    action_text = action or ""
-    slots = dict(session.slots or {})
-    context = {"force_continue": "继续" in action_text}
-    artifacts = {k: v for k, v in (session.artifacts or {}).items() if k != "waiting"}
-    if "取消" in action_text:
-        session.status = AgentSession.STATUS_FAILED
-        session.error = "用户取消任务"
-        session.artifacts = artifacts
-        _agent_set_observer(session, "failed", "任务已取消", "failed", "用户取消任务")
-        session.messages = list(session.messages or []) + [{"role": "assistant", "content": "Agent 调查任务已取消。"}]
-        session.save(update_fields=["status", "error", "messages", "updated_at"])
-        return
-    if "切换高清底图" in action_text:
-        slots["source"] = "mapbox"
-        session.slots = slots
-        session.status = AgentSession.STATUS_RUNNING
-        session.artifacts = artifacts
-        session.save(update_fields=["slots", "status", "artifacts", "updated_at"])
-        _agent_set_observer(session, "select_source", "选择图像源", "running", "已切换为高清底图，准备重新获取影像", {"source": "mapbox"})
-        context["force_continue"] = True
-        _run_agent_background(session.id, context)
-        return
-    if "快速模式重试" in action_text:
-        session.mode = "fast"
-        session.status = AgentSession.STATUS_RUNNING
-        session.artifacts = artifacts
-        session.save(update_fields=["mode", "status", "artifacts", "updated_at"])
-        _agent_set_observer(session, "vl_analysis", "视觉模型解译", "running", "已切换快速视觉模型，准备重新解译")
-        context["resume_with_scene"] = True
-        _run_agent_background(session.id, context)
-        return
-    if "扩大时间范围" in action_text:
-        slots.pop("date_start", None)
-        slots.pop("date_end", None)
-        session.slots = slots
-        session.status = AgentSession.STATUS_RUNNING
-        session.artifacts = artifacts
-        session.save(update_fields=["slots", "status", "artifacts", "updated_at"])
-        _agent_set_observer(session, "retrieve_imagery", "检索并生成影像", "running", "已扩大时间范围，准备重新检索 Sentinel-2 候选")
-        _run_agent_background(session.id, {"force_continue": True})
-        return
-    if "继续" in action_text:
-        session.status = AgentSession.STATUS_RUNNING
-        session.artifacts = artifacts
-        session.save(update_fields=["status", "artifacts", "updated_at"])
-        _agent_set_observer(session, "quality_check", "检查影像质量", "running", "已收到确认，将继续进入模型解译")
-        context["resume_with_scene"] = True
-        _run_agent_background(session.id, context)
+def resume_waiting_agent_session(*args, **kwargs):
+    from .agent.loop import resume_waiting_agent_session as _resume
+    return _resume(*args, **kwargs)

@@ -16,7 +16,10 @@ Including another URLconf
 """
 
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import path, include, re_path
+from django.contrib.staticfiles.urls import staticfiles_urlpatterns
+from django.conf import settings
+from django.views.static import serve
 from map_api import views
 
 urlpatterns = [
@@ -26,3 +29,8 @@ urlpatterns = [
     path('design/', views.design_view, name='design'),
     path('', views.index_view, name='index'),
 ]
+
+# 本地 runserver 在默认生产式 DEBUG 配置下也必须能提供工作台 CSS/JS；
+# 生产环境仍由 Nginx/CDN 接管静态文件。
+urlpatterns += staticfiles_urlpatterns()
+urlpatterns += [re_path(r"^static/(?P<path>.*)$", serve, {"document_root": settings.STATIC_ROOT})]

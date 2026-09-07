@@ -25,17 +25,13 @@
     }, { passive: true });
   }
 
-  /* 快捷键：Ctrl/Cmd+K 聚焦地点搜索；Esc 关闭分析舱 */
+  /* 快捷键：Ctrl/Cmd+K 聚焦地点搜索（Esc 关闭分析舱由 browser.js 统一处理） */
   function initShortcuts() {
     document.addEventListener("keydown", function (e) {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         var input = document.getElementById("search-input");
         if (input) { input.focus(); input.select(); }
-      }
-      if (e.key === "Escape") {
-        var modal = document.getElementById("chat-modal");
-        if (modal && modal.style.display !== "none") modal.style.display = "none";
       }
     });
   }

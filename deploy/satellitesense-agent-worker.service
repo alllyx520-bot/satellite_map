@@ -1,0 +1,19 @@
+[Unit]
+Description=SatelliteSense Persistent Agent Worker
+After=network.target satellitesense.service
+Wants=satellitesense.service
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/satellitesense
+EnvironmentFile=/opt/satellitesense/.env
+Environment=AGENT_EXECUTION_MODE=queue
+ExecStart=/opt/satellitesense/.venv/bin/python manage.py run_agent_worker --poll-seconds 5 --max-sessions 1 --claim-timeout 900
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,4 @@
-from django.http import JsonResponse, FileResponse
+from django.http import JsonResponse, FileResponse, StreamingHttpResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
 from django.shortcuts import render
@@ -13,22 +13,23 @@ import threading
 import requests
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from io import BytesIO
 import numpy as np
 from PIL import Image
 from django.utils import timezone
-from django.db import close_old_connections, connection
+from django.db import close_old_connections, connection, transaction, IntegrityError
 
 from .utils.get_satellite_image import fetch_satellite_image, haversine_distance, get_download_progress, prune_progress, _download_progress
 from .utils.image_preprocessor import smart_prepare_image_v2, MAX_DIM_MAP
 from .utils.analysis_strategy import build_analysis_strategy
+from .remote_sensing_indices import available_indices
 from .utils.active_perception import (
     build_stage1_prompt, extract_bbox_from_response,
     cut_image_geom, map_bbox_to_original, resize_image, build_stage2_prompt,
     extract_answer_text, measure_bbox, pixel_bbox_to_geo
 )
-from .models import AgentSession, ChatHistory, DownloadTask, ImageryScene
+from .models import AgentSession, ChatHistory, DownloadTask, ImageryScene, ExternalServiceHealth
 from .imagery_sources.mapbox import MapboxProvider
 from .imagery_sources.earth_search import EarthSearchProvider
 from .utils.agent_tools import (
@@ -57,6 +58,7 @@ from .payloads import (
     source_recommendation_payload, scene_selection_payload, scene_brief_payload,
     sentinel_retrieval_timeline_payload, scene_payload, imagery_context_text,
     analysis_method_payload, latest_analysis_method, normalize_model_answer,
+    apply_quality_guard,
     docx_safe_text, join_method_items, chat_history_payload,
 )
 
@@ -74,17 +76,26 @@ from .sentinel_pipeline import (
     create_done_download_task, sentinel_retrieval_result,
 )
 
-# Phase 7 M-4:Agent 编排已移至 map_api/orchestrator.py,这里按原名再导出。
+# Phase 7 M-4:Agent 编排已移至 map_api/orchestrator.py（执行循环在 map_api/agent/loop.py），
+# 这里按原名再导出，既有 patch("map_api.views.X") / from map_api.views import X 全部不受影响。
 from .orchestrator import (
     AGENT_MODES, AGENT_STAGE_PUBLIC_THOUGHTS, AGENT_OBSERVER_DEFAULT_STEPS,
     agent_session_payload, _agent_observer_payload, _agent_set_observer, _agent_step,
     _agent_fail, _agent_wait, _agent_store_scene_artifacts, _scene_matches_requested_dates,
-    _candidate_from_mosaic_metadata, _run_agent_background, _agent_internal_ai_query,
-    _agent_internal_report, _agent_fetch_sentinel, _agent_fetch_mapbox,
+    _candidate_from_mosaic_metadata, _run_agent_background,
+    _agent_fetch_sentinel, _agent_fetch_mapbox, execution_events_payload,
     run_agent_session, resume_waiting_agent_session,
 )
+from .agent.events import event_dict, sse_data
+# Agent HITL 协议（action code 翻译）供 messages view 使用
+from .agent.waiting import translate_action
 
 logger = logging.getLogger(__name__)
+
+# Agent 输入进入消息历史、模型上下文和报告，必须有明确上限，避免单次请求
+# 造成数据库膨胀或把模型上下文预算耗尽。
+MAX_AGENT_GOAL_CHARS = 4000
+MAX_AGENT_MESSAGE_CHARS = 8000
 ai_logger = logging.getLogger("map_api.ai")
 
 # 支持高分辨率图像输入的 VL 模型(需开 vl_high_resolution_images)
@@ -170,9 +181,12 @@ def _call_qwen(model_name, messages):
 
 def _json_body(request):
     try:
-        return json.loads(request.body or b"{}")
+        payload = json.loads(request.body or b"{}")
     except json.JSONDecodeError:
         raise ValueError("请求体不是有效 JSON")
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+    return payload
 
 
 def parse_number_param(data, name, default=None, min_value=None, max_value=None, as_int=False, allow_blank=False):
@@ -183,6 +197,8 @@ def parse_number_param(data, name, default=None, min_value=None, max_value=None,
         value = int(raw) if as_int else float(raw)
     except (TypeError, ValueError):
         raise ValueError(f"{name} 必须是{'整数' if as_int else '数字'}")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} 必须是有限数字")
     if min_value is not None and value < min_value:
         raise ValueError(f"{name} 不能小于 {min_value}")
     if max_value is not None and value > max_value:
@@ -226,6 +242,21 @@ def _as_bool(value):
     return bool(value)
 
 
+def _normalize_agent_bbox(value):
+    """在创建 session 前规范化并校验用户提供的 bbox。"""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("bbox 必须是对象")
+    try:
+        min_lng, min_lat, max_lng, max_lat = normalize_bbox(value)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"bbox 无效：{exc}") from exc
+    if not (-180 <= min_lng <= 180 and -180 <= max_lng <= 180 and -90 <= min_lat <= 90 and -90 <= max_lat <= 90):
+        raise ValueError("bbox 超出经纬度范围")
+    return {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat}
+
+
 def _dir_writable(path):
     os.makedirs(path, exist_ok=True)
     probe = os.path.join(path, f".health_{uuid.uuid4().hex}.tmp")
@@ -261,12 +292,29 @@ def system_health(request):
     checks["media_root_writable"] = _dir_writable(settings.MEDIA_ROOT)
     checks["satellite_image_dir_writable"] = _dir_writable(SAVE_DIR)
 
+    def _env_int(name, default):
+        try:
+            return max(0, int(os.environ.get(name, str(default)) or default))
+        except (TypeError, ValueError):
+            return default
+
     config = {
         "mapbox_token": bool(os.environ.get("MAPBOX_TOKEN")),
         "dashscope_api_key": bool(os.environ.get("DASHSCOPE_API_KEY")),
-        "deepseek_api_key": bool(os.environ.get("DEEPSEEK_API_KEY")),
+        "deepseek_api_key": bool(os.environ.get("GLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")),
+        "glm_api_key": bool(os.environ.get("GLM_API_KEY")),
+        "legacy_config": bool(os.environ.get("DEEPSEEK_API_KEY") and not os.environ.get("GLM_API_KEY")),
+        "glm_chat_url": os.environ.get("GLM_CHAT_URL") or "",
+        "deepseek_chat_url": os.environ.get("DEEPSEEK_CHAT_URL") or "",
+        "agent_model": os.environ.get("AGENT_MODEL", AGENT_MODEL),
+        "agent_vision_assist": str(os.environ.get("AGENT_VISION_ASSIST", "1")).strip().lower() not in {"0", "false", "off", "no"},
         "amap_key": bool(os.environ.get("AMAP_KEY")),
         "titiler_endpoint": os.environ.get("TITILER_ENDPOINT") or "https://titiler.xyz",
+        "proxy_mode": "direct" if str(os.environ.get("SATELLITESENSE_DIRECT_HTTP", "")).strip().lower() in {"1", "true", "yes"} else "system",
+        "rate_limits": {
+            "api_per_minute": _env_int("RATELIMIT_API_PER_MINUTE", 120),
+            "ai_per_minute": _env_int("RATELIMIT_AI_PER_MINUTE", 30),
+        },
     }
     required_ok = checks["database"] and checks["media_root_writable"] and checks["satellite_image_dir_writable"]
     required_ok = required_ok and config["mapbox_token"] and config["dashscope_api_key"]
@@ -275,10 +323,21 @@ def system_health(request):
         "code": 200,
         "data": {
             "status": "ok" if required_ok else "degraded",
+            "dependency_readiness": {
+                "local_runtime": required_ok,
+                "mapbox": "configured" if config["mapbox_token"] else "missing_key",
+                "dashscope": "configured" if config["dashscope_api_key"] else "missing_key",
+                "agent_controller": "configured" if config["deepseek_api_key"] else "missing_key",
+                "geocoder": "configured" if config["amap_key"] else "missing_key",
+                "sentinel_search": "public_endpoint",
+                "sentinel_render": "public_endpoint",
+            },
+            "operational_note": "配置项已加载不等于供应商鉴权、余额或实时配额已验证；首次调用时仍可能返回 401、403、429 或网络错误。",
             "checks": checks,
             "config": config,
             "imagery_strategy": IMAGERY_STRATEGY,
             "smart_pipeline": SMART_PIPELINE_PROFILE,
+            "spectral_indices": available_indices(),
             "imagery_sources": {
                 "mapbox": {
                     "role": "default_high_resolution_reference",
@@ -305,9 +364,13 @@ def system_health(request):
                 for mode, cfg in ANALYSIS_MODES.items()
             },
             "agent": {
-                "available": config["deepseek_api_key"] and config["dashscope_api_key"] and config["amap_key"],
-                "controller_model": os.environ.get("AGENT_MODEL", AGENT_MODEL),
-                "modes": AGENT_MODES,
+                "available": bool(config.get("glm_api_key") or config.get("deepseek_api_key")) and config["dashscope_api_key"] and config["amap_key"],
+                "controller_model": config["agent_model"],
+                "vision_assist": config["agent_vision_assist"],
+                "modes": {
+                    mode: {**cfg, "agent_model": os.environ.get("AGENT_MODEL", AGENT_MODEL)}
+                    for mode, cfg in AGENT_MODES.items()
+                },
                 "workflow": [
                     "任务理解",
                     "行政区 bbox 定位",
@@ -316,12 +379,79 @@ def system_health(request):
                     "质量检查",
                     "NDWI 轻量量化",
                     "VL 解译",
-                    "DeepSeek 复核",
+                    "GLM 复核",
                 ],
             },
             "errors": errors,
         },
     })
+
+def system_dependencies(request):
+    """Read-only dependency status; never performs paid/provider probes."""
+    if request.method != "GET":
+        return JsonResponse({"code": 405, "msg": "method not allowed", "data": None}, status=405)
+    cfg = {
+        "mapbox": bool(os.environ.get("MAPBOX_TOKEN")),
+        "earth_search": True,
+        "titiler": True,
+        "amap": bool(os.environ.get("AMAP_KEY")),
+        "glm": bool(os.environ.get("GLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")),
+        "dashscope": bool(os.environ.get("DASHSCOPE_API_KEY")),
+    }
+    services = []
+    for service_id, configured in cfg.items():
+        key_prefix = f"{service_id}:"
+        row = ExternalServiceHealth.objects.filter(service_key__startswith=key_prefix).order_by("-updated_at").first()
+        if not configured:
+            status = "unknown"
+        elif row and row.open_until and row.open_until > timezone.now():
+            status = "open"
+        elif row and row.failure_count:
+            status = "degraded"
+        elif row:
+            status = "healthy"
+        else:
+            status = "unknown"
+        services.append({
+            "id": service_id, "configured": configured, "status": status,
+            "failure_count": int(row.failure_count) if row else 0,
+            "last_error": (row.last_error[:160] if row and row.last_error else None),
+            "circuit_open_until": row.open_until.isoformat() if row and row.open_until else None,
+            "updated_at": row.updated_at.isoformat() if row else None,
+            "last_success_at": row.last_success_at.isoformat() if row and row.last_success_at else None,
+            "last_error_type": row.last_error_type if row and row.last_error_type else None,
+            "latency_ms": row.latency_ms if row else None,
+            "last_http_status": row.last_http_status if row else None,
+            "last_retry_count": row.last_retry_count if row else 0,
+        })
+    overall = "unavailable" if any(s["status"] == "open" for s in services) else ("degraded" if any(s["status"] in {"degraded", "unknown"} for s in services) else "healthy")
+    return JsonResponse({"code": 200, "data": {"overall": overall, "services": services, "probe_policy": "read-only status; no provider request"}})
+
+@csrf_exempt
+def system_dependencies_probe(request):
+    """受保护的最小探测入口；默认仅检查本地配置，避免普通健康检查消耗额度。"""
+    if request.method != "POST":
+        return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
+    if not (request.user.is_authenticated and request.user.is_staff):
+        return JsonResponse({"code": 403, "msg": "admin required"}, status=403)
+    wanted = (request.POST.get("service") or "").strip().lower()
+    allowed = {"mapbox", "earth_search", "titiler", "amap", "glm", "dashscope"}
+    if wanted and wanted not in allowed:
+        return JsonResponse({"code": 400, "msg": "unknown service"}, status=400)
+    # Provider probing is intentionally opt-in per service and records only local state.
+    data = system_dependencies(request).content
+    payload = json.loads(data.decode("utf-8"))
+    services = payload.get("data", {}).get("services", [])
+    if wanted:
+        services = [s for s in services if s["id"] == wanted]
+    return JsonResponse({"code": 200, "data": {"services": services, "probed": False, "note": "未执行供应商请求；请通过受控运维探针执行真实探测"}})
+
+
+def spectral_indices_catalog(request):
+    """返回前端可用的遥感指数目录，避免 UI 硬编码波段和适用范围。"""
+    if request.method != "GET":
+        return JsonResponse({"code": 405, "msg": "method not allowed", "data": {}}, status=405)
+    return JsonResponse({"code": 200, "msg": "ok", "data": {"indices": available_indices()}})
 
 
 
@@ -429,11 +559,13 @@ def get_satellite_img_api(request):
             finally:
                 close_old_connections()
 
-        threading.Thread(target=_download, daemon=True).start()
+        execution_mode = str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower()
+        if execution_mode not in {"queue", "worker", "persistent"}:
+            threading.Thread(target=_download, daemon=True).start()
 
         return JsonResponse({
             "code": 200,
-            "msg": "下载已启动",
+            "msg": "下载已进入队列" if execution_mode in {"queue", "worker", "persistent"} else "下载已启动",
             "data": {
                 "file_name": file_name,
                 "total_tiles": total_tiles,
@@ -532,11 +664,56 @@ def get_sentinel_img_api(request):
 
 
 
+def _ensure_agent_owner_session(request, create=True):
+    """返回当前匿名浏览器 session key；只在需要写入归属时创建 session。"""
+    session_key = request.session.session_key
+    if not session_key and create:
+        request.session.create()
+        session_key = request.session.session_key
+    return session_key
+
+
+def _agent_file_owned_by_other_session(request, file_name, kind):
+    """Agent 文件无当前浏览器的明确归属时隐藏其存在；旧 NULL owner 也隔离。"""
+    owner_key = _ensure_agent_owner_session(request, create=False)
+    name = os.path.basename(file_name or "")
+    if kind == "image":
+        # Agent 影像统一使用 agent_ 前缀，普通手动画面无需逐次扫会话表。
+        if not name.startswith("agent_"):
+            return False
+        sessions = AgentSession.objects.filter(scene__file_name=name).only("owner_session_key")
+    else:
+        if not name.startswith("report_"):
+            return False
+        sessions = AgentSession.objects.all().only(
+            "owner_session_key", "artifacts"
+        )
+    matched = False
+    owned = False
+    for session in sessions.iterator():
+        owned_name = None
+        if kind == "image":
+            owned_name = name
+        elif kind == "report":
+            report = (session.artifacts or {}).get("report") or {}
+            owned_name = os.path.basename(str(report.get("file_name") or ""))
+        if owned_name == name:
+            matched = True
+        if owned_name == name and owner_key and session.owner_session_key == owner_key:
+            owned = True
+    return matched and not owned
+
+
 @csrf_exempt
 def agent_session_list(request):
     if request.method == "GET":
-        limit = min(50, max(1, int(request.GET.get("limit", 20))))
-        return JsonResponse({"code": 200, "data": [agent_session_payload(s) for s in AgentSession.objects.all()[:limit]]})
+        try:
+            limit = min(50, max(1, int(request.GET.get("limit", 20))))
+        except (TypeError, ValueError):
+            limit = 20
+        owner_key = _ensure_agent_owner_session(request)
+        qs = AgentSession.objects.filter(owner_session_key=owner_key).order_by("-updated_at")
+        return JsonResponse({"code": 200, "data": [agent_session_payload(s) for s in qs[:limit]]})
     if request.method != "POST":
         return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
     try:
@@ -544,30 +721,103 @@ def agent_session_list(request):
         goal = (data.get("goal") or data.get("message") or "").strip()
         if not goal:
             return JsonResponse({"code": 400, "msg": "调查目标不能为空", "data": None}, status=400)
-        if not os.environ.get("DEEPSEEK_API_KEY", "").strip():
-            return JsonResponse({"code": 500, "msg": "缺少 DEEPSEEK_API_KEY，请先在 .env 中配置", "data": None}, status=500)
+        if len(goal) > MAX_AGENT_GOAL_CHARS:
+            return JsonResponse({"code": 400, "msg": f"调查目标不能超过 {MAX_AGENT_GOAL_CHARS} 个字符", "data": None}, status=400)
+        has_deepseek_key = bool((os.environ.get("GLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY", "")).strip())
         mode = data.get("mode", "precise")
         if mode not in AGENT_MODES:
             mode = "precise"
+        body_request_id = str(data.get("request_id") or "").strip()
+        header_request_id = str(request.META.get("HTTP_IDEMPOTENCY_KEY") or "").strip()
+        if body_request_id and header_request_id and body_request_id != header_request_id:
+            return JsonResponse({"code": 400, "msg": "request_id 与 Idempotency-Key 不一致", "data": None}, status=400)
+        request_id = body_request_id or header_request_id
+        if request_id and len(request_id) > 120:
+            return JsonResponse({"code": 400, "msg": "request_id 过长", "data": None}, status=400)
         context = {
-            "bbox": data.get("bbox") if isinstance(data.get("bbox"), dict) else None,
+            "bbox": _normalize_agent_bbox(data.get("bbox")),
             "scene_id": data.get("scene_id"),
             "file_name": os.path.basename(data.get("file_name", "") or ""),
             "force_continue": _as_bool(data.get("force_continue", False)),
         }
-        session = AgentSession.objects.create(
-            goal=goal,
-            mode=mode,
-            status=AgentSession.STATUS_RUNNING,
-            messages=[{"role": "user", "content": goal}],
-            artifacts={"entry": "agent", "context": {k: v for k, v in context.items() if v}},
-        )
-        if _as_bool(data.get("sync", False)):
+        owner_key = _ensure_agent_owner_session(request)
+        created = True
+        try:
+            with transaction.atomic():
+                if request_id:
+                    existing = AgentSession.objects.filter(request_id=request_id).first()
+                    if existing:
+                        if not existing.owner_session_key or existing.owner_session_key != owner_key:
+                            # 不暴露 request_id 是否存在，避免跨浏览器枚举他人任务。
+                            return JsonResponse({
+                                "code": 404,
+                                "msg": "找不到指定的 Agent 任务",
+                                "data": None,
+                            }, status=404)
+                        existing_context = ((existing.artifacts or {}).get("context") or {})
+                        requested_context = {k: v for k, v in context.items() if v}
+                        if (
+                            existing.goal != goal
+                            or existing.mode != mode
+                            or existing_context != requested_context
+                        ):
+                            return JsonResponse({
+                                "code": 409,
+                                "msg": "request_id 已被不同的调查请求占用",
+                                "data": None,
+                            }, status=409)
+                        session = existing
+                        created = False
+                    else:
+                        if not has_deepseek_key:
+                            return JsonResponse({"code": 500, "msg": "缺少 GLM_API_KEY（兼容旧配置名 DEEPSEEK_API_KEY），请先在 .env 中配置", "data": None}, status=500)
+                        session = AgentSession.objects.create(
+                            request_id=request_id,
+                            owner_session_key=owner_key,
+                            goal=goal,
+                            mode=mode,
+                            status=AgentSession.STATUS_RUNNING,
+                            messages=[{"role": "user", "content": goal}],
+                            artifacts={"entry": "agent", "context": {k: v for k, v in context.items() if v}},
+                        )
+                else:
+                    if not has_deepseek_key:
+                        return JsonResponse({"code": 500, "msg": "缺少 GLM_API_KEY（兼容旧配置名 DEEPSEEK_API_KEY），请先在 .env 中配置", "data": None}, status=500)
+                    session = AgentSession.objects.create(
+                        owner_session_key=owner_key,
+                        goal=goal,
+                        mode=mode,
+                        status=AgentSession.STATUS_RUNNING,
+                        messages=[{"role": "user", "content": goal}],
+                        artifacts={"entry": "agent", "context": {k: v for k, v in context.items() if v}},
+                    )
+                if created:
+                    artifacts = dict(session.artifacts or {})
+                    execution_mode = str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower()
+                    if execution_mode in {"queue", "worker", "persistent"}:
+                        # 持久化 worker 必须能立即看到这条队列项，不能预先写一个
+                        # 看似有效的 thread claim 把任务阻塞到 claim-timeout。
+                        artifacts.pop("worker_claim", None)
+                        artifacts.pop("worker_claimed_at", None)
+                        artifacts["queued_at"] = timezone.now().isoformat()
+                    else:
+                        # 给进程内后台线程先登记执行租约，避免外部 worker 同时抢占。
+                        claimed_at = timezone.now().isoformat()
+                        artifacts.update({"worker_claim": f"thread:{uuid.uuid4().hex[:10]}", "worker_claimed_at": claimed_at})
+                    session.artifacts = artifacts
+                    session.save(update_fields=["artifacts", "updated_at"])
+        except IntegrityError:
+            if not request_id:
+                raise
+            session = AgentSession.objects.get(request_id=request_id)
+            created = False
+        if created and _as_bool(data.get("sync", False)):
             run_agent_session(session.id, context)
-        else:
-            threading.Thread(target=run_agent_session, args=(session.id, context), daemon=True).start()
+        elif created:
+            # queue 模式由持久化 worker 接管；thread 模式保持本地开发兼容。
+            _run_agent_background(session.id, context, runner=run_agent_session)
         session.refresh_from_db()
-        return JsonResponse({"code": 200, "msg": "Agent 调查任务已启动", "data": agent_session_payload(session)})
+        return JsonResponse({"code": 200, "msg": "Agent 调查任务已启动" if created else "已返回幂等请求对应的 Agent 任务", "data": agent_session_payload(session)})
     except Exception as e:
         return JsonResponse({"code": 400, "msg": str(e), "data": None}, status=400)
 
@@ -578,9 +828,161 @@ def agent_session_detail(request, session_id):
         session = AgentSession.objects.get(id=session_id)
     except AgentSession.DoesNotExist:
         return JsonResponse({"code": 404, "msg": "not found", "data": None}, status=404)
+    if not session.owner_session_key or session.owner_session_key != _ensure_agent_owner_session(request, create=False):
+        return JsonResponse({"code": 404, "msg": "not found", "data": None}, status=404)
     if request.method == "GET":
         return JsonResponse({"code": 200, "data": agent_session_payload(session)})
     return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
+
+
+@csrf_exempt
+def agent_session_events(request, session_id):
+    """读取 durable execution events，支持 after 游标断线续传。"""
+    if request.method != "GET":
+        return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
+    try:
+        session = AgentSession.objects.get(id=session_id)
+    except AgentSession.DoesNotExist:
+        return JsonResponse({"code": 404, "msg": "not found", "data": None}, status=404)
+    if not session.owner_session_key or session.owner_session_key != _ensure_agent_owner_session(request, create=False):
+        return JsonResponse({"code": 404, "msg": "not found", "data": None}, status=404)
+    return JsonResponse({"code": 200, "data": execution_events_payload(session, request.GET.get("after"), request.GET.get("limit", 100))})
+
+
+def _agent_owned_session(request, session_id):
+    try:
+        session = AgentSession.objects.get(id=session_id)
+    except AgentSession.DoesNotExist:
+        return None
+    owner = _ensure_agent_owner_session(request, create=False)
+    if not session.owner_session_key or session.owner_session_key != owner:
+        return None
+    return session
+
+
+@csrf_exempt
+def agent_session_events_stream(request, session_id):
+    """SSE 主事件流；代理/浏览器不支持时由前端回退到 events 轮询。"""
+    if request.method != "GET":
+        return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
+    session = _agent_owned_session(request, session_id)
+    if session is None:
+        return JsonResponse({"code": 404, "msg": "not found", "data": None}, status=404)
+    try:
+        after = int(request.GET.get("after", request.META.get("HTTP_LAST_EVENT_ID", "-1")))
+    except (TypeError, ValueError):
+        after = -1
+    from .models import ExecutionEvent
+    import time as _time
+
+    def stream():
+        cursor = max(-1, after)
+        deadline = _time.monotonic() + 25
+        yield ": connected\n\n"
+        while _time.monotonic() < deadline:
+            rows = list(ExecutionEvent.objects.filter(session_id=session.id, sequence__gt=cursor).order_by("sequence")[:100])
+            if rows:
+                for event in rows:
+                    cursor = event.sequence
+                    yield sse_data(event)
+                continue
+            yield ": keepalive\n\n"
+            _time.sleep(1)
+
+    response = StreamingHttpResponse(stream(), content_type="text/event-stream")
+    response["Cache-Control"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
+    return response
+
+
+@csrf_exempt
+def agent_session_transcript(request, session_id):
+    if request.method != "GET":
+        return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
+    session = _agent_owned_session(request, session_id)
+    if session is None:
+        return JsonResponse({"code": 404, "msg": "not found", "data": None}, status=404)
+    from .models import ExecutionEvent
+    events = list(ExecutionEvent.objects.filter(session_id=session.id).order_by("sequence"))
+    fmt = (request.GET.get("format") or "markdown").lower()
+    rows = [event_dict(event) for event in events]
+    if fmt == "json":
+        response = JsonResponse({"code": 200, "data": {"session_id": session.id, "goal": session.goal[:8000], "events": rows, "final_answer": str((session.artifacts or {}).get("final_answer") or "")[:12000]}})
+        response["Content-Disposition"] = f'attachment; filename="agent_{session.id}_transcript.json"'
+        return response
+    lines = ["# 调查任务", "", "## 目标", "", session.goal[:8000], "", "## 执行记录", ""]
+    for row in rows:
+        payload = row.get("payload") or {}
+        lines.extend([
+            f"### #{row['sequence']} {row['kind']}",
+            f"- 阶段：{row.get('phase') or '未指定'}",
+            f"- 状态：{row.get('status') or 'running'}",
+            f"- 摘要：{payload.get('summary') or '无'}",
+        ])
+        if payload.get("why"):
+            lines.append(f"- 依据：{'；'.join(str(item) for item in payload['why'][:8])}")
+        if payload.get("vision_used"):
+            lines.append("- 视觉辅助：GLM-5.3-Flash 已查看关联影像")
+            image_ref = payload.get("image_ref") or {}
+            if image_ref:
+                lines.append(
+                    f"- 影像引用：scene_id={image_ref.get('scene_id')}；文件={image_ref.get('file_name')}；来源={image_ref.get('source')}"
+                )
+            if payload.get("visual_observation"):
+                lines.append(f"- 公开观察：{payload['visual_observation']}")
+            if payload.get("primary_interpreter"):
+                lines.append(f"- 专业解译模型：{payload['primary_interpreter']}")
+            if payload.get("decision_reviewer"):
+                lines.append(f"- 决策复核模型：{payload['decision_reviewer']}")
+        lines.append("")
+    final_answer = str((session.artifacts or {}).get("final_answer") or "")[:12000]
+    if final_answer:
+        lines.extend(["## 最终结论", "", final_answer, ""])
+    response = HttpResponse("\n".join(lines), content_type="text/markdown; charset=utf-8")
+    response["Content-Disposition"] = f'attachment; filename="agent_{session.id}_transcript.md"'
+    return response
+
+
+def _finish_agent_message_request(session_id, message_id):
+    """把消息请求从 processing 原子推进到 done，并保留有限历史。"""
+    if not message_id:
+        return
+    try:
+        with transaction.atomic():
+            locked = AgentSession.objects.select_for_update().get(id=session_id)
+            states = dict(locked.message_request_states or {})
+            states[message_id] = "done"
+            # 只保留最近 1000 个状态，避免长会话 JSON 无限增长。
+            if len(states) > 1000:
+                states = dict(list(states.items())[-1000:])
+            ids = list(locked.message_request_ids or [])
+            if message_id not in ids:
+                ids.append(message_id)
+            locked.message_request_states = states
+            locked.message_request_ids = ids[-1000:]
+            locked.save(update_fields=["message_request_states", "message_request_ids", "updated_at"])
+    except AgentSession.DoesNotExist:
+        return
+
+
+def _rollback_agent_message_request(session_id, message_id):
+    """业务动作失败时撤销 processing，允许同一 message_id 安全重试。"""
+    if not message_id:
+        return
+    try:
+        with transaction.atomic():
+            locked = AgentSession.objects.select_for_update().get(id=session_id)
+            states = dict(locked.message_request_states or {})
+            state = states.get(message_id)
+            if (state.get("status") if isinstance(state, dict) else state) != "processing":
+                return
+            states.pop(message_id, None)
+            messages = [m for m in (locked.messages or []) if m.get("request_id") != message_id]
+            locked.message_request_states = states
+            locked.messages = messages
+            locked.save(update_fields=["message_request_states", "messages", "updated_at"])
+    except AgentSession.DoesNotExist:
+        return
 
 
 @csrf_exempt
@@ -591,23 +993,174 @@ def agent_session_messages(request, session_id):
         session = AgentSession.objects.get(id=session_id)
     except AgentSession.DoesNotExist:
         return JsonResponse({"code": 404, "msg": "not found", "data": None}, status=404)
+    if not session.owner_session_key or session.owner_session_key != _ensure_agent_owner_session(request, create=False):
+        return JsonResponse({"code": 404, "msg": "not found", "data": None}, status=404)
     try:
         data = _json_body(request)
         content = (data.get("content") or data.get("message") or "").strip()
         action = (data.get("action") or "").strip()
+        # 兼容自然语言操作：前端/用户常直接发送“取消任务”，不额外传 action。
+        if not action and ("取消" in content or content.lower() in {"cancel", "stop"}):
+            action = "cancel"
+        body_message_id = str(data.get("message_id") or "").strip()
+        header_message_id = str(request.META.get("HTTP_IDEMPOTENCY_KEY") or "").strip()
+        if body_message_id and header_message_id and body_message_id != header_message_id:
+            return JsonResponse({"code": 400, "msg": "message_id 与 Idempotency-Key 不一致", "data": None}, status=400)
+        message_id = body_message_id or header_message_id
+        if message_id and len(message_id) > 120:
+            return JsonResponse({"code": 400, "msg": "message_id 过长", "data": None}, status=400)
         if not content and not action:
             return JsonResponse({"code": 400, "msg": "消息不能为空", "data": None}, status=400)
-        messages = list(session.messages or [])
-        if content:
-            messages.append({"role": "user", "content": content})
-        session.messages = messages
-        session.save(update_fields=["messages", "updated_at"])
+        if len(content) > MAX_AGENT_MESSAGE_CHARS:
+            return JsonResponse({"code": 400, "msg": f"消息不能超过 {MAX_AGENT_MESSAGE_CHARS} 个字符", "data": None}, status=400)
+        # 用户消息与 worker 的 waiting/完成消息可能并发到达；先锁行读取最新
+        # messages 再追加，避免普通 save 用旧列表覆盖后台消息。
+        with transaction.atomic():
+            locked = AgentSession.objects.select_for_update().get(id=session.id)
+            processed_ids = list(locked.message_request_ids or [])
+            request_states = dict(locked.message_request_states or {})
+            request_state = request_states.get(message_id) if message_id else None
+            state_status = request_state.get("status") if isinstance(request_state, dict) else request_state
+            state_stale = False
+            if isinstance(request_state, dict) and state_status == "processing":
+                try:
+                    started_at = datetime.fromisoformat(request_state.get("started_at", ""))
+                    if timezone.is_naive(started_at):
+                        started_at = timezone.make_aware(started_at, timezone.get_current_timezone())
+                    state_stale = (timezone.now() - started_at).total_seconds() > 600
+                except (TypeError, ValueError):
+                    state_stale = True
+            if message_id and (message_id in processed_ids or state_status == "done"):
+                session = locked
+                duplicate_message = True
+            elif message_id and state_status == "processing" and not state_stale:
+                return JsonResponse({"code": 202, "msg": "消息正在处理中，请稍后刷新", "data": agent_session_payload(locked)}, status=202)
+            else:
+                duplicate_message = False
+                if locked.status == AgentSession.STATUS_FAILED:
+                    return JsonResponse({
+                        "code": 409,
+                        "msg": "Agent 调查已失败，不能继续追加消息，请重新发起调查。",
+                        "data": agent_session_payload(locked),
+                    }, status=409)
+                if action == "cancel" and locked.status in (AgentSession.STATUS_COMPLETED, AgentSession.STATUS_FAILED):
+                    return JsonResponse({
+                        "code": 400,
+                        "msg": "Agent 调查已经结束，不能取消。",
+                        "data": agent_session_payload(locked),
+                    }, status=400)
+                if action == "generate_report" and locked.status != AgentSession.STATUS_COMPLETED:
+                    status_code = 202 if locked.status == AgentSession.STATUS_RUNNING else 400
+                    return JsonResponse({
+                        "code": status_code,
+                        "msg": "Agent 正在执行，请完成调查后再生成报告" if status_code == 202 else "Agent 调查尚未完成，不能生成报告",
+                        "data": agent_session_payload(locked),
+                    }, status=status_code)
+                if action and action not in ("cancel", "generate_report") and locked.status != AgentSession.STATUS_WAITING_USER:
+                    if locked.status == AgentSession.STATUS_RUNNING:
+                        return JsonResponse({
+                            "code": 202,
+                            "msg": "Agent 正在执行，请等待当前步骤完成",
+                            "data": agent_session_payload(locked),
+                        }, status=202)
+                    return JsonResponse({
+                        "code": 409,
+                        "msg": "当前任务状态不支持该操作",
+                        "data": agent_session_payload(locked),
+                    }, status=409)
+                if message_id:
+                    request_states[message_id] = {"status": "processing", "started_at": timezone.now().isoformat()}
+            messages = list(locked.messages or [])
+            if not duplicate_message and content:
+                item = {"role": "user", "content": content}
+                if message_id:
+                    item["request_id"] = message_id
+                messages.append(item)
+            locked.messages = messages
+            if duplicate_message:
+                session = locked
+            else:
+                locked.message_request_states = request_states
+                locked.save(update_fields=["messages", "message_request_states", "updated_at"])
+                session = locked
+        if duplicate_message:
+            return JsonResponse({"code": 200, "msg": "已忽略重复消息请求", "data": agent_session_payload(session)})
+
+        if action == "cancel":
+            # 取消必须在行锁内基于最新快照写入；否则后台 worker 可能随后用旧
+            # session.artifacts 覆盖 cancel_requested，造成“已取消但又继续完成”。
+            with transaction.atomic():
+                locked = AgentSession.objects.select_for_update().get(id=session.id)
+                if locked.status in (AgentSession.STATUS_COMPLETED, AgentSession.STATUS_FAILED):
+                    session = locked
+                    cancelled = False
+                else:
+                    artifacts = dict(locked.artifacts or {})
+                    artifacts["cancel_requested"] = True
+                    artifacts.pop("waiting", None)
+                    locked.artifacts = artifacts
+                    locked.cancel_requested = True
+                    locked.status = AgentSession.STATUS_FAILED
+                    locked.error = "用户取消了 Agent 调查。"
+                    locked.messages = list(locked.messages or []) + [{"role": "assistant", "content": "调查已取消。"}]
+                    locked.save(update_fields=["artifacts", "cancel_requested", "status", "error", "messages", "updated_at"])
+                    session = locked
+                    cancelled = True
+            if not cancelled:
+                _finish_agent_message_request(session.id, message_id)
+                return JsonResponse({
+                    "code": 400,
+                    "msg": "Agent 调查已经结束，不能取消。",
+                    "data": agent_session_payload(session),
+                }, status=400)
+            _finish_agent_message_request(session.id, message_id)
+            _agent_set_observer(session, "failed", "任务失败", "failed", "用户取消了 Agent 调查。")
+            session.refresh_from_db()
+            return JsonResponse({"code": 200, "data": agent_session_payload(session)})
 
         wants_report = action == "generate_report" or "生成报告" in content
         if wants_report:
-            artifacts = dict(session.artifacts or {})
-            if session.status != AgentSession.STATUS_COMPLETED or not artifacts.get("file_name"):
-                return JsonResponse({"code": 400, "msg": "Agent 调查尚未完成，不能生成报告", "data": agent_session_payload(session)}, status=400)
+            # 报告生成可能被前端双击或网络重试并发触发。先用行锁做一次
+            # 幂等闸门：已有报告直接返回；已有生成标记则告知客户端稍后轮询。
+            with transaction.atomic():
+                locked = AgentSession.objects.select_for_update().get(id=session.id)
+                artifacts = dict(locked.artifacts or {})
+                if locked.status != AgentSession.STATUS_COMPLETED or not artifacts.get("file_name"):
+                    _finish_agent_message_request(session.id, message_id)
+                    return JsonResponse({"code": 400, "msg": "Agent 调查尚未完成，不能生成报告", "data": agent_session_payload(locked)}, status=400)
+                if artifacts.get("report"):
+                    _finish_agent_message_request(session.id, message_id)
+                    return JsonResponse({"code": 200, "msg": "已返回已生成的报告", "data": agent_session_payload(locked)})
+                execution_mode = str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower()
+                persistent_report = execution_mode in {"queue", "worker", "persistent"}
+                generating_at = artifacts.get("report_generating_at")
+                generating_stale = False
+                if generating_at:
+                    try:
+                        generating_dt = datetime.fromisoformat(generating_at)
+                        if timezone.is_naive(generating_dt):
+                            generating_dt = timezone.make_aware(generating_dt, timezone.get_current_timezone())
+                        generating_stale = (timezone.now() - generating_dt).total_seconds() > 600
+                    except (TypeError, ValueError):
+                        generating_stale = True
+                if artifacts.get("report_generating") and not generating_stale and not persistent_report:
+                    _finish_agent_message_request(session.id, message_id)
+                    return JsonResponse({"code": 202, "msg": "报告正在生成，请稍后刷新", "data": agent_session_payload(locked)}, status=202)
+                if artifacts.get("report_generating") and not generating_stale and persistent_report:
+                    from .models import ReportJob
+                    request_key = f"agent-report:{locked.id}:{artifacts['report_generating']}"
+                    if ReportJob.objects.filter(request_key=request_key).exists():
+                        _finish_agent_message_request(session.id, message_id)
+                        return JsonResponse({"code": 202, "msg": "报告正在生成，请稍后刷新", "data": agent_session_payload(locked)}, status=202)
+                # queue 模式重试时复用原 token，使崩溃发生在“标记已写入、任务尚未入队”
+                # 的窗口也能被下一次请求自愈，而不是制造第二个生成状态。
+                artifacts["report_generating"] = artifacts.get("report_generating") or uuid.uuid4().hex
+                artifacts["report_generating_at"] = timezone.now().isoformat()
+                artifacts.pop("report_error", None)
+                report_token = artifacts["report_generating"]
+                locked.artifacts = artifacts
+                locked.save(update_fields=["artifacts", "updated_at"])
+                session = locked
             report_payload = {
                 "file_name": artifacts["file_name"],
                 "scene_id": session.scene_id,
@@ -616,18 +1169,85 @@ def agent_session_messages(request, session_id):
                 "spatial_context": f"Agent 调查：{session.goal}",
                 "bbox": artifacts.get("bbox") or session.slots.get("bbox"),
             }
-            status_code, report_data = _agent_internal_report(report_payload)
-            if status_code != 200 or report_data.get("code") != 200:
-                return JsonResponse({"code": 500, "msg": report_data.get("msg", "报告生成失败"), "data": None}, status=500)
-            artifacts["report"] = report_data["data"]
-            session.artifacts = artifacts
-            session.messages = list(session.messages or []) + [{"role": "assistant", "content": "Word 报告已生成。"}]
-            session.save(update_fields=["artifacts", "messages", "updated_at"])
+            execution_mode = str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower()
+            if execution_mode in {"queue", "worker", "persistent"}:
+                from .report_jobs import enqueue_report_job
+                job = enqueue_report_job(
+                    session,
+                    {**report_payload, "message_id": message_id},
+                    request_key=f"agent-report:{session.id}:{report_token}",
+                    report_token=report_token,
+                )
+                session.refresh_from_db()
+                return JsonResponse({
+                    "code": 202,
+                    "msg": "报告已进入队列，请稍后刷新",
+                    "data": agent_session_payload(session),
+                    "job_id": job.id,
+                }, status=202)
+            try:
+                _resp = build_report(report_payload)
+                status_code, report_data = _resp.status_code, json.loads(_resp.content)
+                if status_code != 200 or report_data.get("code") != 200:
+                    raise RuntimeError(report_data.get("msg", "报告生成失败"))
+                with transaction.atomic():
+                    locked = AgentSession.objects.select_for_update().get(id=session.id)
+                    latest = dict(locked.artifacts or {})
+                    # 即使异常情况下有其它请求先完成，也只保留第一份结果。
+                    if not latest.get("report"):
+                        latest["report"] = report_data["data"]
+                        locked.messages = list(locked.messages or []) + [{"role": "assistant", "content": "Word 报告已生成。"}]
+                    if latest.get("report_generating") == report_token:
+                        latest.pop("report_generating", None)
+                        latest.pop("report_generating_at", None)
+                    locked.artifacts = latest
+                    locked.save(update_fields=["artifacts", "messages", "updated_at"])
+                    session = locked
+                _finish_agent_message_request(session.id, message_id)
+            except Exception as exc:
+                _rollback_agent_message_request(session.id, message_id)
+                with transaction.atomic():
+                    locked = AgentSession.objects.select_for_update().get(id=session.id)
+                    latest = dict(locked.artifacts or {})
+                    if latest.get("report_generating") == report_token:
+                        latest.pop("report_generating", None)
+                        latest.pop("report_generating_at", None)
+                    locked.artifacts = latest
+                    locked.save(update_fields=["artifacts", "updated_at"])
+                return JsonResponse({"code": 500, "msg": str(exc), "data": None}, status=500)
         elif session.status == AgentSession.STATUS_WAITING_USER:
             resume_waiting_agent_session(session, content or action)
             session.refresh_from_db()
+            _finish_agent_message_request(session.id, message_id)
+        elif session.status == AgentSession.STATUS_COMPLETED and content:
+            # 多轮追问：带 tool_history 记忆重跑工具循环
+            artifacts = dict(session.artifacts or {})
+            tool_history = list(artifacts.get("tool_history") or [])
+            tool_history.append({"role": "user", "content": content})
+            tool_history.append({"role": "tool_result", "content": f"用户追加要求：{content}。请基于已有调查结果与当前影像回答，需要时调用工具，最后给 final_answer。"})
+            session.status = AgentSession.STATUS_RUNNING
+            artifacts["worker_claim"] = f"thread:{uuid.uuid4().hex[:10]}"
+            artifacts["worker_claimed_at"] = timezone.now().isoformat()
+            if str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower() in {"queue", "worker", "persistent"}:
+                artifacts.pop("worker_claim", None)
+                artifacts.pop("worker_claimed_at", None)
+                artifacts["queued_at"] = timezone.now().isoformat()
+            session.artifacts = artifacts
+            session.save(update_fields=["status", "artifacts", "updated_at"])
+            _run_agent_background(session.id, {
+                "tool_history": tool_history,
+                "resume_with_scene": True,
+                "bbox": (session.slots or {}).get("bbox"),
+                "follow_up": content,
+                "worker_claim": artifacts.get("worker_claim"),
+            }, runner=run_agent_session)
+            session.refresh_from_db()
+            _finish_agent_message_request(session.id, message_id)
+        else:
+            _finish_agent_message_request(session.id, message_id)
         return JsonResponse({"code": 200, "data": agent_session_payload(session)})
     except Exception as e:
+        _rollback_agent_message_request(session.id, message_id)
         return JsonResponse({"code": 400, "msg": str(e), "data": None}, status=400)
 
 # ----------------------
@@ -636,6 +1256,8 @@ def agent_session_messages(request, session_id):
 def show_satellite_image(request):
     file_name = request.GET.get('file')
     if file_name:
+        if _agent_file_owned_by_other_session(request, file_name, "image"):
+            return JsonResponse({"code": 404, "msg": "找不到指定的卫星图"}, status=404)
         target_path = safe_media_path(SAVE_DIR, file_name, ('.jpg', '.jpeg', '.png'))
         if not target_path or not os.path.exists(target_path):
              return JsonResponse({"code": 404, "msg": "找不到指定的卫星图"}, status=404)
@@ -725,8 +1347,16 @@ def _measure_and_locate(orig_bbox, gsd, preprocess, geo_bbox):
 # ----------------------
 @csrf_exempt
 def ai_query_region(request):
+    return run_vl_analysis(_json_body(request))
+
+
+def run_vl_analysis(data):
+    """VL 分析核心（从 ai_query_region 抽出，行为保持）。
+
+    接收已解析的参数 dict，返回 JsonResponse。HTTP view 与 Agent 工具共用此核心，
+    消除伪造 Request 的耦合。Agent 工具经 _views.run_vl_analysis 调用并读取 .content。
+    """
     try:
-        data = _json_body(request)
         file_name = data.get("file_name")
         file_names = data.get("file_names")
         question = (data.get("question") or "").strip()
@@ -831,6 +1461,34 @@ def ai_query_region(request):
                     f"min_lng={geo_bbox.get('min_lng')}, max_lng={geo_bbox.get('max_lng')}, "
                     f"min_lat={geo_bbox.get('min_lat')}, max_lat={geo_bbox.get('max_lat')}"
                 )
+            # 将证据能力写进模型上下文，避免模型在低质量影像上生成“看起来精确”的数字。
+            if scene:
+                guard_meta = getattr(scene, "metadata", {}) or {}
+                guard_limits = []
+                try:
+                    if scene.gsd_m and float(scene.gsd_m) > 50:
+                        guard_limits.append(f"输出 GSD 约 {float(scene.gsd_m):g}m/像素")
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    if scene.cloud_percent is not None and float(scene.cloud_percent) > 30:
+                        guard_limits.append(f"云量约 {float(scene.cloud_percent):g}%")
+                except (TypeError, ValueError):
+                    pass
+                for key, label, threshold in (("target_coverage_ratio", "有效覆盖", 0.85), ("valid_image_ratio", "有效像素", 0.80)):
+                    try:
+                        value = guard_meta.get(key)
+                        if value is not None and float(value) < threshold:
+                            guard_limits.append(f"{label}约 {float(value):.0%}")
+                    except (TypeError, ValueError):
+                        pass
+                if guard_limits:
+                    context_bits.append(
+                        "## 精度门禁（必须遵守）\n"
+                        + "当前证据受 " + "、".join(guard_limits) + " 限制。只能描述区域级形态、相对差异和趋势；"
+                        "不得臆测河道/建筑/养殖塘的精确宽度、直径、面积、数量，也不得给出含沙量、水深、流速等水质/工程参数。"
+                        "若用户要求这些数值，明确写‘当前影像无法可靠估计’，不要用约数替代。"
+                    )
             if context_bits:
                 spatial_ctx = (spatial_ctx + "\n" if spatial_ctx else "") + "\n".join(context_bits)
             use_active_perception = strategy["active_perception"]
@@ -998,6 +1656,20 @@ def ai_query_region(request):
             if bits:
                 real_answer += "\n\n📐 **定量信息**（基于 GSD 测算）：" + " · ".join(bits)
 
+        # 最终输出再过一次证据门禁：模型可能在主动感知或自检阶段重新生成精确数字。
+        real_answer, guard_result = apply_quality_guard(
+            real_answer, scene=scene, imagery_quality=imagery_quality
+        )
+        if guard_result.get("triggered"):
+            output_quality = dict(output_quality or {})
+            output_quality["precision_guard_triggered"] = True
+            output_quality["precision_guard_reasons"] = guard_result.get("reasons") or []
+            output_quality["redacted_numeric_claims"] = guard_result.get("redacted_count", 0)
+            # 保留定位坐标，但不再把低质量影像上的尺寸测量作为可用证据返回。
+            for target in targets:
+                for key in ("width_m", "height_m", "area_m2"):
+                    target.pop(key, None)
+
         return JsonResponse({
             "code": 200,
             "msg": "success",
@@ -1080,6 +1752,7 @@ def cleanup_media_core(days=7, clean_all=False, dry_run=False):
     deleted_files = 0
     freed_bytes = 0
     deleted_image_files = []
+    deleted_report_files = []
     roots = [SAVE_DIR, REPORT_DIR]
     report_ext = (".docx",)
     image_ext = (".jpg", ".jpeg", ".png")
@@ -1097,26 +1770,57 @@ def cleanup_media_core(days=7, clean_all=False, dry_run=False):
                 continue
             if root == REPORT_DIR and not name.lower().endswith(report_ext):
                 continue
-            if clean_all or os.path.getmtime(path) < cutoff_ts:
-                size = os.path.getsize(path)
+            try:
+                should_delete = clean_all or os.path.getmtime(path) < cutoff_ts
+                size = os.path.getsize(path) if should_delete else 0
+            except FileNotFoundError:
+                # 另一轮清理可能已先删除，清理操作本身应保持幂等。
+                continue
+            if should_delete:
                 if not dry_run:
-                    os.remove(path)
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        continue
                 deleted_files += 1
                 freed_bytes += size
                 if root_real == save_real and name.lower().endswith(image_ext):
                     deleted_image_files.append(name)
+                elif root == REPORT_DIR and name.lower().endswith(report_ext):
+                    deleted_report_files.append(name)
 
     if not dry_run:
         if clean_all:
             DownloadTask.objects.all().delete()
             ImageryScene.objects.all().delete()
             ChatHistory.objects.all().delete()
+            # clean_all 的语义是清理整个本地工作区，Agent 会话及其文件引用也必须删除。
+            AgentSession.objects.all().delete()
             _download_progress.clear()
         else:
             if deleted_image_files:
                 DownloadTask.objects.filter(file_name__in=deleted_image_files).delete()
                 ImageryScene.objects.filter(file_name__in=deleted_image_files).delete()
                 ChatHistory.objects.filter(image_file__in=deleted_image_files).delete()
+                # 影像文件已不存在时，保留会话本身但明确标记证据缺失，避免前端继续展示可下载链接。
+                for session in AgentSession.objects.only("id", "artifacts").iterator():
+                    artifacts = dict(session.artifacts or {})
+                    if os.path.basename(str(artifacts.get("file_name") or "")) in deleted_image_files:
+                        artifacts.pop("file_name", None)
+                        artifacts.pop("image_url", None)
+                        artifacts["file_missing"] = True
+                        session.artifacts = artifacts
+                        session.save(update_fields=["artifacts", "updated_at"])
+            if deleted_report_files:
+                for session in AgentSession.objects.only("id", "artifacts").iterator():
+                    artifacts = dict(session.artifacts or {})
+                    report = artifacts.get("report") or {}
+                    report_name = os.path.basename(str(report.get("file_name") or ""))
+                    if report_name in deleted_report_files:
+                        artifacts.pop("report", None)
+                        artifacts["report_missing"] = True
+                        session.artifacts = artifacts
+                        session.save(update_fields=["artifacts", "updated_at"])
             DownloadTask.objects.filter(updated_at__lt=cutoff).delete()
             for key, info in list(_download_progress.items()):
                 if info.get("status") in ("done", "partial", "error"):
@@ -1313,8 +2017,15 @@ def chat_history_detail(request, history_id):
 def generate_report(request):
     if request.method != "POST":
         return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
+    return build_report(_json_body(request))
+
+
+def build_report(data):
+    """Word 报告生成核心（从 generate_report 抽出，行为保持）。
+
+    接收已解析的参数 dict，返回 JsonResponse。HTTP view 与 Agent 工具共用此核心。
+    """
     try:
-        data = _json_body(request)
         file_name = os.path.basename(data.get("file_name", "") or "")
         if file_name == "__compare__":
             file_name = ""
@@ -1534,6 +2245,8 @@ def generate_report(request):
 
 def download_report(request):
     file_name = request.GET.get("file", "")
+    if _agent_file_owned_by_other_session(request, file_name, "report"):
+        return JsonResponse({"code": 404, "msg": "not found"}, status=404)
     path = safe_media_path(settings.MEDIA_ROOT, file_name, ('.docx',))
     if not path or not os.path.exists(path):
         return JsonResponse({"code": 404, "msg": "not found"}, status=404)

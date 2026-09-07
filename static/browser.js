@@ -12,6 +12,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const normalMap = L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', {
         subdomains: ["1", "2", "3", "4"],
         maxZoom: MAP_MAX_ZOOM,
+        errorTileUrl: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
         attribution: '&copy; 高德地图'
     });
 
@@ -135,7 +136,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const workspaceResizer = document.getElementById('workspace-sidebar-resizer');
     const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
     // 窄屏下左右两栏(各最大 340px 叠层)物理上无法并存,触发手风琴/默认收起,避免重叠。桌面布局不受影响。
-    const narrowLayout = () => window.innerWidth < 720;
+    const narrowLayout = () => window.innerWidth <= 960;  // 与 CSS 响应式断点(max-width: 960px)一致
 
     function readWorkbenchLayout() {
         try {
@@ -181,15 +182,15 @@ document.addEventListener('DOMContentLoaded', () => {
         const isAgent = kind === 'agent';
         const maxWidth = Math.min(560, Math.max(320, window.innerWidth - 560));
         document.body.classList.add('is-resizing-sidebar');
+        let lastWidth = null;
         const onMove = (moveEvent) => {
-            const width = isAgent
+            lastWidth = isAgent
                 ? clamp(moveEvent.clientX, 300, maxWidth)
                 : clamp(window.innerWidth - moveEvent.clientX, 320, maxWidth);
             document.documentElement.style.setProperty(
                 isAgent ? '--agent-sidebar-width' : '--workspace-sidebar-width',
-                `${width}px`
+                `${lastWidth}px`
             );
-            saveWorkbenchLayout(isAgent ? { agentWidth: width, agentCollapsed: false } : { workspaceWidth: width, workspaceCollapsed: false });
             document.body.classList.toggle(isAgent ? 'agent-collapsed' : 'workspace-collapsed', false);
             syncMapViewport();
         };
@@ -197,6 +198,10 @@ document.addEventListener('DOMContentLoaded', () => {
             document.body.classList.remove('is-resizing-sidebar');
             window.removeEventListener('mousemove', onMove);
             window.removeEventListener('mouseup', onUp);
+            // 拖拽中只改 CSS 变量，结束时才落盘 localStorage
+            if (lastWidth != null) {
+                saveWorkbenchLayout(isAgent ? { agentWidth: lastWidth, agentCollapsed: false } : { workspaceWidth: lastWidth, workspaceCollapsed: false });
+            }
             syncMapViewport();
         };
         window.addEventListener('mousemove', onMove);
@@ -229,9 +234,18 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!control) return;
             control.classList.remove('is-open');
             const trigger = control.querySelector('.toolbar-select-trigger');
-            const menu = control.querySelector('.toolbar-select-menu');
+            const menu = control._menu || control.querySelector('.toolbar-select-menu');
             if (trigger) trigger.setAttribute('aria-expanded', 'false');
-            if (menu) menu.hidden = true;
+            if (menu) {
+                menu.hidden = true;
+                // 窄屏下菜单被 portal 到 body（见 openMenu）：关闭时收回原 shell，避免 DOM 泄漏
+                if (menu.classList.contains('is-portaled')) {
+                    menu.classList.remove('is-portaled');
+                    menu.style.left = '';
+                    menu.style.top = '';
+                    control._shell?.appendChild(menu);
+                }
+            }
         };
         const closeAll = (except = null) => {
             document.querySelectorAll('.toolbar-control.is-open, .modal-select-control.is-open').forEach((control) => {
@@ -328,6 +342,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 control.classList.add('is-open');
                 trigger.setAttribute('aria-expanded', 'true');
                 menu.hidden = false;
+                control._menu = menu;
+                control._shell = shell;
+                // ≤960px 顶栏 overflow-x:auto 会裁剪绝对定位下拉：
+                // 移到 body 下改 position:fixed，按 trigger 视口坐标定位
+                //（.glass 的 backdrop-filter 会把 fixed 劫持为相对顶栏，故必须移出 DOM）
+                if (narrowLayout()) {
+                    const r = trigger.getBoundingClientRect();
+                    document.body.appendChild(menu);
+                    menu.classList.add('is-portaled');
+                    menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 226)) + 'px';
+                    menu.style.top = (r.bottom + 8) + 'px';
+                }
                 const selectedButton = optionButtons.find((button) => button.dataset.value === select.value);
                 selectedButton?.focus();
             }
@@ -416,7 +442,10 @@ document.addEventListener('DOMContentLoaded', () => {
         toast.className = `toast toast-${type}`;
         toast.textContent = msg;
         container.appendChild(toast);
-        setTimeout(() => { if (toast.parentNode) toast.remove(); }, 3000);
+        setTimeout(() => {
+            toast.classList.add('out');
+            setTimeout(() => { if (toast.parentNode) toast.remove(); }, 420);
+        }, 3000);
     }
 
     function escapeHtml(value) {
@@ -459,13 +488,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function historyLabel(history) {
         const scene = history.scene;
-        if (!scene) return (history.spatial_context || history.image_file).substring(0, 36);
+        // 截断后清尾部悬挂分隔符（"· "、" / "等），避免标题以孤立符号结尾
+        const trimTail = (s) => s.replace(/[\s·/|-]+$/, '');
+        if (!scene) return trimTail((history.spatial_context || history.image_file).substring(0, 36));
         const prefix = scene.source === 'sentinel2' ? '近期公开影像' : '高清底图';
         const acquired = scene.acquired_at ? formatSceneDate(scene.acquired_at).split(' ')[0] : '';
         const detail = scene.source === 'sentinel2'
             ? [acquired, scene.cloud_percent != null ? `云量${scene.cloud_percent}%` : '', scene.selection?.suitability_score != null ? `评分${scene.selection.suitability_score}` : ''].filter(Boolean).join(' / ')
             : (history.spatial_context || scene.decision_grade_label || sceneGradeText(scene.decision_grade));
-        return `${prefix}${detail ? ' · ' + detail : ''}`.substring(0, 42);
+        return trimTail(`${prefix}${detail ? ' · ' + detail : ''}`.substring(0, 42));
     }
 
     function historySubtitle(history) {
@@ -473,7 +504,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (history.spatial_context) parts.push(history.spatial_context);
         if (history.scene) parts.push(sceneBrief(history.scene));
         if (!parts.length && history.image_file) parts.push(history.image_file);
-        return parts.filter(Boolean).join(' / ').substring(0, 88);
+        return parts.filter(Boolean).join(' / ').substring(0, 88).replace(/[\s·/|-]+$/, '');
     }
 
     function historySourceCode(history) {
@@ -542,6 +573,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const agentPanel = document.getElementById('agent-session-panel');
     let currentAgentSessionId = null;
     let agentPollTimer = null;
+    async function showDependencyHint() {
+        try {
+            const res = await fetch('/api/system/dependencies/');
+            const body = await res.json();
+            const d = body?.data;
+            if (d?.overall === 'degraded' || d?.overall === 'unavailable') {
+                showToast(`外部依赖状态：${d.overall === 'unavailable' ? '部分服务暂不可用' : '部分服务状态异常'}，任务仍可尝试并会显示降级原因`, 'warning');
+            }
+        } catch (_) { /* 依赖状态不应阻断主界面 */ }
+    }
+    showDependencyHint();
+    let agentStartedAt = 0;
+    let agentStallTimer = null;
 
     function agentStatusText(status) {
         const map = {
@@ -554,34 +598,91 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function agentStepText(step) {
-        const mark = step.status === 'done' ? '✓' : (step.status === 'running' ? '…' : '!');
+        const mark = step.status === 'done' ? '✓' : (step.status === 'running' ? '…' : '○');
         return `<li class="agent-step agent-step-${escapeHtml(step.status || 'todo')}"><span>${mark}</span><b>${escapeHtml(step.label || step.id)}</b>${step.message ? `<small>${escapeHtml(step.message)}</small>` : ''}</li>`;
     }
 
     function renderAgentPlan(observer, steps) {
-        const planSteps = Array.isArray(observer?.plan_steps) && observer.plan_steps.length
-            ? observer.plan_steps
-            : steps.map(s => ({ id: s.id, label: s.label, status: s.status === 'done' ? 'done' : (s.status === 'running' ? 'running' : 'pending') }));
-        if (!planSteps.length) return '';
-        return `<div class="agent-plan-strip">${planSteps.map(step => `
+        // 只展示已经发生的步骤；未来的固定 pending 芯片会制造“播放脚本”的错觉。
+        const planSteps = (Array.isArray(observer?.plan_steps) ? observer.plan_steps : [])
+            .filter(step => step && step.status && step.status !== 'pending');
+        const actual = steps.filter(step => step && step.id).map(step => ({ id: step.id, label: step.label, status: step.status }));
+        const merged = [...planSteps, ...actual].filter((step, i, all) => all.findIndex(x => x.id === step.id) === i);
+        if (!merged.length) return '';
+        return `<div class="agent-plan-strip">${merged.map(step => `
             <span class="agent-plan-chip agent-plan-${escapeHtml(step.status || 'pending')}">${escapeHtml(step.label || step.id)}</span>
         `).join('')}</div>`;
     }
 
-    function renderAgentObserver(observer, steps) {
+    function agentEventNarrative(event) {
+        const payload = event?.payload || {};
+        const tool = payload.name || payload.failed_tool || '';
+        if (event?.kind === 'model_decision') {
+            if (payload.vision_used) {
+                return {
+                    title: 'GLM-5.3-Flash 视觉辅助判断',
+                    body: [payload.summary || '已查看当前影像并生成公开决策摘要', payload.visual_observation ? `观察：${payload.visual_observation}` : '未提供独立视觉观察'].filter(Boolean).join(' · '),
+                    why: (payload.why || []).join('；') || '结合影像、覆盖率和质量证据进行判断',
+                };
+            }
+            return {
+                title: '做出决策',
+                body: payload.summary || (payload.tool_call ? `准备调用 ${payload.tool_call.name}` : '准备整理结论'),
+                why: payload.tool_call ? `依据当前证据选择 ${payload.tool_call.name}` : '依据当前证据判断无需继续调用工具',
+            };
+        }
+        if (event?.kind === 'model_unavailable') {
+            return { title: '决策服务暂不可用', body: payload.summary || '模型决策服务未返回可用结果', why: (payload.why || []).join('；') || '可重试当前步骤，或明确选择规则流程' };
+        }
+        if (event?.kind === 'rule_decision') {
+            return { title: '规则兜底决策', body: payload.summary || '按已确认规则继续执行', why: (payload.why || []).join('；') || '这不是模型自主决策' };
+        }
+        if (event?.kind === 'tool_started') {
+            return { title: '开始执行', body: `调用 ${tool}`, why: payload.args ? `输入参数已锁定：${JSON.stringify(payload.args)}` : '' };
+        }
+        if (event?.kind === 'tool_result') {
+            const result = payload.result || {};
+            const failed = result.status === 'error' || result.available === false;
+            const detail = result.message || result.reason || (result.result?.message) || (failed ? '工具未返回可用结果' : '已获得工具结果并写入证据链');
+            return { title: failed ? '执行失败' : '完成并记录', body: `${tool}：${detail}`, why: failed ? '将根据失败类型决定重试、替代工具或请求用户' : '结果已进入后续决策上下文' };
+        }
+        if (event?.kind === 'replan_required') {
+            return { title: '重新规划', body: payload.error || '上一步没有得到可用结果', why: payload.suggestion || '避免重复失败并选择可行的替代路径' };
+        }
+        if (event?.kind === 'checkpoint') return { title: '保存检查点', body: `已保存 ${payload.tool_count || 0} 次工具交换`, why: '支持断线恢复和 worker 接管' };
+        if (event?.kind === 'plan_changed') return { title: '更新计划', body: payload.reason || '根据新证据调整执行计划', why: '让后续步骤与当前事实保持一致' };
+        return { title: event?.kind || '执行事件', body: payload.message || payload.reason || '', why: '' };
+    }
+
+    function renderAgentEvent(event) {
+        const n = agentEventNarrative(event);
+        const status = event?.status || event?.payload?.status || 'running';
+        const icon = status === 'done' ? '✓' : (status === 'failed' ? '!' : (status === 'warning' ? '⚠' : '•'));
+        return `<li class="agent-event-item agent-event-${escapeHtml(status)}"><div><b><i>${icon}</i>${escapeHtml(n.title)}</b><small>#${escapeHtml(event?.sequence ?? '')} · ${escapeHtml(event?.created_at ? formatSceneDate(event.created_at) : '')}</small></div><p>${escapeHtml(n.body)}</p>${n.why ? `<em>为什么：${escapeHtml(n.why)}</em>` : ''}</li>`;
+    }
+
+    function renderAgentObserver(observer, steps, eventLog = []) {
         if (!observer || Object.keys(observer).length === 0) return '';
+        const decision = observer.decision && typeof observer.decision === 'object' ? observer.decision : {};
+        const why = Array.isArray(decision.why) ? decision.why : [];
+        const latestDecision = [...eventLog].reverse().find(e => ['model_decision', 'rule_decision', 'model_unavailable'].includes(e?.kind));
+        const decisionPayload = latestDecision?.payload || {};
+        const decisionNarrative = latestDecision ? agentEventNarrative(latestDecision) : null;
+        const decisionWhy = Array.isArray(decisionPayload.why) ? decisionPayload.why : why;
+        const currentThought = decisionNarrative?.body || observer.public_thought || '';
         return `
             <div class="agent-observer">
                 <div class="agent-observer-head">
-                    <span>当前阶段</span>
+                    <span>当前决策</span>
                     <b>${escapeHtml(observer.current_label || '准备中')}</b>
                 </div>
                 <div class="agent-observer-grid">
-                    <div><span>Agent 公开思路</span><p>${escapeHtml(observer.public_thought || '正在整理任务上下文。')}</p></div>
-                    <div><span>正在做</span><p>${escapeHtml(observer.doing || '')}</p></div>
-                    <div><span>下一步</span><p>${escapeHtml(observer.next || '继续按计划推进')}</p></div>
+                    ${currentThought ? `<div><span>${escapeHtml(decisionNarrative?.title || '当前判断')}</span><p>${escapeHtml(currentThought)}</p></div>` : ''}
+                    ${decisionWhy.length ? `<div><span>决策依据</span><p>${escapeHtml(decisionWhy.join('；'))}</p></div>` : ''}
+                    ${observer.doing ? `<div><span>正在执行</span><p>${escapeHtml(observer.doing)}</p></div>` : ''}
+                    ${observer.next ? `<div><span>下一步</span><p>${escapeHtml(observer.next)}</p></div>` : ''}
                 </div>
-                ${renderAgentPlan(observer, steps)}
+                ${eventLog.length ? `<div class="agent-live-events"><span>专家执行记录</span><ol>${eventLog.slice(-8).map(renderAgentEvent).join('')}</ol></div>` : ''}
             </div>
         `;
     }
@@ -589,6 +690,8 @@ document.addEventListener('DOMContentLoaded', () => {
     function renderAgentSession(session) {
         if (!agentPanel || !session) return;
         agentPanel.hidden = false;
+        const prevScrollTop = agentPanel.scrollTop;  // 轮询重绘后恢复滚动位置
+        const prevImg = agentPanel.querySelector('.agent-result-img');  // 复用旧节点，URL 不变就不重新加载
         const artifacts = session.artifacts || {};
         const observer = session.observer || artifacts.observer || {};
         const ndwi = artifacts.ndwi;
@@ -597,35 +700,91 @@ document.addEventListener('DOMContentLoaded', () => {
         const waiting = artifacts.waiting;
         const steps = Array.isArray(session.timeline) ? session.timeline : [];
         const optionsHtml = waiting?.options?.length
-            ? `<div class="agent-options">${waiting.options.map(opt => `<button data-agent-option="${escapeHtml(opt)}">${escapeHtml(opt)}</button>`).join('')}</div>`
+            ? `<div class="agent-options">${waiting.options.map(opt => {
+                const code = typeof opt === 'string' ? opt : (opt?.code || opt?.label || '');
+                const label = typeof opt === 'string' ? opt : (opt?.label || opt?.code || '');
+                return `<button data-agent-option="${escapeHtml(code)}" data-agent-label="${escapeHtml(label)}">${escapeHtml(label)}</button>`;
+            }).join('')}</div>`
             : '';
+        // 结果图不做 cache-bust：URL 不变就不重新请求（下方仅在 URL 变化时替换 src）
         const imageHtml = artifacts.image_url
-            ? `<img class="agent-result-img" src="${escapeHtml(artifacts.image_url)}&t=${Date.now()}" alt="Agent 影像结果">`
+            ? `<img class="agent-result-img" src="${escapeHtml(artifacts.image_url)}" alt="Agent 影像结果">`
             : '';
         const ndwiHtml = ndwi
             ? `<div class="agent-metric"><span>NDWI</span><b>${ndwi.available ? `${ndwi.water_percent}% 可能水体` : '未计算'}</b><p>${escapeHtml(ndwi.limitations || ndwi.reason || '')}</p></div>`
             : '';
+        const cancelHtml = session.status === 'running'
+            ? '<button id="agent-cancel-btn" class="agent-secondary-btn">取消任务</button>'
+            : '';
+        const scene = artifacts.scene || {};
+        const sceneMeta = scene.metadata || {};
+        const evidenceBits = [];
+        if (scene.source_label || scene.source) evidenceBits.push(`来源 ${scene.source_label || scene.source}`);
+        if (scene.decision_grade) evidenceBits.push(`证据级别 ${sceneGradeText(scene.decision_grade)}`);
+        const originalGsd = sceneMeta.source_asset_gsd_m ?? scene.gsd_m;
+        const previewScale = sceneMeta.preview_scale_m ?? sceneMeta.rendered_gsd_m;
+        evidenceBits.push(originalGsd != null ? `原始 GSD ${Number(originalGsd).toFixed(1)}m/像素` : '原始 GSD 未知');
+        if (previewScale != null) evidenceBits.push(`预览采样 ${Number(previewScale).toFixed(1)}m/像素`);
+        evidenceBits.push(scene.cloud_percent != null ? `云量 ${Number(scene.cloud_percent).toFixed(1)}%` : '云量未知');
+        evidenceBits.push(sceneMeta.target_coverage_ratio != null ? `覆盖 ${(Number(sceneMeta.target_coverage_ratio) * 100).toFixed(1)}%` : '覆盖未知');
+        evidenceBits.push(sceneMeta.valid_image_ratio != null ? `有效像素 ${(Number(sceneMeta.valid_image_ratio) * 100).toFixed(1)}%` : '有效像素未知');
+        if (sceneMeta.grid_shape) evidenceBits.push(`网格 ${sceneMeta.grid_shape.columns || '?'}×${sceneMeta.grid_shape.rows || '?'}`);
+        if (ndwi?.sample_size_px != null) evidenceBits.push(`NDWI 样本 ${Number(ndwi.sample_size_px).toLocaleString('zh-CN')} px`);
+        if (ndwi?.grid_failed_count != null && ndwi.grid_failed_count > 0) evidenceBits.push(`失败网格 ${ndwi.grid_failed_count}`);
+        const evidenceHtml = evidenceBits.length
+            ? `<div class="agent-metric agent-evidence-metric"><span>证据质量</span><b>${escapeHtml(evidenceBits.join(' · '))}</b><p>数字结论仅在上述有效区域和分辨率范围内成立；低质量影像不支持精确尺寸或水质参数。</p></div>`
+            : '';
         const reportHtml = report
             ? `<a class="agent-report-link" href="${escapeHtml(report.download_url)}" target="_blank">下载 Word 报告</a>`
             : (session.status === 'completed' ? '<button id="agent-report-btn" class="agent-secondary-btn">生成报告</button>' : '');
+        const transcriptHtml = session.status !== 'running'
+            ? `<div class="agent-transcript-actions"><a href="/api/agent/sessions/${session.id}/transcript/?format=markdown" target="_blank">导出 Markdown</a><a href="/api/agent/sessions/${session.id}/transcript/?format=json" target="_blank">导出 JSON</a></div>`
+            : '';
+        const eventLog = (window.agentEventLog || []).slice(-12);
+        const eventHtml = eventLog.length ? `<details class="agent-event-log"><summary>完整执行记录（${eventLog.length}）</summary><ol>${eventLog.map(renderAgentEvent).join('')}</ol></details>` : '';
         agentPanel.innerHTML = `
             <div class="agent-session-head">
                 <span>${escapeHtml(agentStatusText(session.status))}</span>
                 <b>#${session.id}</b>
+                ${session.goal ? `<div class="agent-goal-echo" title="${escapeHtml(session.goal)}">目标：${escapeHtml(session.goal)}</div>` : ''}
             </div>
-            ${renderAgentObserver(observer, steps)}
-            <ol class="agent-steps">${steps.map(agentStepText).join('')}</ol>
+            ${renderAgentObserver(observer, steps, eventLog)}
+            ${eventHtml}
+            ${!eventLog.length ? `<ol class="agent-steps">${steps.map(agentStepText).join('')}</ol>` : ''}
             ${waiting ? `<div class="agent-waiting">${escapeHtml(waiting.message || '')}${optionsHtml}</div>` : ''}
+            ${cancelHtml}
             ${imageHtml}
+            ${evidenceHtml}
             ${ndwiHtml}
             ${finalAnswer ? `<div class="agent-final-answer">${renderMarkdown(finalAnswer)}</div>` : ''}
             ${reportHtml}
+            ${transcriptHtml}
         `;
+        // 仅当结果图 URL 变化时才让浏览器重新加载：URL 不变则换回旧 img 节点，避免轮询闪动
+        const imgEl = agentPanel.querySelector('.agent-result-img');
+        if (imgEl && prevImg && prevImg.getAttribute('src') === imgEl.getAttribute('src')) {
+            imgEl.replaceWith(prevImg);
+        }
+        agentPanel.scrollTop = prevScrollTop;
         agentPanel.querySelectorAll('[data-agent-option]').forEach(btn => {
-            btn.addEventListener('click', () => sendAgentMessage(btn.dataset.agentOption || btn.textContent));
+            btn.addEventListener('click', () => {
+                const code = btn.dataset.agentOption || '';
+                const label = btn.dataset.agentLabel || code || btn.textContent || '';
+                sendAgentMessage(label, code);
+            });
         });
         const reportBtn = document.getElementById('agent-report-btn');
-        if (reportBtn) reportBtn.addEventListener('click', () => sendAgentMessage('生成报告', 'generate_report'));
+        if (reportBtn) reportBtn.addEventListener('click', () => {
+            if (reportBtn.disabled) return;  // 防连点
+            reportBtn.disabled = true;
+            sendAgentMessage('生成报告', 'generate_report');
+        });
+        const cancelBtn = document.getElementById('agent-cancel-btn');
+        if (cancelBtn) cancelBtn.addEventListener('click', () => {
+            if (cancelBtn.disabled) return;
+            cancelBtn.disabled = true;
+            sendAgentMessage('取消调查', 'cancel');
+        });
         if (artifacts.scene) {
             const b = artifacts.bbox || artifacts.scene.bbox;
             if (b?.min_lat != null) fitMapBounds(dataBboxToMapBounds(b));
@@ -634,12 +793,30 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function loadAgentSession(id) {
         const res = await fetch(`/api/agent/sessions/${id}/`);
+        if (res.status === 429) {
+            // Agent 状态轮询被限流时，任务本身仍在后台运行；不能把 429 当成任务失败。
+            return null;
+        }
         const data = await res.json();
         if (data.code === 200) {
+            // 事件流是执行事实；observer/timeline 只是兼容投影。
+            try {
+                const evRes = await fetch(`/api/agent/sessions/${id}/events/?after=${encodeURIComponent(window.agentEventCursor ?? -1)}`);
+                if (evRes.ok) {
+                    const evBody = await evRes.json();
+                    const events = evBody?.data?.events || [];
+                    window.agentEventLog = [...(window.agentEventLog || []), ...events].slice(-80);
+                    if (evBody?.data?.next_cursor != null) window.agentEventCursor = evBody.data.next_cursor;
+                }
+            } catch (_) { /* 状态接口仍可独立工作 */ }
             renderAgentSession(data.data);
             if (data.data.status === 'completed' || data.data.status === 'failed' || data.data.status === 'waiting_user') {
                 if (agentPollTimer) clearInterval(agentPollTimer);
                 agentPollTimer = null;
+                if (window.agentEventSource) {
+                    window.agentEventSource.close();
+                    window.agentEventSource = null;
+                }
                 agentRunBtn.disabled = false;
             }
             return data.data;
@@ -649,14 +826,55 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function startAgentPolling(id) {
         if (agentPollTimer) clearInterval(agentPollTimer);
+        window.agentEventCursor = -1;
+        window.agentEventLog = [];
+        window.agentEventReconnects = 0;
+        window.agentStatusFailureCount = 0;
+        agentStartedAt = Date.now();
+        if (agentStallTimer) clearTimeout(agentStallTimer);
+        agentStallTimer = setTimeout(() => {
+            if (currentAgentSessionId === id && agentRunBtn?.disabled) {
+                showToast('任务仍在后台处理中，进度面板会自动更新；如长时间无变化可刷新状态', 'info');
+                const hint = agentPanel?.querySelector('.agent-boot-state small');
+                if (hint) hint.textContent = '链路响应较慢，正在保留任务并等待后台阶段完成。';
+            }
+        }, 8000);
         agentPollTimer = setInterval(() => {
             loadAgentSession(id).catch(() => {
-                if (agentPollTimer) clearInterval(agentPollTimer);
-                agentPollTimer = null;
-                agentRunBtn.disabled = false;
-                showToast('Agent 状态读取失败', 'error');
+                window.agentStatusFailureCount = (window.agentStatusFailureCount || 0) + 1;
+                if (window.agentStatusFailureCount >= 3) showToast('暂时无法获取最新状态，已保留当前任务内容', 'warning');
             });
-        }, 1200);
+        }, 3000);
+    }
+
+    function startAgentEventStream(id) {
+        if (!window.EventSource) return;
+        if (window.agentEventSource) window.agentEventSource.close();
+        const source = new EventSource(`/api/agent/sessions/${id}/events/stream/?after=${encodeURIComponent(window.agentEventCursor ?? -1)}`);
+        window.agentEventSource = source;
+        source.addEventListener('agent_event', (event) => {
+            try {
+                const item = JSON.parse(event.data);
+                window.agentEventLog = [...(window.agentEventLog || []), item].slice(-80);
+                if (item.sequence != null) window.agentEventCursor = item.sequence;
+                if (currentAgentSessionId === id) loadAgentSession(id).catch(() => {});
+            } catch (_) { /* malformed event: polling remains available */ }
+        });
+        source.onerror = () => {
+            source.close();
+            window.agentEventSource = null;
+            if (currentAgentSessionId === id) {
+                showToast('实时连接暂时中断，已切换恢复轮询', 'info');
+                // 让轮询先推进游标，再按退避重连 SSE；最多重连3次，避免网络异常时风暴。
+                const attempt = Number(window.agentEventReconnects || 0) + 1;
+                window.agentEventReconnects = attempt;
+                if (attempt <= 3) {
+                    window.setTimeout(() => {
+                        if (currentAgentSessionId === id && !window.agentEventSource) startAgentEventStream(id);
+                    }, Math.min(15000, 1000 * (2 ** (attempt - 1))));
+                }
+            }
+        };
     }
 
     async function startAgentSession(extra = {}) {
@@ -666,6 +884,10 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
         agentRunBtn.disabled = true;
+        showToast(agentModeSelect?.value === 'fast' ? '快速模式：预计 1 次视觉调用' : '精准模式：预计 2–4 次视觉调用，可能需要更长时间', 'info');
+        const previousLabel = agentRunBtn.innerHTML;
+        agentRunBtn.innerHTML = '<i class="ri-loader-4-line ri-spin" aria-hidden="true"></i>';
+        agentRunBtn.setAttribute('aria-label', '正在启动调查');
         if (agentPanel) {
             agentPanel.hidden = false;
             agentPanel.innerHTML = `
@@ -680,41 +902,50 @@ document.addEventListener('DOMContentLoaded', () => {
             `;
         }
         try {
+            const requestId = extra.request_id || (window.crypto?.randomUUID ? window.crypto.randomUUID() : `agent-${Date.now()}-${Math.random().toString(16).slice(2)}`);
             const res = await fetch('/api/agent/sessions/', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     goal,
                     mode: agentModeSelect?.value || 'precise',
+                    request_id: requestId,
                     ...extra
                 })
             });
             const data = await res.json();
             if (data.code !== 200) {
                 agentRunBtn.disabled = false;
+                agentRunBtn.innerHTML = previousLabel;
+                agentRunBtn.setAttribute('aria-label', '启动调查');
                 showToast(data.msg || 'Agent 启动失败', 'error');
                 return;
             }
             currentAgentSessionId = data.data.id;
             renderAgentSession(data.data);
             startAgentPolling(currentAgentSessionId);
+            startAgentEventStream(currentAgentSessionId);
             showToast('Agent 调查已启动', 'success');
         } catch (e) {
             agentRunBtn.disabled = false;
-            showToast('Agent 请求失败', 'error');
+            agentRunBtn.innerHTML = previousLabel;
+            agentRunBtn.setAttribute('aria-label', '启动调查');
+            if (agentPanel) agentPanel.innerHTML += '<div class="agent-boot-state agent-error-state"><div><b>调查启动失败</b><small>请检查网络或服务状态后重试。</small></div></div>';
+            showToast('Agent 请求失败，可重试', 'error');
         }
     }
 
     async function sendAgentMessage(content, action = '') {
         if (!currentAgentSessionId) return;
         try {
+            const messageId = (window.crypto?.randomUUID ? window.crypto.randomUUID() : `msg-${Date.now()}-${Math.random().toString(16).slice(2)}`);
             const res = await fetch(`/api/agent/sessions/${currentAgentSessionId}/messages/`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content, action })
+                body: JSON.stringify({ content, action, message_id: messageId })
             });
             const data = await res.json();
-            if (data.code === 200) {
+            if (data.code === 200 || data.code === 202) {
                 renderAgentSession(data.data);
                 if (data.data?.status === 'running') {
                     agentRunBtn.disabled = true;
@@ -722,8 +953,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 } else if (data.data?.status === 'completed' || data.data?.status === 'failed' || data.data?.status === 'waiting_user') {
                     agentRunBtn.disabled = false;
                 }
-                showToast(action === 'generate_report' ? '报告已生成' : '已发送给 Agent', 'success');
+                if (data.code === 202) {
+                    showToast(data.msg || '请求正在处理中，请稍后刷新', 'info');
+                    startAgentPolling(currentAgentSessionId);
+                } else {
+                    showToast(action === 'generate_report' ? '报告已生成' : '已发送给 Agent', 'success');
+                }
             } else {
+                agentRunBtn.disabled = false;
+                agentRunBtn.innerHTML = '<i class="ri-play-line" aria-hidden="true"></i>';
+                agentRunBtn.setAttribute('aria-label', '启动调查');
+                if (agentStallTimer) { clearTimeout(agentStallTimer); agentStallTimer = null; }
                 showToast(data.msg || 'Agent 消息失败', 'error');
             }
         } catch (e) {
@@ -740,14 +980,38 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // 全局快捷键：让高频入口始终可达，并避免浏览器默认行为抢占焦点。
+    const placeSearchInput = document.querySelector('input[placeholder*="搜索地点"]');
+    document.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+            e.preventDefault();
+            placeSearchInput?.focus();
+            placeSearchInput?.select();
+        }
+        if (e.key === 'Escape' && document.activeElement === placeSearchInput) {
+            placeSearchInput.value = '';
+            placeSearchInput.dispatchEvent(new Event('input', { bubbles: true }));
+            placeSearchInput.blur();
+        }
+    });
+
     // ==========================================
     // 返回全国按钮
     // ==========================================
     const backBtn = document.getElementById('backButton');
     const zoomReadout = document.getElementById('map-zoom-readout');
+    const gsdReadout = document.getElementById('map-gsd-readout');
+    // Web 墨卡托地面分辨率实时估算：156543.03392 * cos(lat) / 2^zoom (m/px)
+    function formatGroundResolution() {
+        const metersPerPx = 156543.03392 * Math.cos(map.getCenter().lat * Math.PI / 180) / Math.pow(2, map.getZoom());
+        if (metersPerPx >= 1000) return `${(metersPerPx / 1000).toFixed(2)} km/px`;
+        if (metersPerPx >= 10) return `${Math.round(metersPerPx)} m/px`;
+        return `${metersPerPx.toFixed(2)} m/px`;
+    }
     function updateBackBtn() {
         backBtn.classList.toggle('is-visible', map.getZoom() >= 7);
         if (zoomReadout) zoomReadout.textContent = map.getZoom();
+        if (gsdReadout) gsdReadout.textContent = formatGroundResolution();
     }
     map.on('zoomend', updateBackBtn);
     map.on('moveend', updateBackBtn);
@@ -779,23 +1043,36 @@ document.addEventListener('DOMContentLoaded', () => {
     const compareBtn = document.getElementById('compare-btn');
     if (compareBar) compareBar.hidden = true;
 
+    const compareBarHint = document.getElementById('compare-bar-hint');
+
     compareToggle.addEventListener('click', () => {
         compareMode = !compareMode;
         compareToggle.classList.toggle('is-active', compareMode);
         document.body.classList.toggle('compare-mode', compareMode);
         if (!compareMode) {
             document.querySelectorAll('.select-cb').forEach(cb => cb.checked = false);
-            compareBar.hidden = true;
+            document.querySelectorAll('.coord-item.is-selected').forEach(el => el.classList.remove('is-selected'));
         }
+        updateCompareBar();
     });
 
+    // 对比条在对比模式下常显：不足 2 个勾选时禁用按钮并说明还差几个
     function updateCompareBar() {
         const checked = document.querySelectorAll('.select-cb:checked').length;
-        compareBar.hidden = !(compareMode && checked >= 2);
+        compareBar.hidden = !compareMode;
+        compareBtn.disabled = checked < 2;
         compareBtn.textContent = `对比所选 (${checked} 个区域)`;
+        if (compareBarHint) {
+            compareBarHint.textContent = checked < 2 ? `再勾选 ${2 - checked} 个区域即可开始对比` : '';
+        }
     }
     document.addEventListener('change', (e) => {
-        if (e.target.classList.contains('select-cb')) updateCompareBar();
+        if (e.target.classList.contains('select-cb')) {
+            // 勾选同步卡片高亮
+            const item = e.target.closest('.coord-item');
+            if (item) item.classList.toggle('is-selected', e.target.checked);
+            updateCompareBar();
+        }
     });
 
     compareBtn.addEventListener('click', () => {
@@ -820,16 +1097,24 @@ document.addEventListener('DOMContentLoaded', () => {
         const container = document.querySelector('.chat-modal-left');
         container.innerHTML = '';
         container.style.position = '';
+        container.style.display = 'flex';   // 左栏默认 display:block，flex 布局需显式开启
         container.style.flexDirection = 'row';
         container.style.flexWrap = 'wrap';
         container.style.gap = '8px';
         container.style.alignContent = 'flex-start';
         items.forEach((item, i) => {
+            const figure = document.createElement('figure');
+            figure.className = 'compare-figure';
             const img = document.createElement('img');
             img.src = item.imgUrl;
             img.className = 'compare-preview-img';
             img.alt = `区域 ${i + 1}`;
-            container.appendChild(img);
+            const cap = document.createElement('figcaption');
+            cap.className = 'compare-figure-cap';
+            cap.textContent = `区域 #${i + 1}`;
+            figure.appendChild(img);
+            figure.appendChild(cap);
+            container.appendChild(figure);
         });
 
         chatMemories['__compare__'] = {
@@ -838,7 +1123,7 @@ document.addEventListener('DOMContentLoaded', () => {
             compareFiles: items.map(x => x.fileName)
         };
         renderChatHistory();
-        modal.style.display = 'flex';
+        showChatModal();
         updatePromptScene();
         setTimeout(() => textarea.focus(), 100);
     }
@@ -848,11 +1133,15 @@ document.addEventListener('DOMContentLoaded', () => {
     // ==========================================
     const mapHint = document.getElementById('map-hint');
     let hintHidden = false;
+    // 触屏没有右键：换成「再次长按取消」（touchstart 里再次长按会清除旧框选）
+    if (mapHint && window.matchMedia('(pointer: coarse)').matches) {
+        mapHint.textContent = '长按拖拽框选区域 · 再次长按取消';
+    }
+    if (mapHint) requestAnimationFrame(() => mapHint.classList.add('visible'));
     function hideHint() {
         if (!hintHidden && mapHint) {
             hintHidden = true;
-            mapHint.style.opacity = '0';
-            setTimeout(() => { if (mapHint) mapHint.style.display = 'none'; }, 500);
+            mapHint.classList.remove('visible');
         }
     }
 
@@ -1007,6 +1296,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const nw = b.getNorthWest();
             const se = b.getSouthEast();
             const item = addRecordToSidebar(nw, se);
+            item._mapRect = selectionRect;  // 与鼠标 mouseup 分支一致：删除卡片时同步移除地图金框
             sendToBackend(nw, se, item);
             selectionRect = null;
             map.dragging.enable();
@@ -1358,6 +1648,48 @@ document.addEventListener('DOMContentLoaded', () => {
     const modalIdSpan = document.getElementById('chat-modal-id');
     const agentRegionBtn = document.getElementById('agent-region-btn');
 
+    // 模态开合：backdrop 淡入淡出，关闭动画结束后再 display:none；焦点归还触发元素
+    let modalLastFocus = null;
+    const isChatModalOpen = () => modal.style.display === 'flex';
+
+    function showChatModal() {
+        if (!isChatModalOpen()) modalLastFocus = document.activeElement;
+        modal.style.display = 'flex';
+        requestAnimationFrame(() => {
+            modal.classList.add('is-open');
+            // 模态从 display:none 展开时 renderChatHistory 里的滚底拿不到布局，须在此重滚
+            chatBox.scrollTop = chatBox.scrollHeight;
+        });
+    }
+
+    function closeChatModal() {
+        if (!isChatModalOpen()) return;
+        modal.classList.remove('is-open');
+        setTimeout(() => {
+            if (!modal.classList.contains('is-open')) modal.style.display = 'none';
+        }, 340);
+        if (modalLastFocus && document.contains(modalLastFocus)) {
+            try { modalLastFocus.focus(); } catch (err) {}
+        }
+        modalLastFocus = null;
+    }
+
+    // Tab 焦点循环：模态打开期间焦点不离开分析舱
+    document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Tab' || !isChatModalOpen()) return;
+        const focusables = Array.from(modal.querySelectorAll('button, [href], input, select, textarea, [tabindex]'))
+            .filter(el => !el.disabled && el.tabIndex >= 0 && el.getClientRects().length > 0);
+        if (!focusables.length) return;
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const active = document.activeElement;
+        if (e.shiftKey) {
+            if (active === first || !modal.contains(active)) { e.preventDefault(); last.focus(); }
+        } else if (active === last || !modal.contains(active)) {
+            e.preventDefault(); first.focus();
+        }
+    });
+
     if (agentRegionBtn) {
         agentRegionBtn.addEventListener('click', () => {
             if (!currentActiveImage || currentActiveImage === '__compare__') {
@@ -1386,7 +1718,12 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        const gsd = scene.gsd_m ? `约 ${scene.gsd_m} m/像素` : '未知';
+        const sourceGsd = Number(scene.metadata?.source_asset_gsd_m || 0);
+        const renderedGsd = Number(scene.metadata?.rendered_gsd_m || scene.gsd_m || 0);
+        const isSentinel = scene.source === 'sentinel2' || String(scene.source_label || '').includes('Sentinel-2');
+        const gsd = isSentinel && sourceGsd > 0 && renderedGsd > 0
+            ? `原始 ${sourceGsd}m · 预览采样约 ${renderedGsd}m/像素`
+            : renderedGsd > 0 ? `约 ${renderedGsd} m/像素` : '未知';
         const cloud = scene.cloud_percent != null ? `${scene.cloud_percent}%` : '未知';
         const acquiredAt = formatSceneDate(scene.acquired_at);
         const grade = sceneGradeText(scene.decision_grade);
@@ -1406,7 +1743,7 @@ document.addEventListener('DOMContentLoaded', () => {
             </div>
             <div class="scene-chip-row">
                 <span title="拍摄日期"><i class="ri-calendar-line" aria-hidden="true"></i>${escapeHtml(acquiredAt)}</span>
-                <span title="空间分辨率"><i class="ri-ruler-line" aria-hidden="true"></i>${escapeHtml(gsd)}</span>
+                <span title="原始影像分辨率与当前预览采样尺度"><i class="ri-ruler-line" aria-hidden="true"></i>${escapeHtml(gsd)}</span>
                 <span title="云量"><i class="ri-cloudy-line" aria-hidden="true"></i>${escapeHtml(cloud)}</span>
                 ${scene.processing_level ? `<span title="处理级别"><i class="ri-stack-line" aria-hidden="true"></i>${escapeHtml(scene.processing_level)}</span>` : ''}
             </div>
@@ -1424,16 +1761,23 @@ document.addEventListener('DOMContentLoaded', () => {
         modalIdSpan.innerText = currentSpatialCtx ? ` · ${currentSpatialCtx}` : '';
         renderScenePanel(getChatData(fileName).scene);
         renderChatHistory();
-        modal.style.display = 'flex';
+        showChatModal();
         updatePromptScene();
         setTimeout(() => textarea.focus(), 100);
     }
 
-    closeBtn.onclick = () => { modal.style.display = 'none'; };
+    closeBtn.onclick = () => { closeChatModal(); };
+
+    // 影像预览点击在新标签打开原图（modalImg 会被 restoreChatModalLayout 重建，用代理）
+    document.querySelector('.chat-modal-left').addEventListener('click', (e) => {
+        if (e.target.id === 'chat-modal-img' && e.target.src) {
+            window.open(e.target.src, '_blank', 'noopener');
+        }
+    });
 
     // 点击背景关闭
     modal.addEventListener('click', (e) => {
-        if (e.target === modal) modal.style.display = 'none';
+        if (e.target === modal) closeChatModal();
     });
 
     // Enter 发送，Shift+Enter 换行
@@ -1451,13 +1795,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     textarea.addEventListener('input', autoResize);
 
-    // Esc 关闭
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && modal.style.display === 'flex') {
-            modal.style.display = 'none';
-        }
-    });
-
     // 预设提示词：根据单图/多图模式显示对应分组
     function updatePromptScene() {
         const isMulti = currentActiveImage === '__compare__';
@@ -1472,12 +1809,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const area = document.querySelector('.chat-prompts-area');
         const btn = document.getElementById('chat-prompt-toggle');
         const isOpen = area.classList.toggle('show');
-        if (isOpen) {
-            btn.classList.add('active');
-            updatePromptScene();
-        } else {
-            btn.classList.remove('active');
-        }
+        btn.classList.toggle('active', isOpen);
+        btn.setAttribute('aria-expanded', String(isOpen));
+        if (isOpen) updatePromptScene();
     };
 
     // 全局函数：选中预设提示词
@@ -1491,7 +1825,9 @@ document.addEventListener('DOMContentLoaded', () => {
             ta.style.height = ta.scrollHeight + 'px';
         }
         document.querySelector('.chat-prompts-area').classList.remove('show');
-        document.getElementById('chat-prompt-toggle').classList.remove('active');
+        const toggleBtn = document.getElementById('chat-prompt-toggle');
+        toggleBtn.classList.remove('active');
+        toggleBtn.setAttribute('aria-expanded', 'false');
         tag.classList.add('flash');
         setTimeout(() => tag.classList.remove('flash'), 400);
     };
@@ -1508,10 +1844,17 @@ document.addEventListener('DOMContentLoaded', () => {
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;');
 
+        // 块级代码 ```：最先处理并占位，避免内部内容被后续行内规则/表格/换行污染
+        const preBlocks = [];
+        html = html.replace(/```[^\n]*\n([\s\S]*?)```/g, (m, code) => {
+            preBlocks.push(code.replace(/\n$/, ''));
+            return `\u0000PRE${preBlocks.length - 1}\u0000`;
+        });
+
         // 表格处理（先做，内部单元格再补内联格式化）
         html = html.replace(/(\|[^\n]+\|\n\|[-:|\s]+\|\n(?:\|[^\n]+\|\n?)*)/gm, (match) => {
             const rows = match.trim().split('\n');
-            let tableHtml = '<table class="md-table">';
+            let tableHtml = '<div class="md-table-wrap"><table class="md-table">';
             rows.forEach((row, i) => {
                 const cells = row.split('|').filter(c => c.trim() !== '');
                 const tag = i === 1 ? '' : (i === 0 ? 'th' : 'td');
@@ -1527,7 +1870,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     tableHtml += '</tr>';
                 }
             });
-            tableHtml += '</table>';
+            tableHtml += '</table></div>';
             return tableHtml;
         });
 
@@ -1558,7 +1901,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (inOl) { result.push('</ol>'); inOl = false; }
                 if (line.trim() === '') {
                     result.push('<br>');
-                } else if (!line.startsWith('<table') && !line.startsWith('<tr') && !line.startsWith('<td') && !line.startsWith('<th') && !line.startsWith('</table') && !line.startsWith('</tr') && !line.startsWith('</td') && !line.startsWith('</th') && !line.startsWith('<div') && !line.startsWith('<ul') && !line.startsWith('<ol') && !line.startsWith('<li') && !line.startsWith('</ul') && !line.startsWith('</ol') && !line.startsWith('</div') && !line.startsWith('<strong') && !line.startsWith('<em') && !line.startsWith('<br') && !line.startsWith('<code')) {
+                } else if (!line.startsWith('\u0000') && !line.startsWith('<table') && !line.startsWith('<tr') && !line.startsWith('<td') && !line.startsWith('<th') && !line.startsWith('</table') && !line.startsWith('</tr') && !line.startsWith('</td') && !line.startsWith('</th') && !line.startsWith('<div') && !line.startsWith('<ul') && !line.startsWith('<ol') && !line.startsWith('<li') && !line.startsWith('</ul') && !line.startsWith('</ol') && !line.startsWith('</div') && !line.startsWith('<strong') && !line.startsWith('<em') && !line.startsWith('<br') && !line.startsWith('<code')) {
                     result.push(`<p>${line}</p>`);
                 } else {
                     result.push(line);
@@ -1567,7 +1910,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         if (inUl) result.push('</ul>');
         if (inOl) result.push('</ol>');
-        return result.join('\n');
+        // 还原块级代码占位符（内容已转义，直接输出 pre.md-pre>code）
+        return result.join('\n').replace(/\u0000PRE(\d+)\u0000/g, (m, i) =>
+            `<pre class="md-pre"><code>${preBlocks[Number(i)]}</code></pre>`);
     }
 
     function renderMethodMeta(method) {
@@ -1623,6 +1968,7 @@ document.addEventListener('DOMContentLoaded', () => {
         } else if (!document.getElementById('imagery-scene-panel')) {
             left.insertAdjacentHTML('beforeend', '<div id="imagery-scene-panel" class="imagery-scene-panel" hidden></div>');
         }
+        left.style.display = '';
         left.style.flexWrap = '';
         left.style.flexDirection = '';
         left.style.gap = '';
@@ -1717,7 +2063,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const analysisMode = getAnalysisMode();
         const loadingDiv = document.createElement('div');
         loadingDiv.className = 'chat-bubble chat-ai';
-        loadingDiv.innerHTML = `<span class="spinner"></span> SatelliteSense ${analysisMode.label}${isCompare ? '正在对比分析' : '正在分析'}...`;
+        loadingDiv.innerHTML = `<span class="chat-typing"><span class="chat-typing-dots"><i></i><i></i><i></i></span> SatelliteSense ${analysisMode.label}${isCompare ? '正在对比分析' : '正在分析'}...</span>`;
         chatBox.appendChild(loadingDiv);
         chatBox.scrollTop = chatBox.scrollHeight;
 
@@ -1783,10 +2129,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     zoomBtn.addEventListener('click', () => {
-        if (currentActiveImage === '__compare__' || !currentActiveImage) return;
+        if (currentActiveImage === '__compare__' || !currentActiveImage) {
+            showToast('请先打开一个区域的影像，再使用放大', 'warning');
+            return;
+        }
         zoomMode = !zoomMode;
-        zoomBtn.style.background = zoomMode ? 'rgba(0,122,255,0.25)' : 'rgba(255,255,255,0.06)';
-        zoomBtn.style.color = zoomMode ? '#007aff' : 'rgba(255,255,255,0.7)';
+        zoomBtn.classList.toggle('is-active', zoomMode);
         zoomBtn.innerHTML = zoomMode
             ? '<i class="ri-close-line" aria-hidden="true"></i>退出'
             : '<i class="ri-zoom-in-line" aria-hidden="true"></i>放大';
@@ -1837,8 +2185,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (zoomCanvas) { zoomCanvas.remove(); zoomCanvas = null; }
         zoomMode = false;
-        zoomBtn.style.background = 'rgba(255,255,255,0.06)';
-        zoomBtn.style.color = 'rgba(255,255,255,0.7)';
+        zoomBtn.classList.remove('is-active');  // 收尾交给 class，内联样式会压住 CSS 态
         zoomBtn.innerHTML = '<i class="ri-zoom-in-line" aria-hidden="true"></i>放大';
 
         if (x2 - x1 < 0.03 || y2 - y1 < 0.03) return;
@@ -1898,14 +2245,36 @@ document.addEventListener('DOMContentLoaded', () => {
     // ==========================================
     const searchInput = document.getElementById('search-input');
     const searchResults = document.getElementById('search-results');
+    const searchBox = document.getElementById('search-box');
     let searchTimeout = null;
     let searchIdx = -1;
+
+    // ≤960px 顶栏 overflow-x:auto 会裁剪绝对定位的搜索结果：
+    // 窄屏下移到 body 改 position:fixed，按输入框视口坐标定位（.glass 的 backdrop-filter 会劫持 fixed）
+    function portalSearchResults() {
+        if (narrowLayout() && searchResults.style.display === 'block' && !searchResults.classList.contains('is-portaled')) {
+            const r = searchInput.getBoundingClientRect();
+            document.body.appendChild(searchResults);
+            searchResults.classList.add('is-portaled');
+            searchResults.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 316)) + 'px';
+            searchResults.style.top = (r.bottom + 8) + 'px';
+        }
+    }
+    function restoreSearchResults() {
+        if (searchResults.classList.contains('is-portaled')) {
+            searchResults.classList.remove('is-portaled');
+            searchResults.style.left = '';
+            searchResults.style.top = '';
+            searchBox.appendChild(searchResults);
+        }
+    }
 
     searchInput.addEventListener('input', () => {
         clearTimeout(searchTimeout);
         const q = searchInput.value.trim();
-        if (q.length === 0) { searchResults.style.display = 'none'; searchIdx = -1; return; }
+        if (q.length === 0) { searchResults.style.display = 'none'; restoreSearchResults(); searchIdx = -1; return; }
         searchResults.style.display = 'block';
+        portalSearchResults();
         searchResults.innerHTML = '<div class="search-result-item search-state"><span class="spinner"></span> 搜索中...</div>';
         searchIdx = -1;
         searchTimeout = setTimeout(async () => {
@@ -1927,6 +2296,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             map.flyTo([item.lat, item.lon], 14, { duration: 1.2 });
                             searchInput.value = name;
                             searchResults.style.display = 'none';
+                            restoreSearchResults();
                             searchIdx = -1;
                             showToast('已定位: ' + name, 'info');
                         });
@@ -1934,16 +2304,18 @@ document.addEventListener('DOMContentLoaded', () => {
                     });
                 }
                 searchResults.style.display = 'block';
+                portalSearchResults();
             } catch(e) {
                 searchResults.innerHTML = '<div class="search-result-item search-state">搜索服务不可用</div>';
                 searchResults.style.display = 'block';
+                portalSearchResults();
             }
         }, 250);
     });
 
     searchInput.addEventListener('keydown', (e) => {
         const items = searchResults.querySelectorAll('.search-result-item');
-        if (e.key === 'Escape') { searchResults.style.display = 'none'; searchIdx = -1; searchInput.blur(); return; }
+        if (e.key === 'Escape') { searchResults.style.display = 'none'; restoreSearchResults(); searchIdx = -1; searchInput.blur(); return; }
         if (e.key === 'ArrowDown') {
             e.preventDefault();
             searchIdx = Math.min(searchIdx + 1, items.length - 1);
@@ -1957,15 +2329,26 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             return;
         } else { return; }
-        items.forEach((item, i) => item.style.background = i === searchIdx ? 'rgba(0,122,255,0.2)' : '');
+        items.forEach((item, i) => item.classList.toggle('is-active', i === searchIdx));
     });
 
     document.addEventListener('mousedown', (e) => {
-        if (!e.target.closest('#search-box')) { searchResults.style.display = 'none'; searchIdx = -1; }
+        if (!e.target.closest('#search-box') && !e.target.closest('#search-results')) { searchResults.style.display = 'none'; restoreSearchResults(); searchIdx = -1; }
     });
 
     searchInput.addEventListener('focus', () => {
-        if (searchInput.value.trim().length > 0) searchResults.style.display = 'block';
+        if (searchInput.value.trim().length > 0) { searchResults.style.display = 'block'; portalSearchResults(); }
+    });
+
+    // 视口尺寸变化时重算 portal 位置（或收回顶栏）
+    window.addEventListener('resize', () => {
+        if (searchResults.classList.contains('is-portaled')) {
+            searchResults.classList.remove('is-portaled');
+            searchResults.style.left = '';
+            searchResults.style.top = '';
+            searchBox.appendChild(searchResults);
+            if (searchResults.style.display === 'block' && narrowLayout()) portalSearchResults();
+        }
     });
 
     // ==========================================
@@ -1973,6 +2356,27 @@ document.addEventListener('DOMContentLoaded', () => {
     // ==========================================
     const adminToggle = document.getElementById('layer-admin');
     const roadsToggle = document.getElementById('layer-roads');
+    const spectralIndexList = document.getElementById('spectral-index-list');
+    async function loadSpectralIndexCatalog() {
+        if (!spectralIndexList) return;
+        try {
+            const response = await fetch('/api/analysis/indices/');
+            const payload = await response.json();
+            const indices = payload?.data?.indices || {};
+            spectralIndexList.textContent = '';
+            Object.entries(indices).forEach(([key, meta]) => {
+                const item = document.createElement('span');
+                item.className = 'spectral-chip';
+                item.setAttribute('role', 'listitem');
+                item.title = `${meta.label || key} · 波段 ${(meta.bands || []).join(' / ')}`;
+                item.textContent = key.toUpperCase();
+                spectralIndexList.appendChild(item);
+            });
+        } catch (error) {
+            spectralIndexList.textContent = '指标目录暂不可用';
+        }
+    }
+    loadSpectralIndexCatalog();
     const labelLayer = L.tileLayer('https://a.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}.png', {
         maxZoom: 18, attribution: '&copy; <a href="https://carto.com/">CARTO</a>'
     });
@@ -2003,20 +2407,22 @@ document.addEventListener('DOMContentLoaded', () => {
     // 快捷键
     // ==========================================
     document.addEventListener('keydown', (e) => {
+        // Esc 优先于输入框 early-return：textarea 聚焦时也要能关模态/取消框选
+        if (e.key === 'Escape') {
+            let cancelledSel = false;
+            if (selectionRect) { map.removeLayer(selectionRect); selectionRect = null; cancelledSel = true; }
+            if (isSelecting) { isSelecting = false; map.dragging.enable(); cancelledSel = true; }
+            if (isChatModalOpen()) closeChatModal();
+            // 只提示真正取消了的"框选";不谎称能中断已发起的下载/AI 请求
+            if (cancelledSel) showToast('已取消框选', 'info');
+            return;
+        }
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
             if (e.key === 'Enter' && e.ctrlKey) {
                 e.preventDefault();
                 sendBtn.click();
             }
             return;
-        }
-        if (e.key === 'Escape') {
-            let cancelledSel = false;
-            if (selectionRect) { map.removeLayer(selectionRect); selectionRect = null; cancelledSel = true; }
-            if (isSelecting) { isSelecting = false; map.dragging.enable(); cancelledSel = true; }
-            if (modal.style.display === 'flex') { modal.style.display = 'none'; }
-            // 只提示真正取消了的"框选";不谎称能中断已发起的下载/AI 请求
-            if (cancelledSel) showToast('已取消框选', 'info');
         }
     });
 
@@ -2039,6 +2445,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 const item = document.createElement('div');
                 item.className = 'history-item';
                 item.title = '点击加载历史对话';
+                item.tabIndex = 0;
+                item.setAttribute('role', 'button');
                 const badge = document.createElement('span');
                 badge.className = 'history-source-badge';
                 badge.textContent = historySourceCode(h);
@@ -2071,7 +2479,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         modalIdSpan.innerText = currentSpatialCtx ? ' · ' + currentSpatialCtx : '';
                         renderScenePanel(dd.data.scene);
                         renderChatHistory();
-                        modal.style.display = 'flex';
+                        showChatModal();
                         if (dd.data.bbox) {
                             const b = dd.data.bbox;
                             fitMapBounds(dataBboxToMapBounds(b));
@@ -2091,6 +2499,13 @@ document.addEventListener('DOMContentLoaded', () => {
                     e.stopPropagation();
                     await fetch(`/api/ai/history/${h.id}/`, { method: 'DELETE' });
                     loadHistories();
+                });
+                // 键盘可达：Enter/Space 触发与点击相同的加载
+                item.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        item.click();
+                    }
                 });
                 item.appendChild(badge);
                 item.appendChild(label);
@@ -2130,8 +2545,21 @@ document.addEventListener('DOMContentLoaded', () => {
     // ==========================================
     // 报告导出
     // ==========================================
-    document.getElementById('report-btn').addEventListener('click', async () => {
-        if (!currentActiveImage) return;
+    const reportBtn = document.getElementById('report-btn');
+    reportBtn.addEventListener('click', async () => {
+        if (!currentActiveImage) {
+            showToast('请先打开一个区域的影像，再生成报告', 'warning');
+            return;
+        }
+        if (currentActiveImage === '__compare__') {
+            showToast('对比模式暂不支持导出报告，请打开单个区域', 'warning');
+            return;
+        }
+        if (reportBtn.disabled) return;   // 防连点
+        reportBtn.disabled = true;
+        // 忙碌态：spinner + 文案，结束恢复
+        const btnHtml = reportBtn.innerHTML;
+        reportBtn.innerHTML = '<span class="spinner"></span>生成中';
         const mem = chatMemories[currentActiveImage] || {};
         showToast('正在生成报告...', 'info');
         try {
@@ -2149,7 +2577,14 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const d = await r.json();
             if (d.code === 200) {
-                window.location.href = d.data.download_url;
+                // 用隐藏 a[download] 触发下载：直接改 location.href 失败时会整页跳走
+                const a = document.createElement('a');
+                a.href = d.data.download_url;
+                a.download = '';
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
                 showToast('报告已生成，正在下载', 'success');
             } else if (d.code === 410) {
                 showToast(d.msg || '卫星图文件已丢失，请重新框选', 'error');
@@ -2159,6 +2594,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         } catch (e) {
             showToast('报告生成失败', 'error');
+        } finally {
+            reportBtn.disabled = false;
+            reportBtn.innerHTML = btnHtml;
         }
     });
 

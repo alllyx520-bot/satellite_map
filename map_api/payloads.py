@@ -5,6 +5,7 @@
 既有 patch("map_api.views.X") 与 from map_api.views import X 全部不受影响。
 """
 from django.utils import timezone
+import re
 
 from .utils.active_perception import extract_answer_text
 
@@ -60,6 +61,9 @@ def imagery_quality_payload(scene):
     acquired_days = _days_since(scene.acquired_at)
     fetched_days = _days_since(scene.fetched_at)
     gsd = scene.gsd_m or 0
+    scene_metadata = getattr(scene, "metadata", None) or {}
+    preview_gsd = scene_metadata.get("preview_scale_m") or scene_metadata.get("rendered_gsd_m")
+    original_gsd = scene_metadata.get("source_asset_gsd_m") or gsd
     cloud_label = _cloud_label(scene.cloud_percent)
     grade_label = _grade_label(scene.decision_grade)
     cautions = []
@@ -67,7 +71,7 @@ def imagery_quality_payload(scene):
     if source == "sentinel2":
         summary = "近期公开 Sentinel-2 L2A 影像，具备拍摄时间、云量和产品号追溯能力。"
         best_for = "适合宏观地类、水体、植被、农田和大范围建设区变化筛查。"
-        spatial_note = f"约 {gsd:g} m/像素，偏区域级解译。" if gsd else "约 10m 级公开影像，偏区域级解译。"
+        spatial_note = f"原始 GSD 约 {float(original_gsd):g} m/像素；当前预览采样约 {float(preview_gsd):g} m/像素。" if original_gsd and preview_gsd else (f"原始 GSD 约 {float(original_gsd):g} m/像素，偏区域级解译。" if original_gsd else "约 10m 级公开影像，偏区域级解译。")
         cautions.append("不适合车辆、小建筑、屋顶材质等细节目标判读。")
         if scene.cloud_percent is None:
             cautions.append("缺少云量指标，需降低结论确定性。")
@@ -99,6 +103,8 @@ def imagery_quality_payload(scene):
         "summary": summary,
         "best_for": best_for,
         "spatial_resolution": spatial_note,
+        "original_gsd_m": original_gsd or None,
+        "preview_scale_m": preview_gsd,
         "timeliness": _timeliness_label(acquired_days),
         "acquired_days_ago": acquired_days,
         "fetched_days_ago": fetched_days,
@@ -275,6 +281,8 @@ def scene_brief_payload(scene):
         "product_id": scene.product_id,
         "acquired_at": scene.acquired_at.isoformat() if scene.acquired_at else None,
         "gsd_m": scene.gsd_m,
+        "original_gsd_m": (scene.metadata or {}).get("source_asset_gsd_m") or scene.gsd_m,
+        "preview_scale_m": (scene.metadata or {}).get("preview_scale_m") or (scene.metadata or {}).get("rendered_gsd_m") or scene.gsd_m,
         "cloud_percent": scene.cloud_percent,
         "decision_grade": scene.decision_grade,
         "decision_grade_label": quality.get("decision_grade_label"),
@@ -341,6 +349,7 @@ def imagery_context_text(scene):
         return ""
     acquired = scene.acquired_at.strftime("%Y-%m-%d %H:%M") if scene.acquired_at else "未知"
     cloud = f"{scene.cloud_percent}%" if scene.cloud_percent is not None else "未知"
+    scene_metadata = getattr(scene, "metadata", None) or {}
     quality = imagery_quality_payload(scene) or {}
     quality_lines = ""
     if quality:
@@ -356,7 +365,8 @@ def imagery_context_text(scene):
         "## 影像元数据\n"
         f"数据源：{scene.source_label}\n"
         f"拍摄时间：{acquired}\n"
-        f"GSD：约 {scene.gsd_m} m/像素\n"
+        f"原始 GSD：约 {scene_metadata.get('source_asset_gsd_m') or scene.gsd_m} m/像素\n"
+        f"当前预览采样尺度：约 {scene_metadata.get('preview_scale_m') or scene_metadata.get('rendered_gsd_m') or '未知'} m/像素\n"
         f"云量：{cloud}\n"
         f"处理级别：{scene.processing_level}\n"
         f"决策等级：{scene.decision_grade}\n"
@@ -431,6 +441,68 @@ def normalize_model_answer(response_text):
             "warnings": warnings,
         },
     }
+
+
+def apply_quality_guard(answer, *, scene=None, imagery_quality=None):
+    """在证据不足时拦截模型过度具体的定量断言。
+
+    免责声明不能抵消正文里的幻觉数字；当云量、覆盖率、有效像素率或输出 GSD
+    明显不适合精细判读时，替换“目标属性 + 数字 + 单位”片段，并返回可审计元数据。
+    """
+    text = "" if answer is None else str(answer)
+    if imagery_quality:
+        quality = imagery_quality
+    elif scene and hasattr(scene, "acquired_at"):
+        quality = imagery_quality_payload(scene) or {}
+    else:
+        quality = {}
+    metadata = getattr(scene, "metadata", {}) or {}
+    try:
+        gsd = float(getattr(scene, "gsd_m", None) or 0)
+    except (TypeError, ValueError):
+        gsd = 0
+    try:
+        cloud = float(getattr(scene, "cloud_percent", None)) if getattr(scene, "cloud_percent", None) is not None else None
+    except (TypeError, ValueError):
+        cloud = None
+    try:
+        coverage = float(metadata.get("target_coverage_ratio")) if metadata.get("target_coverage_ratio") is not None else None
+    except (TypeError, ValueError):
+        coverage = None
+    try:
+        valid = float(metadata.get("valid_image_ratio")) if metadata.get("valid_image_ratio") is not None else None
+    except (TypeError, ValueError):
+        valid = None
+
+    reasons = []
+    if gsd > 50:
+        reasons.append(f"GSD约{gsd:g}m/像素")
+    if cloud is not None and cloud > 30:
+        reasons.append(f"云量约{cloud:g}%")
+    if coverage is not None and coverage < 0.85:
+        reasons.append(f"有效覆盖约{coverage:.0%}")
+    if valid is not None and valid < 0.80:
+        reasons.append(f"有效像素约{valid:.0%}")
+    if not reasons:
+        return text, {"triggered": False, "reasons": [], "redacted_count": 0}
+
+    # 只处理明显的“属性+精确数字”组合，避免误伤普通日期、比例或 NDWI 数值。
+    numeric_claim = re.compile(
+        r"((?:河道|道路|建筑|养殖塘|池塘|目标|洪泛区|岸线|水面|面积|宽度|长度|直径|水深|流速|含沙量|洪泛面积)"
+        r"[^。！？\n]{0,24}?\d+(?:\.\d+)?\s*(?:mg/L|平方米|公顷|公里|厘米|m²|m2|km|cm|米|吨|m|%))",
+        flags=re.IGNORECASE,
+    )
+    def _redact_claim(match):
+        label_match = re.match(r"(河道|道路|建筑|养殖塘|池塘|目标|洪泛区|岸线|水面|面积|宽度|长度|直径|水深|流速|含沙量|洪泛面积)", match.group(1))
+        label = label_match.group(1) if label_match else "该项"
+        return f"{label}：当前影像无法可靠估计"
+
+    guarded, count = numeric_claim.subn(_redact_claim, text)
+    # 即使没有命中，也给出可见的证据等级提示，供用户理解为何不能精确回答。
+    note = "数据质量门禁：" + "、".join(reasons) + "；本次仅支持区域级趋势/形态判断，精确尺寸、数量和水质参数需更高分辨率或现场数据复核。"
+    if note not in guarded:
+        guarded = guarded.rstrip() + "\n\n" + note
+    return guarded, {"triggered": True, "reasons": reasons, "redacted_count": count}
 
 
 def docx_safe_text(value):

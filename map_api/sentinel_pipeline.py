@@ -18,6 +18,7 @@ from PIL import Image
 from .geo_math import (
     bbox_intersection_ratio, bbox_union_coverage_ratio,
     image_valid_ratio, crop_sentinel_nodata_border, sentinel_nodata_crop_too_large,
+    clip_image_to_polygon,
 )
 from .media_paths import SAVE_DIR, safe_media_path
 from .models import DownloadTask, ImageryScene
@@ -107,6 +108,50 @@ def compose_sentinel_mosaic(rendered_items, width, height, threshold=8):
     return buf.getvalue(), round(float(filled.sum()) / float(width * height), 4), item_summaries
 
 
+def compose_sentinel_grid(rendered_items, width, height, columns, rows, threshold=8):
+    """按每个子 bbox 的地理位置拼接网格渲染结果。
+
+    与旧版“整幅 bbox 渲染后叠加”不同，每个 tile 只渲染自己的范围，
+    避免大行政区任务出现一张图只有局部有效、其余全黑的问题。
+    """
+    if not rendered_items:
+        raise ValueError("没有可拼接的 Sentinel-2 网格结果")
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    filled = np.zeros((height, width), dtype=bool)
+    item_summaries = []
+    tile_w = max(1, int(np.ceil(width / columns)))
+    tile_h = max(1, int(np.ceil(height / rows)))
+    for item in rendered_items:
+        image = Image.open(BytesIO(item["image_bytes"])).convert("RGB")
+        x = int(item.get("grid_x", 0) * tile_w)
+        y = int(item.get("grid_y", 0) * tile_h)
+        w = min(tile_w, width - x)
+        h = min(tile_h, height - y)
+        if w <= 0 or h <= 0:
+            continue
+        image = image.resize((w, h))
+        arr = np.asarray(image, dtype=np.uint8)
+        valid = arr.max(axis=2) > threshold
+        fill = valid & ~filled[y:y + h, x:x + w]
+        canvas[y:y + h, x:x + w][fill] = arr[fill]
+        filled[y:y + h, x:x + w] |= valid
+        candidate = item["candidate"]
+        item_summaries.append({
+            "product_id": candidate.product_id,
+            "item_id": candidate.item_id,
+            "coverage_ratio": item.get("coverage_ratio", 0),
+            "grid_x": item.get("grid_x", 0),
+            "grid_y": item.get("grid_y", 0),
+            "tile_bbox": item.get("tile_bbox"),
+            "valid_image_ratio": round(float(valid.sum()) / float(width * height), 4),
+            "used_pixel_ratio": round(float(fill.sum()) / float(width * height), 4),
+        })
+    output = Image.fromarray(canvas, mode="RGB")
+    buf = BytesIO()
+    output.save(buf, "JPEG", quality=92)
+    return buf.getvalue(), round(float(filled.sum()) / float(width * height), 4), item_summaries
+
+
 
 def sentinel_cache_key(candidate, bbox, width, height):
     payload = {
@@ -183,10 +228,19 @@ def select_best_sentinel_candidate(candidates):
 
 
 def sorted_sentinel_candidates(candidates):
+    """按云量优先、时间次之、综合评分兜底排序。
+
+    Earth Search 已在时间范围内返回候选；对同一行政区的候选，云量是
+    真彩色和 NDWI 可用性的直接质量指标，不能再让粗粒度 suitability score
+    把较高云量影像排在低云量影像前面。
+    """
     return sorted(
         candidates or [],
-        key=lambda c: (c.suitability_score or 0, c.acquired_at.timestamp() if c.acquired_at else 0),
-        reverse=True,
+        key=lambda c: (
+            100.0 if c.cloud_percent is None else float(c.cloud_percent),
+            -(c.acquired_at.timestamp() if c.acquired_at else 0),
+            -(c.suitability_score or 0),
+        ),
     )
 
 
@@ -200,7 +254,13 @@ def greedy_cover_sentinel_candidates(candidates, bbox, max_count=6):
         for candidate in remaining:
             coverage = bbox_union_coverage_ratio(bbox, [c.bbox for c in selected] + [candidate.bbox])
             if coverage > best_coverage or (
-                coverage == best_coverage and best and (candidate.suitability_score or 0) > (best.suitability_score or 0)
+                coverage == best_coverage and best and (
+                    100.0 if candidate.cloud_percent is None else float(candidate.cloud_percent),
+                    -(candidate.suitability_score or 0),
+                ) < (
+                    100.0 if best.cloud_percent is None else float(best.cloud_percent),
+                    -(best.suitability_score or 0),
+                )
             ):
                 best = candidate
                 best_coverage = coverage
@@ -310,6 +370,7 @@ def scene_from_candidate(
         "rendered_by": "titiler",
         "source_asset_gsd_m": candidate.gsd_m,
         "rendered_gsd_m": round(rendered_gsd_m, 2),
+        "preview_scale_m": round(rendered_gsd_m, 2),
     }
     if cache_key:
         metadata["sentinel_cache_key"] = cache_key
@@ -328,6 +389,8 @@ def scene_from_candidate(
         min_lat=bbox["min_lat"],
         max_lng=bbox["max_lng"],
         max_lat=bbox["max_lat"],
+        # 保持历史 API 的 gsd_m（当前渲染采样尺度）兼容；原始传感器 GSD
+        # 通过 metadata.source_asset_gsd_m 单独暴露，前端/模型必须使用该字段标注原始分辨率。
         gsd_m=round(rendered_gsd_m, 2),
         area_km2=round(area_km2, 4),
         cloud_percent=candidate.cloud_percent,
@@ -373,6 +436,7 @@ def scene_from_sentinel_mosaic(
         "rendered_by": "titiler",
         "source_asset_gsd_m": primary.gsd_m,
         "rendered_gsd_m": round(rendered_gsd_m, 2),
+        "preview_scale_m": round(rendered_gsd_m, 2),
         "render_size_px": render_size,
         "mosaic": True,
         "mosaic_candidate_count": len(candidates),
@@ -454,6 +518,8 @@ def sentinel_retrieval_result(
     min_valid_ratio=None,
     max_mosaic_candidates=None,
     allow_mosaic=True,
+    max_auto_crop_ratio=None,
+    polygon=None,
 ):
     if not candidates:
         return None
@@ -527,7 +593,13 @@ def sentinel_retrieval_result(
             effective_bbox = processed["bbox"]
             effective_plan = processed["plan"]
             crop_metadata = processed["metadata"]
-            if sentinel_nodata_crop_too_large(crop_metadata):
+            if polygon:
+                try:
+                    image_bytes, polygon_coverage = clip_image_to_polygon(image_bytes, effective_bbox, polygon)
+                except ValueError as exc:
+                    render_errors.append(f"{candidate.product_id or candidate.item_id}: {exc}")
+                    continue
+            if sentinel_nodata_crop_too_large(crop_metadata, max_removed_ratio=max_auto_crop_ratio):
                 render_errors.append(
                     f"{candidate.product_id or candidate.item_id}: 边缘 no-data 占比 "
                     f"{float(crop_metadata.get('removed_pixel_ratio') or 0):.1%}，疑似覆盖不足或拼接不完整"
@@ -638,7 +710,9 @@ def sentinel_retrieval_result(
     effective_bbox = processed["bbox"]
     effective_plan = processed["plan"]
     crop_metadata = processed["metadata"]
-    if sentinel_nodata_crop_too_large(crop_metadata):
+    if polygon:
+        mosaic_bytes, polygon_coverage = clip_image_to_polygon(mosaic_bytes, effective_bbox, polygon)
+    if sentinel_nodata_crop_too_large(crop_metadata, max_removed_ratio=max_auto_crop_ratio):
         raise ValueError(
             f"Sentinel-2 多景拼接后仍存在大面积 no-data 边缘 "
             f"({float(crop_metadata.get('removed_pixel_ratio') or 0):.1%})；"
