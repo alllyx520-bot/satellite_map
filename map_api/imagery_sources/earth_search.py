@@ -331,6 +331,8 @@ class EarthSearchProvider(ImageryProvider):
                     "type": asset.get("type", ""),
                     "title": asset.get("title", ""),
                     "roles": asset.get("roles", []),
+                    "gsd": asset.get("gsd"),
+                    "raster:bands": asset.get("raster:bands") or [],
                 }
         return result
 

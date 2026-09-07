@@ -2368,8 +2368,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 const item = document.createElement('span');
                 item.className = 'spectral-chip';
                 item.setAttribute('role', 'listitem');
-                item.title = `${meta.label || key} · 波段 ${(meta.bands || []).join(' / ')}`;
-                item.textContent = key.toUpperCase();
+                item.title = meta.implemented
+                    ? `${meta.label || key} · 波段 ${(meta.bands || []).join(' / ')} · 已接通`
+                    : `${meta.label || key} · 当前仅为指标目录，尚未接通真实波段执行链`;
+                item.textContent = meta.implemented ? key.toUpperCase() : `${key.toUpperCase()} · 目录`;
                 spectralIndexList.appendChild(item);
             });
         } catch (error) {

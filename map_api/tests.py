@@ -25,9 +25,21 @@ import requests
 from PIL import Image
 from .remote_sensing_indices import ndvi, ndwi, bsi, ndsi, summarize, otsu_threshold, quantile_threshold, get_index_function, compute_index, change_summary
 from .agent.registry import ToolDefinition
+from .utils.agent_tools import fetch_cog_bbox_array
 
 
 class SpectralIndexTests(SimpleTestCase):
+    def test_cog_reader_uses_discrete_scl_contract(self):
+        response = MagicMock()
+        response.content = b"fake"
+        response.raise_for_status.return_value = None
+        image = Image.new("L", (2, 2), 8)
+        buf = BytesIO(); image.save(buf, "TIFF")
+        response.content = buf.getvalue()
+        with patch("map_api.utils.agent_tools.requests.get", return_value=response) as get_mock:
+            fetch_cog_bbox_array({"href": "https://example.com/SCL.tif"}, {"min_lng": 1, "min_lat": 2, "max_lng": 3, "max_lat": 4}, "https://titiler.test", kind="scl")
+        self.assertEqual(get_mock.call_args.kwargs["params"], {"url": "https://example.com/SCL.tif", "resampling": "nearest"})
+
     def test_indices_and_summary_are_numeric_and_masked(self):
         red = np.array([[1, 2], [0, 4]], dtype=np.float32)
         nir = np.array([[3, 2], [0, 8]], dtype=np.float32)
@@ -1256,7 +1268,7 @@ class AIQueryApiTests(TestCase):
                 data={
                     "file_name": file_name,
                     "scene_id": scene.id,
-                    "question": "数一下这里的建筑细节",
+                    "question": "分析这片区域",
                     "mode": "precise",
                     "self_check": True,
                     "history": [],
@@ -1320,7 +1332,7 @@ class AIQueryApiTests(TestCase):
         image_path = self._make_test_image(file_name)
         scene = ImageryScene.objects.create(
             file_name=file_name,
-            source="mapbox",
+            source="sentinel2",
             min_lng=10,
             min_lat=20,
             max_lng=14,
@@ -1347,7 +1359,7 @@ class AIQueryApiTests(TestCase):
                 data={
                     "file_name": file_name,
                     "scene_id": scene.id,
-                    "question": "数一下这里的建筑细节",
+                    "question": "分析这片区域的建筑细节",
                     "mode": "precise",
                     "history": [],
                 },
@@ -1356,13 +1368,28 @@ class AIQueryApiTests(TestCase):
 
         self.assertEqual(r.status_code, 200)
         data = r.json()["data"]
-        self.assertEqual(data["active_stages"], 2)
-        self.assertEqual(data["answer"], "局部细节分析结论\n\n📐 **定量信息**（基于 GSD 测算）：尺寸约 16.0m × 16.0m · 占地约 256 m² · 中心约 22.5°N, 11.5°E")
-        self.assertEqual(data["targets"][0]["width_m"], 16.0)
-        self.assertEqual(data["targets"][0]["height_m"], 16.0)
-        self.assertEqual(data["targets"][0]["area_m2"], 256.0)
-        self.assertEqual(data["targets"][0]["lat"], 22.5)
-        self.assertEqual(data["targets"][0]["lng"], 11.5)
+        self.assertEqual(data["active_stages"], 1)
+        self.assertEqual(data["answer"], stage1)
+        self.assertEqual(data["targets"], [])
+
+    def test_mapbox_scene_does_not_claim_physical_measurement(self):
+        file_name = "sat_mapbox_no_measure.jpg"
+        image_path = self._make_test_image(file_name)
+        scene = ImageryScene.objects.create(
+            file_name=file_name, source="mapbox", min_lng=10, min_lat=20,
+            max_lng=14, max_lat=24, gsd_m=1.2,
+        )
+        preprocess = {"single": image_path, "orig_w": 32, "orig_h": 32, "eff_w": 32, "eff_h": 32}
+        with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-key"}, clear=False), \
+                patch("map_api.views.smart_prepare_image_v2", return_value=preprocess), \
+                patch("map_api.views._call_qwen", return_value=self._fake_qwen_response('<answer>整体结论</answer>')):
+            response = self.client.post(
+                "/api/ai/query-region/",
+                data={"file_name": file_name, "scene_id": scene.id, "question": "分析整体区域", "active_perception": False},
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["targets"], [])
 
 
 class HistoryApiTests(TestCase):

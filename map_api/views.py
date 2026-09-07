@@ -1370,7 +1370,7 @@ def run_vl_analysis(data):
             mode = "precise"
         mode_cfg = ANALYSIS_MODES[mode]
         model_name = mode_cfg["model"]
-        gsd = data.get("gsd")              # 米/像素(用于 GSD 测量)
+        gsd = data.get("gsd")              # Sentinel 物理 GSD；Mapbox 仅为截图采样间隔
         geo_bbox = data.get("bbox")        # 图像地理范围 {min_lng,max_lng,min_lat,max_lat}(用于坐标接地)
         scene = None
 
@@ -1425,6 +1425,10 @@ def run_vl_analysis(data):
             if scene:
                 if not gsd and scene.gsd_m:
                     gsd = scene.gsd_m
+                # Mapbox 的 gsd_m 只是导出栅格采样间隔，不是传感器 GSD，
+                # 禁止进入物理尺寸/面积测量路径。
+                if (scene.source or "").lower() == "mapbox":
+                    gsd = None
                 if not isinstance(geo_bbox, dict):
                     geo_bbox = {
                         "min_lng": scene.min_lng,

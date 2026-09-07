@@ -487,21 +487,44 @@ def resolve_district_bbox(place_name, timeout=12):
     }
 
 
-def fetch_cog_bbox_array(asset_url, bbox, titiler_endpoint, size=256, timeout=60):
+def fetch_cog_bbox_array(asset, bbox, titiler_endpoint, size=256, timeout=60, kind="reflectance"):
+    """读取 Sentinel COG bbox，并按资产语义返回数组。
+
+    反射率资产使用 STAC raster:bands 的 scale/offset；SCL 是离散分类栅格，
+    禁止使用连续值 rescale，避免云/阴影类别被压成 0/255。
+    """
+    asset_info = asset if isinstance(asset, dict) else {}
+    asset_url = asset_info.get("href") if isinstance(asset_info, dict) else asset
+    if not asset_url:
+        raise ValueError("COG 资产缺少 href")
     endpoint = (
         f"{(titiler_endpoint or 'https://titiler.xyz').rstrip('/')}/cog/bbox/"
         f"{bbox['min_lng']},{bbox['min_lat']},{bbox['max_lng']},{bbox['max_lat']}/"
         f"{size}x{size}.tif"
     )
+    params = {"url": asset_url}
+    if kind == "scl":
+        params["resampling"] = "nearest"
+    else:
+        params["rescale"] = "0,10000"
     response = requests.get(
         endpoint,
-        params={"url": asset_url, "rescale": "0,10000"},
+        params=params,
         timeout=timeout,
         proxies=request_proxies(),
     )
     response.raise_for_status()
     image = Image.open(BytesIO(response.content))
-    arr = np.asarray(image.convert("F"), dtype=np.float32)
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    if kind != "scl":
+        bands = asset_info.get("raster:bands") or []
+        band = bands[0] if bands and isinstance(bands[0], dict) else {}
+        scale = float(band.get("scale", 1.0) or 1.0)
+        offset = float(band.get("offset", 0.0) or 0.0)
+        if scale != 1.0 or offset != 0.0:
+            arr = arr * scale + offset
     return arr
 
 
@@ -580,18 +603,29 @@ def compute_ndwi_summary(candidate, bbox, titiler_endpoint=None, threshold=NDWI_
             "limitations": "仍可使用真彩色影像做视觉解译，但水体比例不提供量化结果。",
         }
     try:
-        green = fetch_cog_bbox_array(green_url, bbox, titiler_endpoint)
-        nir = fetch_cog_bbox_array(nir_url, bbox, titiler_endpoint)
+        green_asset = assets.get("green") or {}
+        nir_asset = assets.get("nir") or {}
+        green = fetch_cog_bbox_array(green_asset, bbox, titiler_endpoint)
+        nir = fetch_cog_bbox_array(nir_asset, bbox, titiler_endpoint)
         scl_url = (assets.get("scl") or {}).get("href")
         valid_mask = None
         if scl_url:
-            scl = fetch_cog_bbox_array(scl_url, bbox, titiler_endpoint)
+            scl = fetch_cog_bbox_array(assets.get("scl") or {}, bbox, titiler_endpoint, kind="scl")
             # Sentinel-2 SCL: 3 cloud shadow, 8/9 cloud, 10 cirrus, 11 snow/ice
             valid_mask = ~np.isin(np.rint(scl).astype(np.int16), [3, 8, 9, 10, 11])
         polygon_mask = polygon_mask_for_bbox(polygon, bbox, green.shape) if polygon else None
         if polygon_mask is not None:
             valid_mask = polygon_mask if valid_mask is None else (valid_mask & polygon_mask)
         result = compute_ndwi_from_arrays(green, nir, threshold=threshold, valid_mask=valid_mask)
+        if valid_mask is not None:
+            result["mask_source"] = "sentinel-2-scl"
+            result["masked_pixel_count"] = int((~valid_mask).sum())
+        result["data_contract"] = {
+            "source": "sentinel-2-l2a",
+            "reflectance_scale_applied": True,
+            "scl_resampling": "nearest" if scl_url else None,
+            "measurement_grade": "screening",
+        }
         if polygon_mask is not None:
             result["limitations"] = result["limitations"].replace("未做行政边界精确裁剪", "已按行政区 polygon 裁剪")
             result["polygon_clipped"] = True
@@ -651,6 +685,7 @@ def compute_ndwi_mosaic_summary(
             "polygon_clipped": bool(polygon),
         }
     water_ratio = weighted_water / sample_total
+    dates = [getattr(candidate, "acquired_at", None).date().isoformat() for candidate in candidates or [] if getattr(candidate, "acquired_at", None)]
     return {
         "available": True,
         "method": "NDWI=(Green-NIR)/(Green+NIR)",
@@ -662,6 +697,9 @@ def compute_ndwi_mosaic_summary(
         "max_ndwi": round(weighted_max, 4) if weighted_max is not None else None,
         "sample_size_px": sample_total,
         "candidate_count": len(summaries),
+        "acquisition_dates": sorted(set(dates)),
+        "temporal_consistency": "same_date_required_for_change" if len(set(dates)) > 1 else "same_date_or_single_scene",
+        "change_detection_allowed": len(set(dates)) <= 1,
         "candidate_summaries": summaries,
         "failed_candidates": failed,
         "polygon_clipped": bool(polygon),

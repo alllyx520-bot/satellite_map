@@ -2,19 +2,19 @@
 import numpy as np
 
 INDEX_DEFINITIONS = {
-    "ndvi": {"label": "植被指数", "bands": ("red", "nir"), "range": (-1, 1), "formula": "(NIR-Red)/(NIR+Red)", "threshold_strategy": "分位数或 Otsu", "uses": ("植被健康", "农田筛查")},
-    "ndwi": {"label": "水体指数", "bands": ("green", "nir"), "range": (-1, 1), "formula": "(Green-NIR)/(Green+NIR)", "threshold_strategy": "Otsu", "uses": ("水体范围", "岸线变化")},
-    "mndwi": {"label": "改进水体指数", "bands": ("green", "swir"), "range": (-1, 1), "formula": "(Green-SWIR)/(Green+SWIR)", "threshold_strategy": "Otsu", "uses": ("城市水体", "建筑背景抑制")},
-    "ndbi": {"label": "建成区指数", "bands": ("swir", "nir"), "range": (-1, 1), "formula": "(SWIR-NIR)/(SWIR+NIR)", "threshold_strategy": "分位数或 Otsu", "uses": ("城市扩张", "建设活动")},
-    "bsi": {"label": "裸土指数", "bands": ("swir", "red", "nir", "blue"), "range": (-1, 1), "formula": "((SWIR+Red)-(NIR+Blue))/((SWIR+Red)+(NIR+Blue))", "threshold_strategy": "分位数", "uses": ("裸地筛查", "施工扰动")},
-    "ndsi": {"label": "雪指数", "bands": ("green", "swir"), "range": (-1, 1), "formula": "(Green-SWIR)/(Green+SWIR)", "threshold_strategy": "Otsu", "uses": ("积雪范围", "冰雪变化")},
+    "ndvi": {"label": "植被指数", "bands": ("red", "nir"), "range": (-1, 1), "formula": "(NIR-Red)/(NIR+Red)", "threshold_strategy": "分位数或 Otsu", "uses": ("植被健康", "农田筛查"), "status": "catalog_only", "implemented": False},
+    "ndwi": {"label": "水体指数", "bands": ("green", "nir"), "range": (-1, 1), "formula": "(Green-NIR)/(Green+NIR)", "threshold_strategy": "固定阈值 + 质量说明", "uses": ("水体范围", "岸线变化"), "status": "implemented", "implemented": True},
+    "mndwi": {"label": "改进水体指数", "bands": ("green", "swir"), "range": (-1, 1), "formula": "(Green-SWIR)/(Green+SWIR)", "threshold_strategy": "Otsu", "uses": ("城市水体", "建筑背景抑制"), "status": "catalog_only", "implemented": False},
+    "ndbi": {"label": "建成区指数", "bands": ("swir", "nir"), "range": (-1, 1), "formula": "(SWIR-NIR)/(SWIR+NIR)", "threshold_strategy": "分位数或 Otsu", "uses": ("城市扩张", "建设活动"), "status": "catalog_only", "implemented": False},
+    "bsi": {"label": "裸土指数", "bands": ("swir", "red", "nir", "blue"), "range": (-1, 1), "formula": "((SWIR+Red)-(NIR+Blue))/((SWIR+Red)+(NIR+Blue))", "threshold_strategy": "分位数", "uses": ("裸地筛查", "施工扰动"), "status": "catalog_only", "implemented": False},
+    "ndsi": {"label": "雪指数", "bands": ("green", "swir"), "range": (-1, 1), "formula": "(Green-SWIR)/(Green+SWIR)", "threshold_strategy": "Otsu", "uses": ("积雪范围", "冰雪变化"), "status": "catalog_only", "implemented": False},
 }
 
 INDEX_FUNCTIONS = {}
 
 
 def available_indices():
-    return {name: dict(meta) for name, meta in INDEX_DEFINITIONS.items()}
+    return {name: {**meta, "bands": list(meta.get("bands", ())), "uses": list(meta.get("uses", ())) } for name, meta in INDEX_DEFINITIONS.items()}
 
 
 def get_index_function(name):
