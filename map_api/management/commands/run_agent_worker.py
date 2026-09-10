@@ -9,6 +9,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from map_api.models import AgentSession
+from map_api.run_kernel import sync_session
 from map_api.orchestrator import run_agent_session
 from map_api.report_jobs import claim_next_report_job, execute_report_job
 from map_api.download_jobs import claim_next_download_task, execute_download_task
@@ -77,6 +78,15 @@ class Command(BaseCommand):
             for session_id in session_ids:
                 if processed_this_round >= max_sessions:
                     break
+                from map_api.models import AgentRun
+                candidate_session = AgentSession.objects.filter(pk=session_id).first()
+                candidate_run = AgentRun.objects.filter(pk=(candidate_session.artifacts or {}).get("run_id")).first() if candidate_session else None
+                if candidate_run and candidate_run.execution_engine == "dag":
+                    from map_api.run_executor import execute_run
+                    execute_run(candidate_run.id, worker_id)
+                    processed_this_round += 1
+                    total += 1
+                    continue
                 # 短事务抢占，避免多个 worker 同时重复跑同一会话；长耗时执行在事务外完成。
                 try:
                     with transaction.atomic():
@@ -107,11 +117,16 @@ class Command(BaseCommand):
                         "resume_with_scene": bool(session.scene_id),
                         "worker_claim": worker_id,
                     })
+                    sync_session(session.id)
                     total += 1
                 except Exception as exc:
                     self.stderr.write(f"会话 #{session.id} 执行异常：{exc}")
                     failed += 1
                     self._mark_worker_failure(session.id, worker_id, exc)
+                    try:
+                        sync_session(session.id, error=str(exc))
+                    except AgentSession.DoesNotExist:
+                        pass
             if once:
                 self.stdout.write(f"本轮处理 {total} 个 Agent 会话，失败 {failed} 个。")
                 return

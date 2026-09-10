@@ -23,6 +23,77 @@ from contextlib import ExitStack
 import numpy as np
 import requests
 from PIL import Image
+from .models import AgentRun
+from .run_kernel import InvalidRunTransition, transition
+
+
+class AgentRunKernelTests(TestCase):
+    def test_state_transition_and_checkpoint(self):
+        run = AgentRun.objects.create(goal="水体", run_key="test-run-kernel")
+        transition(run.id, "planning", snapshot={"status": "planning"})
+        self.assertEqual(run.checkpoints.count(), 1)
+        with self.assertRaises(InvalidRunTransition):
+            transition(run.id, "completed")
+        transition(run.id, "running")
+        transition(run.id, "completed", snapshot={"status": "completed"})
+        run.refresh_from_db()
+        self.assertEqual(run.status, "completed")
+        self.assertEqual(run.checkpoints.count(), 3)
+        self.assertEqual(run.events.count(), 3)
+
+    def test_session_sync_projects_artifacts_and_evidence(self):
+        from .models import AgentSession
+        from .run_kernel import sync_session
+        run = AgentRun.objects.create(goal="水体", run_key="artifact-run", status="running")
+        session = AgentSession.objects.create(goal="水体", status="completed", artifacts={
+            "run_id": run.id, "observer": {"current_step": "complete"},
+            "file_name": "scene.tif", "final_answer": "复核结论", "ndwi": {"water_percent": 12},
+        })
+        session.timeline = [{"id": "complete", "status": "done"}]
+        session.save(update_fields=["timeline"])
+        sync_session(session.id, snapshot={"evidence": [{"evidence_id": "e1", "tool": "compute_ndwi", "value": 12}]})
+        run.refresh_from_db()
+        self.assertEqual(run.status, "completed")
+        self.assertEqual(run.artifacts_v2.count(), 3)
+        self.assertEqual(run.evidence_v2.get(evidence_id="e1").value, 12)
+        self.assertEqual(run.steps.count(), 0)
+
+    def test_agent_run_detail_returns_persisted_facts(self):
+        from .models import AgentSession, RunArtifact, RunEvidence
+        run = AgentRun.objects.create(goal="水体", run_key="detail-run", status="completed")
+        owner = self.client.session
+        owner.save()
+        AgentSession.objects.create(goal=run.goal, owner_session_key=owner.session_key, artifacts={"run_id": run.id})
+        RunArtifact.objects.create(run=run, artifact_id="a1", kind="result", title="结果", uri="urn:test")
+        RunEvidence.objects.create(run=run, evidence_id="e1", kind="metric", metric="NDWI", value=0.4)
+        response = self.client.get(f"/api/agent/runs/{run.id}/")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["data"]
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual(data["artifacts"][0]["id"], "a1")
+        self.assertEqual(data["evidence"][0]["metric"], "NDWI")
+        self.assertFalse(data["acceptance"]["passed"])
+        self.assertFalse(data["acceptance"]["required_evidence_complete"])
+        self.assertIsNone(data["acceptance"]["fallback_used"])
+        self.assertIsNone(data["acceptance"]["provider_switch_count"])
+        self.assertEqual(Client().get(f"/api/agent/runs/{run.id}/").status_code, 404)
+
+    def test_unowned_run_is_not_public(self):
+        run = AgentRun.objects.create(goal="private", run_key="unowned")
+        self.assertEqual(self.client.get(f"/api/agent/runs/{run.id}/").status_code, 404)
+
+    def test_other_browser_cannot_read_run_or_checkpoint(self):
+        from .models import AgentSession
+        run = AgentRun.objects.create(goal="private", run_key="owned")
+        owner = self.client.session
+        owner.save()
+        AgentSession.objects.create(goal=run.goal, owner_session_key=owner.session_key, artifacts={"run_id": run.id})
+        transition(run.id, "planning", snapshot={"private": "checkpoint-data"})
+        outsider = Client()
+        outsider.session.save()
+        response = outsider.get(f"/api/agent/runs/{run.id}/")
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("checkpoint-data", response.content.decode())
 from .remote_sensing_indices import ndvi, ndwi, bsi, ndsi, summarize, otsu_threshold, quantile_threshold, get_index_function, compute_index, change_summary
 from .agent.registry import ToolDefinition
 from .utils.agent_tools import fetch_cog_bbox_array
@@ -475,7 +546,7 @@ class AnalysisModeTests(SimpleTestCase):
 
 
 class AgentToolTests(SimpleTestCase):
-    def test_grid_ndwi_keeps_valid_tiles_when_one_tile_fails(self):
+    def test_grid_ndwi_rejects_incomplete_region_when_one_tile_fails(self):
         scene = SimpleNamespace(
             id=1,
             source="sentinel2",
@@ -500,7 +571,8 @@ class AgentToolTests(SimpleTestCase):
                 patch("map_api.agent.tools._views._candidate_from_mosaic_metadata", return_value=SimpleNamespace()), \
                 patch("map_api.agent.tools._views.compute_ndwi_summary", side_effect=[RuntimeError("TiTiler timeout"), good_summary, good_summary]):
             result = _tool_compute_ndwi({"scene_id": 1, "slots": {}, "bbox": None}, {})
-        self.assertTrue(result["result"]["available"])
+        self.assertFalse(result["result"]["available"])
+        self.assertEqual(result["status"], "failed")
         self.assertEqual(result["result"]["grid_count"], 2)
         self.assertEqual(result["result"]["grid_failed_count"], 1)
 
@@ -788,20 +860,15 @@ class AgentToolTests(SimpleTestCase):
         self.assertEqual(out["water_percent"], 50.0)
         self.assertEqual(out["method"], "NDWI=(Green-NIR)/(Green+NIR)")
 
-    def test_ndwi_mosaic_passes_district_polygon_to_each_candidate(self):
-        candidates = [SimpleNamespace(product_id="S2-A", item_id="", assets={})]
+    def test_ndwi_mosaic_applies_district_polygon_to_combined_grid(self):
+        candidates = [SimpleNamespace(product_id="S2-A", item_id="", assets={}, acquired_at=timezone.now())]
         polygon = [[[0, 0], [1, 0], [1, 1], [0, 0]]]
-        with patch("map_api.utils.agent_tools.compute_ndwi_summary", return_value={
-            "available": True,
-            "sample_size_px": 4,
-            "water_ratio": 0.25,
-            "mean_ndwi": 0.1,
-            "max_ndwi": 0.4,
-        }) as mocked:
+        with patch("map_api.utils.agent_tools._read_ndwi_inputs", return_value=(np.full((64,64),0.5), np.full((64,64),0.1), np.ones((64,64),dtype=bool))):
             result = compute_ndwi_mosaic_summary(candidates, {"min_lng": 0, "min_lat": 0, "max_lng": 1, "max_lat": 1}, polygon=polygon)
         self.assertTrue(result["available"])
         self.assertTrue(result["polygon_clipped"])
-        self.assertEqual(mocked.call_args.kwargs["polygon"], polygon)
+        self.assertLess(result["sample_size_px"],4096)
+        self.assertEqual(result["water_percent"],100)
 
     def test_execution_event_payload_is_public_decision_summary_and_redacted(self):
         payload = normalized_payload("model_decision", {
@@ -2262,7 +2329,20 @@ def _agent_final(text, current_step="complete", thought=None):
         "plan": _AGENT_PLAN_STEPS,
         "tool_call": None,
         "final_answer": text,
+        "limitations": ["受影像日期、分辨率和阈值影响，结果仅作筛查。"],
     }
+
+
+def _agent_script(steps):
+    script = iter(steps)
+    def decision(messages, tools, ctx):
+        step = next(script)
+        if isinstance(step, BaseException):
+            raise step
+        if step.get("final_answer") and "evidence_refs" not in step:
+            step = {**step, "evidence_refs": [item["evidence_id"] for item in ctx.get("evidence", []) if item.get("evidence_id")]}
+        return step
+    return decision
 
 
 class AgentSessionApiTests(TestCase):
@@ -2281,7 +2361,7 @@ class AgentSessionApiTests(TestCase):
 
     def _jpg_bytes(self):
         buf = BytesIO()
-        Image.new("RGB", (64, 64), (80, 120, 160)).save(buf, "JPEG")
+        Image.new("RGB", (1024, 1024), (80, 120, 160)).save(buf, "JPEG")
         return buf.getvalue()
 
     def _candidate(self, cloud=8.5):
@@ -2365,7 +2445,7 @@ class AgentSessionApiTests(TestCase):
     def _post_session(self, st, script, extra_patches=None, **post_data):
         for p in self._domain_patches():
             st.enter_context(p)
-        st.enter_context(patch("map_api.agent.loop.agent_step", side_effect=script))
+        st.enter_context(patch("map_api.agent.loop.agent_step", side_effect=_agent_script(script)))
         for p in (extra_patches or []):
             st.enter_context(p)
         body = {"goal": self.GOAL, "sync": True}
@@ -2561,7 +2641,7 @@ class AgentSessionApiTests(TestCase):
             ])
         self.assertEqual(r.status_code, 200)
         data = r.json()["data"]
-        self.assertEqual(data["status"], "completed")
+        self.assertEqual(data["status"], "completed", data.get("artifacts", {}).get("waiting"))
         self.assertEqual(data["slots"]["task"], "water")
         self.assertEqual(data["slots"]["source"], "sentinel2")
         self.assertEqual(data["artifacts"]["ndwi"]["water_percent"], 18.5)
@@ -2571,6 +2651,47 @@ class AgentSessionApiTests(TestCase):
         self.assertTrue(data["observer"]["plan_steps"])
         self.assertTrue(ChatHistory.objects.filter(id=data["history_id"]).exists())
         self.assertTrue(AgentSession.objects.filter(id=data["id"], status=AgentSession.STATUS_COMPLETED).exists())
+        self._cleanup_img(data)
+
+    def test_failed_metric_stops_before_visual_review_or_final(self):
+        with ExitStack() as st:
+            r = self._post_session(st, [
+                _agent_call("geocode_place", {"place_name": "南宁市"}),
+                _agent_call("search_sentinel_imagery"),
+                _agent_call("compute_ndwi"),
+                _agent_final("不得发布这个没有计算依据的结论"),
+            ], extra_patches=[patch("map_api.views.compute_ndwi_summary", return_value={
+                "available": False, "reason": "缺少 SCL 资产",
+            })])
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "waiting_user")
+        self.assertIn("缺少 SCL", data["artifacts"]["waiting"]["message"])
+        self.assertNotIn("final_answer", data["artifacts"])
+        self.assertFalse(ChatHistory.objects.exists())
+        self._cleanup_img(data)
+
+    def test_blank_model_decisions_never_start_rule_tools(self):
+        with ExitStack() as st:
+            search = st.enter_context(patch("map_api.views._agent_fetch_sentinel"))
+            r = self._post_session(st, [_agent_final("")] * 10)
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "failed")
+        search.assert_not_called()
+        self.assertNotIn("final_answer", data["artifacts"])
+
+    def test_coarse_imagery_cannot_produce_synthetic_completed_answer(self):
+        image = BytesIO()
+        Image.new("RGB", (64, 64), (80, 120, 160)).save(image, "JPEG")
+        with ExitStack() as st:
+            r = self._post_session(st, [
+                _agent_call("geocode_place", {"place_name": "南宁市"}),
+                _agent_call("search_sentinel_imagery"),
+                _agent_final("不得将低质量影像标记为完成"),
+            ], extra_patches=[patch("map_api.views.EarthSearchProvider.render_candidate_jpeg", return_value=image.getvalue())])
+        data = r.json()["data"]
+        self.assertEqual(data["status"], "waiting_user")
+        self.assertNotIn("final_answer", data["artifacts"])
+        self.assertFalse(ChatHistory.objects.exists())
         self._cleanup_img(data)
 
     def test_agent_uses_sentinel_mosaic_for_city_bbox(self):
@@ -3313,10 +3434,10 @@ class AgentSessionApiTests(TestCase):
                 output=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=[{"text": "<answer>当前区域以建设用地为主。</answer>"}]))]),
                 message="",
             )))
-            st.enter_context(patch("map_api.agent.loop.agent_step", side_effect=[
+            st.enter_context(patch("map_api.agent.loop.agent_step", side_effect=_agent_script([
                 _agent_call("analyze_imagery", current_step="vl_analysis"),
                 _agent_final("复核结论：当前区域以建设用地为主。"),
-            ]))
+            ])))
             r = self.client.post(
                 "/api/agent/sessions/",
                 data={"goal": "调查当前区域建设用地", "scene_id": scene.id, "file_name": image_file, "sync": True},
@@ -3357,19 +3478,20 @@ class AgentSessionApiTests(TestCase):
                 st2.enter_context(p)
             st2.enter_context(patch("map_api.views.EarthSearchProvider.search", return_value=[self._candidate(cloud=8.5)]))
             st2.enter_context(patch("map_api.views._run_agent_background", side_effect=_sync_run))
-            st2.enter_context(patch("map_api.agent.loop.agent_step", side_effect=[
+            st2.enter_context(patch("map_api.agent.loop.agent_step", side_effect=_agent_script([
+                _agent_call("search_sentinel_imagery", current_step="retrieve_imagery"),
                 _agent_call("compute_ndwi", current_step="ndwi"),
                 _agent_call("analyze_imagery", current_step="vl_analysis"),
                 _agent_final("复核结论：继续分析后水体约 18.5%。"),
-            ]))
+            ])))
             r2 = self.client.post(
                 f"/api/agent/sessions/{session_id}/messages/",
-                data={"content": "继续分析", "action": "continue"},
+                data={"content": "重试当前步骤", "action": "retry_step"},
                 content_type="application/json",
             )
         data2 = r2.json()["data"]
         self.assertEqual(r2.status_code, 200, r2.content.decode())
-        self.assertEqual(data2["status"], "completed")
+        self.assertEqual(data2["status"], "completed", data2.get("artifacts", {}).get("waiting"))
         self.assertIn("复核结论", data2["artifacts"]["final_answer"])
         self._cleanup_img(data2)
 

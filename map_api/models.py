@@ -104,6 +104,161 @@ class AgentSession(models.Model):
         ordering = ["-updated_at"]
 
 
+class AgentRun(models.Model):
+    """持久化运行事实；AgentSession 仅作为兼容层保留。"""
+    STATUS_QUEUED = "queued"
+    STATUS_PLANNING = "planning"
+    STATUS_RUNNING = "running"
+    STATUS_WAITING_USER = "waiting_user"
+    STATUS_RETRYING = "retrying"
+    STATUS_CANCELLING = "cancelling"
+    STATUS_CANCELLED = "cancelled"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+    STATUS_BLOCKED = "blocked"
+    STATUS_NOT_SUPPORTED = "not_supported"
+    STATUS_EXTERNAL_UNAVAILABLE = "external_service_unavailable"
+
+    goal = models.TextField()
+    run_key = models.CharField(max_length=120, unique=True)
+    status = models.CharField(max_length=40, default=STATUS_QUEUED)
+    mode = models.CharField(max_length=30, default="precise")
+    current_step_id = models.CharField(max_length=120, blank=True, default="")
+    plan_version = models.PositiveIntegerField(default=1)
+    context_version = models.PositiveIntegerField(default=1)
+    event_sequence = models.PositiveIntegerField(default=0)
+    provider = models.CharField(max_length=120, blank=True, default="")
+    model = models.CharField(max_length=120, blank=True, default="")
+    execution_engine = models.CharField(max_length=20, default="legacy")
+    cancellation_epoch = models.PositiveIntegerField(default=0)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+
+class RunStep(models.Model):
+    run = models.ForeignKey(AgentRun, on_delete=models.CASCADE, related_name="steps")
+    step_id = models.CharField(max_length=120)
+    kind = models.CharField(max_length=60)
+    label = models.CharField(max_length=200)
+    status = models.CharField(max_length=40, default="queued")
+    depends_on = models.JSONField(default=list, blank=True)
+    required_capabilities = models.JSONField(default=list, blank=True)
+    input_refs = models.JSONField(default=list, blank=True)
+    output_refs = models.JSONField(default=list, blank=True)
+    attempt = models.PositiveIntegerField(default=0)
+    max_attempts = models.PositiveIntegerField(default=1)
+    retry_policy = models.JSONField(default=dict, blank=True)
+    approval_policy = models.JSONField(default=dict, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    error = models.TextField(blank=True, default="")
+    purpose = models.TextField(blank=True, default="")
+    completion_schema = models.JSONField(default=dict, blank=True)
+    failure_conditions = models.JSONField(default=list, blank=True)
+    optional = models.BooleanField(default=False)
+    allow_replan = models.BooleanField(default=True)
+    lease_token = models.CharField(max_length=64, blank=True, default="")
+    lease_until = models.DateTimeField(null=True, blank=True)
+    lease_plan_version = models.PositiveIntegerField(default=0)
+    lease_cancellation_epoch = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["run", "step_id"], name="uniq_run_step")]
+
+
+class RunCheckpoint(models.Model):
+    run = models.ForeignKey(AgentRun, on_delete=models.CASCADE, related_name="checkpoints")
+    sequence = models.PositiveIntegerField()
+    state_snapshot = models.JSONField(default=dict)
+    context_snapshot = models.JSONField(default=dict)
+    plan_snapshot = models.JSONField(default=dict)
+    last_event_sequence = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["run", "sequence"], name="uniq_run_checkpoint")]
+
+
+class RunEvent(models.Model):
+    """Committed v2 events; sequence and command identity are scoped to a run."""
+    run = models.ForeignKey(AgentRun, on_delete=models.CASCADE, related_name="events")
+    sequence = models.PositiveIntegerField()
+    schema_version = models.PositiveIntegerField(default=1)
+    type = models.CharField(max_length=60)
+    step_id = models.CharField(max_length=120, blank=True, default="")
+    payload = models.JSONField(default=dict)
+    refs = models.JSONField(default=list)
+    command_key = models.CharField(max_length=160)
+    command_digest = models.CharField(max_length=64)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sequence"]
+        constraints = [
+            models.UniqueConstraint(fields=["run", "sequence"], name="uniq_run_event_sequence"),
+            models.UniqueConstraint(fields=["run", "command_key"], name="uniq_run_event_command"),
+        ]
+
+
+class RunToolCall(models.Model):
+    run = models.ForeignKey(AgentRun, on_delete=models.CASCADE, related_name="tool_calls")
+    call_key = models.CharField(max_length=64)
+    name = models.CharField(max_length=120)
+    step_id = models.CharField(max_length=120)
+    arguments = models.JSONField(default=dict)
+    inputs = models.JSONField(default=dict)
+    status = models.CharField(max_length=30, default="running")
+    result = models.JSONField(default=dict)
+    context_patch = models.JSONField(default=dict)
+    attempt = models.PositiveIntegerField(default=1)
+    claim = models.CharField(max_length=64)
+    lease_until = models.DateTimeField()
+    error = models.JSONField(default=dict)
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["run", "call_key"], name="uniq_run_tool_call")]
+
+
+class RunArtifact(models.Model):
+    run = models.ForeignKey(AgentRun, on_delete=models.CASCADE, related_name="artifacts_v2")
+    artifact_id = models.CharField(max_length=160)
+    kind = models.CharField(max_length=60)
+    title = models.CharField(max_length=240)
+    uri = models.CharField(max_length=500)
+    preview_uri = models.CharField(max_length=500, blank=True, default="")
+    mime_type = models.CharField(max_length=120, blank=True, default="")
+    metadata = models.JSONField(default=dict, blank=True)
+    evidence_refs = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["run", "artifact_id"], name="uniq_run_artifact")]
+
+
+class RunEvidence(models.Model):
+    run = models.ForeignKey(AgentRun, on_delete=models.CASCADE, related_name="evidence_v2")
+    evidence_id = models.CharField(max_length=160)
+    kind = models.CharField(max_length=60)
+    scene_id = models.CharField(max_length=160, blank=True, default="")
+    asset_id = models.CharField(max_length=160, blank=True, default="")
+    metric = models.CharField(max_length=120, blank=True, default="")
+    value = models.JSONField(null=True, blank=True)
+    method = models.CharField(max_length=240, blank=True, default="")
+    aoi = models.JSONField(null=True, blank=True)
+    mask_statistics = models.JSONField(default=dict, blank=True)
+    data_contract = models.JSONField(default=dict, blank=True)
+    confidence = models.FloatField(null=True, blank=True)
+    limitations = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["run", "evidence_id"], name="uniq_run_evidence")]
+
+
 class ExecutionEvent(models.Model):
     """可恢复的 Agent 执行事件；UI projection 不再是唯一事实来源。"""
 

@@ -1,5 +1,6 @@
 from django.http import JsonResponse, FileResponse, StreamingHttpResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
 from django.conf import settings
 from django.shortcuts import render
 from http import HTTPStatus
@@ -29,9 +30,11 @@ from .utils.active_perception import (
     cut_image_geom, map_bbox_to_original, resize_image, build_stage2_prompt,
     extract_answer_text, measure_bbox, pixel_bbox_to_geo
 )
-from .models import AgentSession, ChatHistory, DownloadTask, ImageryScene, ExternalServiceHealth
+from .models import AgentSession, ChatHistory, DownloadTask, ImageryScene, ExternalServiceHealth, AnalysisRun, AgentRun, RunStep, RunCheckpoint, RunArtifact, RunEvidence
 from .imagery_sources.mapbox import MapboxProvider
-from .imagery_sources.earth_search import EarthSearchProvider
+from .imagery_sources.earth_search import EarthSearchProvider, COLLECTION_PROFILES, get_collection_profile
+# M0 数据源扩展:provider 实例化统一走注册表;上面的类名 import 保留作 patch 兼容锚点。
+from .imagery_sources import get_provider
 from .utils.agent_tools import (
     AGENT_MODEL,
     build_agent_plan,
@@ -92,6 +95,40 @@ from .agent.waiting import translate_action
 
 logger = logging.getLogger(__name__)
 
+def agent_run_detail(request, run_id):
+    if request.method != "GET":
+        return JsonResponse({"code": 405, "msg": "只支持 GET", "data": None}, status=405)
+    owner = _ensure_agent_owner_session(request, create=False)
+    if not owner or not AgentSession.objects.filter(
+        owner_session_key=owner, artifacts__run_id=run_id,
+    ).exists():
+        return JsonResponse({"code": 404, "msg": "run not found", "data": None}, status=404)
+    try:
+        run = AgentRun.objects.prefetch_related("steps", "checkpoints", "artifacts_v2", "evidence_v2").get(pk=run_id)
+    except AgentRun.DoesNotExist:
+        return JsonResponse({"code": 404, "msg": "run not found", "data": None}, status=404)
+    evidence = list(run.evidence_v2.all())
+    run_artifacts = list(run.artifacts_v2.all())
+    from .run_acceptance import assess_run
+    from .run_api import summary
+    session = AgentSession.objects.get(owner_session_key=owner, artifacts__run_id=run_id)
+    latest = run.checkpoints.order_by("-sequence").first()
+    current_context = latest.context_snapshot if latest and run.execution_engine == "dag" else {}
+    return JsonResponse({"code": 200, "data": {
+        **summary(run),
+        "id": run.id, "run_key": run.run_key, "goal": run.goal, "status": run.status,
+        "waiting": (session.artifacts or {}).get("waiting"),
+        "current_step_id": run.current_step_id, "error": run.error,
+        "acceptance": assess_run(run, evidence=evidence, artifacts=run_artifacts),
+        "source": current_context.get("slots", {}).get("source"),
+        "requirements": current_context.get("requirements"), "aoi": current_context.get("aoi"),
+        "quality": current_context.get("quality"), "final": current_context.get("final") if run.status == "completed" else None,
+        "steps": [{"id": s.step_id, "kind": s.kind, "label": s.label, "status": s.status, "depends_on": s.depends_on, "attempt": s.attempt, "error": s.error} for s in run.steps.all()],
+        "checkpoints": [{"sequence": c.sequence, "state": c.state_snapshot, "created_at": c.created_at.isoformat()} for c in run.checkpoints.all()],
+        "artifacts": [{"id": a.artifact_id, "kind": a.kind, "title": a.title, "uri": a.uri, "preview_uri": a.preview_uri, "mime_type": a.mime_type, "metadata": a.metadata, "evidence_refs": a.evidence_refs} for a in run.artifacts_v2.all()],
+        "evidence": [{"id": e.evidence_id, "kind": e.kind, "scene_id": e.scene_id, "metric": e.metric, "value": e.value, "method": e.method, "confidence": e.confidence, "limitations": e.limitations} for e in evidence],
+    }})
+
 # Agent 输入进入消息历史、模型上下文和报告，必须有明确上限，避免单次请求
 # 造成数据库膨胀或把模型上下文预算耗尽。
 MAX_AGENT_GOAL_CHARS = 4000
@@ -112,7 +149,11 @@ IMAGERY_STRATEGY = {
     "principle": "保留 Mapbox 高清底图作为默认主流程；当问题强调近期态势、宏观地类、水体、植被、农业或变化筛查时，推荐切换 Sentinel-2 近期公开影像。",
     "source_roles": {
         "mapbox": "高清参考底图，适合建筑、道路、设施、空间格局和细节视觉解译。",
+        "tianditu": "天地图影像高清底图，中国区合规视觉参考，适合建筑、道路和空间格局细节解译。",
+        "esri": "Esri World Imagery 全球高清底图，视觉参考级，适合建筑、道路和空间格局细节解译。",
         "sentinel2": "近期公开可追溯影像，适合宏观地类、水体、植被、农业和变化线索筛查。",
+        "sentinel1": "Sentinel-1 SAR 全天候影像，适合洪水/淹没、多云/夜间等光学受限场景的水体与宏观地物筛查。",
+        "copdem": "Copernicus DEM GLO-30 静态高程数据（采集基线 2011-2015），适合地形/坡度/地势分析。",
     },
 }
 SMART_PIPELINE_PROFILE = [
@@ -300,6 +341,7 @@ def system_health(request):
 
     config = {
         "mapbox_token": bool(os.environ.get("MAPBOX_TOKEN")),
+        "tianditu_key": bool(os.environ.get("TIANDITU_KEY")),
         "dashscope_api_key": bool(os.environ.get("DASHSCOPE_API_KEY")),
         "deepseek_api_key": bool(os.environ.get("GLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")),
         "glm_api_key": bool(os.environ.get("GLM_API_KEY")),
@@ -331,6 +373,8 @@ def system_health(request):
                 "geocoder": "configured" if config["amap_key"] else "missing_key",
                 "sentinel_search": "public_endpoint",
                 "sentinel_render": "public_endpoint",
+                "agent_v2_api": "available",
+                "agent_dag_engine": "available",
             },
             "operational_note": "配置项已加载不等于供应商鉴权、余额或实时配额已验证；首次调用时仍可能返回 401、403、429 或网络错误。",
             "checks": checks,
@@ -339,6 +383,21 @@ def system_health(request):
             "smart_pipeline": SMART_PIPELINE_PROFILE,
             "spectral_indices": available_indices(),
             "imagery_sources": {
+                "tianditu": {
+                    "role": "optional_high_resolution_basemap",
+                    "available": config["tianditu_key"],
+                    "label": "天地图影像高清底图",
+                    "recommended_for": ["中国区行政区调查", "建筑形态", "道路结构", "空间格局", "细节视觉解译"],
+                    "limitations": ["拍摄时间、云量和原始产品号不可追溯", "需保留天地图版权标注", "不适合作为近期态势的单一证据"],
+                },
+                "esri": {
+                    "role": "optional_high_resolution_basemap",
+                    "available": True,
+                    "label": "Esri World Imagery 高清底图",
+                    "provider": "Esri / Maxar / Earthstar Geographics",
+                    "recommended_for": ["全球范围细节判读", "建筑形态", "道路结构", "空间格局"],
+                    "limitations": ["多源融合底图，拍摄时间不可追溯", "免费条款限非营运用途并需署名 Esri 及数据提供方"],
+                },
                 "mapbox": {
                     "role": "default_high_resolution_reference",
                     "available": config["mapbox_token"],
@@ -355,6 +414,24 @@ def system_health(request):
                     "recommended_for": ["近期态势", "宏观地类", "水体岸线", "植被农业", "变化线索筛查"],
                     "limitations": ["约 10m 空间分辨率，不适合车辆、小建筑等细节目标", "云量、重访周期和公开服务可用性会影响稳定性"],
                 },
+                "sentinel1": {
+                    "role": "optional_all_weather_sar",
+                    "available": True,
+                    "label": "Sentinel-1 GRD SAR 影像",
+                    "provider": "Element84 Earth Search / Sentinel-1 GRD",
+                    "renderer": config["titiler_endpoint"],
+                    "recommended_for": ["洪水淹没", "多云/夜间全天候", "水体与宏观地物线索"],
+                    "limitations": ["SAR 非光学影像，VL 解译可靠性低", "斑点噪声与几何畸变限制细节判读", "不支持光谱指数"],
+                },
+                "copdem": {
+                    "role": "optional_static_dem",
+                    "available": True,
+                    "label": "Copernicus DEM GLO-30 高程数据",
+                    "provider": "Element84 Earth Search / COP-DEM GLO-30",
+                    "renderer": config["titiler_endpoint"],
+                    "recommended_for": ["地形地势", "坡度分析", "水文背景"],
+                    "limitations": ["静态 DEM（采集基线 2011-2015），不代表拍摄时相地表状态", "不能用于变化监测或执法证据"],
+                },
             },
             "analysis_modes": {
                 mode: {
@@ -366,6 +443,13 @@ def system_health(request):
             "agent": {
                 "available": bool(config.get("glm_api_key") or config.get("deepseek_api_key")) and config["dashscope_api_key"] and config["amap_key"],
                 "controller_model": config["agent_model"],
+                "execution_engine": "agent_run_dag_v2",
+                "v2_endpoints": [
+                    "/api/v2/agent/runs/",
+                    "/api/v2/agent/runs/<id>/events/stream/",
+                    "/api/v2/agent/runs/<id>/actions/",
+                    "/api/v2/agent/runs/<id>/replan/",
+                ],
                 "vision_assist": config["agent_vision_assist"],
                 "modes": {
                     mode: {**cfg, "agent_model": os.environ.get("AGENT_MODEL", AGENT_MODEL)}
@@ -397,6 +481,9 @@ def system_dependencies(request):
         "amap": bool(os.environ.get("AMAP_KEY")),
         "glm": bool(os.environ.get("GLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")),
         "dashscope": bool(os.environ.get("DASHSCOPE_API_KEY")),
+        "firms": bool(os.environ.get("FIRMS_MAP_KEY")),
+        "overpass": True,
+        "openmeteo": True,
     }
     services = []
     for service_id, configured in cfg.items():
@@ -451,7 +538,56 @@ def spectral_indices_catalog(request):
     """返回前端可用的遥感指数目录，避免 UI 硬编码波段和适用范围。"""
     if request.method != "GET":
         return JsonResponse({"code": 405, "msg": "method not allowed", "data": {}}, status=405)
-    return JsonResponse({"code": 200, "msg": "ok", "data": {"indices": available_indices()}})
+    return JsonResponse({"code": 200, "msg": "ok", "data": {"indices": available_indices(), "contract_version": 1}})
+
+
+def analysis_run_detail(request, run_id):
+    if request.method != "GET":
+        return JsonResponse({"code": 405, "msg": "method not allowed"}, status=405)
+    try:
+        run = AnalysisRun.objects.get(pk=run_id)
+    except AnalysisRun.DoesNotExist:
+        return JsonResponse({"code": 404, "msg": "analysis run not found"}, status=404)
+    return JsonResponse({"code": 200, "data": {"id": run.id, "query": run.query, "status": run.status, "scene_ids": run.scene_ids, "parameters": run.parameters, "result": run.result, "model_versions": run.model_versions, "started_at": run.started_at.isoformat(), "finished_at": run.finished_at.isoformat() if run.finished_at else None}})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def analysis_change(request):
+    """两期指数变化摘要接口；拒绝 Mapbox、混合日期和未对齐栅格。"""
+    from .remote_sensing_indices import compute_index, change_summary
+    body = _json_body(request)
+    if (body.get("source") or "sentinel2").lower() != "sentinel2":
+        return JsonResponse({"code": 422, "status": "not_supported", "reason": "正式变化检测仅支持 Sentinel-2"}, status=422)
+    if body.get("temporal_consistency") in {"mixed_dates", "cross_date_mosaic"}:
+        return JsonResponse({"code": 422, "status": "not_supported", "reason": "跨日期覆盖补全不能作为变化检测输入"}, status=422)
+    try:
+        index = str(body.get("index") or "ndwi").lower()
+        before = body.get("before") or {}
+        after = body.get("after") or {}
+        b_arrays = {k: np.asarray(v, dtype=np.float32) for k, v in (before.get("bands") or {}).items()}
+        a_arrays = {k: np.asarray(v, dtype=np.float32) for k, v in (after.get("bands") or {}).items()}
+        before_idx, bvalid = compute_index(index, b_arrays)
+        after_idx, avalid = compute_index(index, a_arrays)
+        if before_idx.shape != after_idx.shape:
+            raise ValueError("两期输出网格尺寸不一致")
+        mask = bvalid & avalid
+        if body.get("aoi_mask") is not None:
+            mask &= np.asarray(body["aoi_mask"], dtype=bool)
+        result = change_summary(before_idx, after_idx, valid_mask=mask, min_delta=float(body.get("min_delta") or 0))
+        result.update({"index": index, "measurement_grade": "screening", "change_detection_allowed": True, "mask_source": "common_valid_mask_and_aoi", "aoi": body.get("aoi"), "limitations": ["区域筛查级", "结果仅统计共同有效像元"]})
+        run = AnalysisRun.objects.create(
+            query=body.get("query") or f"{index} two-date change detection",
+            status=AnalysisRun.STATUS_COMPLETED,
+            scene_ids=[before.get("scene_id"), after.get("scene_id")],
+            parameters={"data_requirements": {"needs_two_dates": True, "needs_spectral_bands": True, "required_indices": [index]}, "data_contract_snapshots": [before.get("data_contract"), after.get("data_contract")], "aoi": body.get("aoi"), "mask_statistics": {"valid_pixel_ratio": result.get("valid_pixel_ratio"), "mask_source": result.get("mask_source")}},
+            result=result,
+            model_versions={"index_kernel": "remote_sensing_indices.v1"},
+        )
+        result["analysis_run_id"] = run.id
+        return JsonResponse({"code": 200, "status": "completed", "data": result})
+    except (ValueError, TypeError, KeyError) as exc:
+        return JsonResponse({"code": 422, "status": "failed", "reason": str(exc)}, status=422)
 
 
 
@@ -470,7 +606,12 @@ def index_view(request):
 
 def workbench_view(request):
     """负责展示前端地图页面。"""
-    return render(request, 'browser.html')
+    return render(request, 'browser.html', {'legacy_agent': request.GET.get('legacy') == '1'})
+
+
+def agent_workbench_view(request):
+    """Agent 入口沿用线上地图工作台的风格和布局。"""
+    return workbench_view(request)
 
 
 def design_view(request):
@@ -487,8 +628,13 @@ def get_satellite_img_api(request):
 
     try:
         data = _json_body(request)
-        if not os.environ.get('MAPBOX_TOKEN'):
+        basemap_source = str(data.get("basemap_source") or "mapbox").strip().lower()
+        if basemap_source not in ("mapbox", "tianditu", "esri"):
+            return JsonResponse({"code": 400, "msg": f"不支持的底图影像源: {basemap_source}", "data": None}, status=400)
+        if basemap_source == "mapbox" and not os.environ.get('MAPBOX_TOKEN'):
             return JsonResponse({"code": 500, "msg": "缺少 MAPBOX_TOKEN，请先在 .env 中配置", "data": None}, status=500)
+        if basemap_source == "tianditu" and not os.environ.get('TIANDITU_KEY'):
+            return JsonResponse({"code": 500, "msg": "缺少 TIANDITU_KEY，请先在 .env 中配置天地图服务密钥", "data": None}, status=500)
 
         min_lng, min_lat, max_lng, max_lat = normalize_bbox(data)
         resolution = int(data.get('target_resolution', 0))
@@ -508,7 +654,7 @@ def get_satellite_img_api(request):
         gsd = plan["gsd_m"]
         area_km2 = plan["area_km2"]
         bbox_payload = {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat}
-        metadata = MapboxProvider().metadata_for_bbox(bbox_payload).as_dict()
+        metadata = get_provider(basemap_source).metadata_for_bbox(bbox_payload).as_dict()
         scene = ImageryScene.objects.create(
             file_name=file_name,
             min_lng=min_lng,
@@ -547,6 +693,7 @@ def get_satellite_img_api(request):
                     file_name=file_name,
                     target_resolution=resolution,
                     progress_callback=_persist_progress,
+                    basemap_source=basemap_source,
                 )
                 if not img_path:
                     _download_progress[file_name]["status"] = "error"
@@ -608,9 +755,12 @@ def get_sentinel_img_api(request):
             max_value=10,
             as_int=True,
         )
+        collection = str(data.get("collection") or "sentinel-2-l2a").strip()
+        if collection not in COLLECTION_PROFILES:
+            return JsonResponse({"code": 400, "msg": f"不支持的影像 collection: {collection}", "data": None}, status=400)
         bbox = {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat}
         plan = compute_image_plan(min_lng, min_lat, max_lng, max_lat, resolution)
-        provider = EarthSearchProvider(titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
+        provider = get_provider("earth_search", titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
         try:
             candidates = provider.search(
                 bbox,
@@ -618,7 +768,7 @@ def get_sentinel_img_api(request):
                 end_date=end_date,
                 max_cloud=max_cloud,
                 limit=candidate_limit,
-                collection="sentinel-2-l2a",
+                collection=collection,
             )
         except (requests.RequestException, ValueError) as e:
             logger.warning("sentinel image search failed: %s", e)
@@ -627,6 +777,8 @@ def get_sentinel_img_api(request):
             return JsonResponse({"code": 404, "msg": "未找到符合条件的 Sentinel-2 影像，可切回高清底图继续分析", "data": None}, status=404)
 
         try:
+            # 按 collection profile 标注源身份，SAR/DEM 场景不再误挂 sentinel2。
+            _profile = get_collection_profile(collection)
             retrieval = sentinel_retrieval_result(
                 provider,
                 candidates,
@@ -634,6 +786,9 @@ def get_sentinel_img_api(request):
                 plan,
                 resolution,
                 file_prefix="sentinel",
+                source=_profile["source"],
+                source_label=_profile["source_label"],
+                source_label_mosaic=_profile["source_label_mosaic"],
             )
         except ValueError as e:
             logger.warning("sentinel image retrieval failed: %s", e)
@@ -769,7 +924,7 @@ def agent_session_list(request):
                         session = existing
                         created = False
                     else:
-                        if not has_deepseek_key:
+                        if not has_deepseek_key and not getattr(request, "agent_queue_only", False):
                             return JsonResponse({"code": 500, "msg": "缺少 GLM_API_KEY（兼容旧配置名 DEEPSEEK_API_KEY），请先在 .env 中配置", "data": None}, status=500)
                         session = AgentSession.objects.create(
                             request_id=request_id,
@@ -781,7 +936,7 @@ def agent_session_list(request):
                             artifacts={"entry": "agent", "context": {k: v for k, v in context.items() if v}},
                         )
                 else:
-                    if not has_deepseek_key:
+                    if not has_deepseek_key and not getattr(request, "agent_queue_only", False):
                         return JsonResponse({"code": 500, "msg": "缺少 GLM_API_KEY（兼容旧配置名 DEEPSEEK_API_KEY），请先在 .env 中配置", "data": None}, status=500)
                     session = AgentSession.objects.create(
                         owner_session_key=owner_key,
@@ -792,8 +947,26 @@ def agent_session_list(request):
                         artifacts={"entry": "agent", "context": {k: v for k, v in context.items() if v}},
                     )
                 if created:
+                    run = AgentRun.objects.create(goal=goal, run_key=f"session:{uuid.uuid4().hex}", status=AgentRun.STATUS_QUEUED if getattr(request, "agent_queue_only", False) else AgentRun.STATUS_PLANNING, mode=mode, provider="GLM", model=AGENT_MODEL)
+                    steps = [("understand_goal", "understand", "理解调查目标", []), ("resolve_aoi", "locate", "定位调查范围", ["understand_goal"]), ("declare_data_requirements", "data_requirements", "声明数据需求", ["resolve_aoi"]), ("match_source_capabilities", "match_source", "匹配数据源能力", ["declare_data_requirements"]), ("search_scenes", "retrieve", "检索影像场景", ["match_source_capabilities"]), ("quality_gate", "quality", "执行质量门禁", ["search_scenes"]), ("select_product", "select", "选择合格产品", ["quality_gate"]), ("read_assets", "read_assets", "读取影像资产", ["select_product"]), ("apply_aoi_and_qa_mask", "mask", "应用 AOI 与 QA 掩膜", ["read_assets"]), ("compute_metric", "metric", "计算遥感指标", ["apply_aoi_and_qa_mask"]), ("compare_temporal_scenes", "change", "比较时序场景", ["compute_metric"]), ("visual_review", "visual_review", "视觉复核", ["compute_metric"]), ("evidence_compilation", "evidence", "整理证据", ["visual_review", "compare_temporal_scenes"]), ("final_review", "review", "最终复核", ["evidence_compilation"]), ("publish_artifacts", "publish", "发布分析产物", ["final_review"])]
+                    if getattr(request, "agent_queue_only", False):
+                        from .run_executor import default_plan
+                        run.execution_engine = "dag"
+                        run.provider = os.environ.get("AGENT_PROVIDER", "glm").lower()
+                        model_env = {"glm": "AGENT_MODEL", "qwen": "QWEN_AGENT_MODEL", "openai-compatible": "OPENAI_AGENT_MODEL"}.get(run.provider)
+                        run.model = os.environ.get(model_env, AGENT_MODEL if run.provider == "glm" else "") if model_env else ""
+                        run.save(update_fields=["execution_engine", "provider", "model"])
+                        RunStep.objects.bulk_create([RunStep(run=run, **step) for step in default_plan()])
+                    else:
+                        RunStep.objects.bulk_create([RunStep(run=run, step_id=sid, kind=kind, label=label, depends_on=deps) for sid, kind, label, deps in steps])
+                    from .run_journal import append_locked
+                    append_locked(run, "run.created", {"status": run.status},
+                                  context={"session_id": session.id, "goal": goal, "input": context},
+                                  command_key="run-created")
                     artifacts = dict(session.artifacts or {})
-                    execution_mode = str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower()
+                    artifacts["run_id"] = run.id
+                    execution_mode = "queue" if getattr(request, "agent_queue_only", False) else str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower()
+                    artifacts["execution_mode"] = execution_mode
                     if execution_mode in {"queue", "worker", "persistent"}:
                         # 持久化 worker 必须能立即看到这条队列项，不能预先写一个
                         # 看似有效的 thread claim 把任务阻塞到 claim-timeout。
@@ -811,7 +984,7 @@ def agent_session_list(request):
                 raise
             session = AgentSession.objects.get(request_id=request_id)
             created = False
-        if created and _as_bool(data.get("sync", False)):
+        if created and _as_bool(data.get("sync", False)) and not getattr(request, "agent_queue_only", False):
             run_agent_session(session.id, context)
         elif created:
             # queue 模式由持久化 worker 接管；thread 模式保持本地开发兼容。
@@ -1013,6 +1186,25 @@ def agent_session_messages(request, session_id):
             return JsonResponse({"code": 400, "msg": "消息不能为空", "data": None}, status=400)
         if len(content) > MAX_AGENT_MESSAGE_CHARS:
             return JsonResponse({"code": 400, "msg": f"消息不能超过 {MAX_AGENT_MESSAGE_CHARS} 个字符", "data": None}, status=400)
+        linked_run = AgentRun.objects.filter(pk=(session.artifacts or {}).get("run_id"), execution_engine="dag").first()
+        if linked_run:
+            from .run_executor import project_legacy
+            from .run_scheduler import control_run, StepConflict
+            from .run_journal import RunCommandConflict
+            from .agent.waiting import translate_action
+            action = action or translate_action(content)
+            if action == "generate_report" and linked_run.status == "completed":
+                report = linked_run.artifacts_v2.filter(kind="report").order_by("-id").first()
+                return JsonResponse({"code": 200, "data": {**agent_session_payload(session), "report_url": report.uri if report else None}})
+            if action not in {"cancel", "pause", "retry_step"}:
+                return JsonResponse({"code": 409, "msg": "请在工作台补充条件并重新规划；已完成的调查可新建后续任务。"}, status=409)
+            try:
+                control_run(linked_run.id, action, command_key=message_id or uuid.uuid4().hex)
+                project_legacy(linked_run.id)
+            except (StepConflict, RunCommandConflict) as exc:
+                return JsonResponse({"code": 409, "msg": str(exc), "error": exc.details}, status=409)
+            session.refresh_from_db()
+            return JsonResponse({"code": 200, "data": agent_session_payload(session)})
         # 用户消息与 worker 的 waiting/完成消息可能并发到达；先锁行读取最新
         # messages 再追加，避免普通 save 用旧列表覆盖后台消息。
         with transaction.atomic():
@@ -1104,6 +1296,8 @@ def agent_session_messages(request, session_id):
                     locked.error = "用户取消了 Agent 调查。"
                     locked.messages = list(locked.messages or []) + [{"role": "assistant", "content": "调查已取消。"}]
                     locked.save(update_fields=["artifacts", "cancel_requested", "status", "error", "messages", "updated_at"])
+                    from .run_kernel import sync_session
+                    sync_session(locked.id)
                     session = locked
                     cancelled = True
             if not cancelled:
@@ -1425,9 +1619,9 @@ def run_vl_analysis(data):
             if scene:
                 if not gsd and scene.gsd_m:
                     gsd = scene.gsd_m
-                # Mapbox 的 gsd_m 只是导出栅格采样间隔，不是传感器 GSD，
+                # 高清底图(Mapbox/天地图/Esri)的 gsd_m 只是导出栅格采样间隔，不是传感器 GSD，
                 # 禁止进入物理尺寸/面积测量路径。
-                if (scene.source or "").lower() == "mapbox":
+                if (scene.source or "").lower() in ("mapbox", "tianditu", "esri"):
                     gsd = None
                 if not isinstance(geo_bbox, dict):
                     geo_bbox = {
@@ -1878,9 +2072,11 @@ def imagery_search(request):
 
         if provider_name != "earth_search":
             return JsonResponse({"code": 400, "msg": "unsupported provider"}, status=400)
+        if collection not in COLLECTION_PROFILES:
+            return JsonResponse({"code": 400, "msg": f"unsupported collection: {collection}"}, status=400)
 
         bbox = {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat}
-        candidates = EarthSearchProvider().search(
+        candidates = get_provider("earth_search").search(
             bbox,
             start_date=start_date,
             end_date=end_date,
@@ -1917,12 +2113,14 @@ def imagery_recommend_source(request):
         current_source = (data.get("current_source") or data.get("source") or "mapbox").strip().lower()
         if current_source == "earth_search":
             current_source = "sentinel2"
-        if current_source not in ("mapbox", "sentinel2"):
+        if current_source not in ("mapbox", "tianditu", "esri", "sentinel2", "sentinel1", "copdem"):
             current_source = "unknown"
 
+        # 伪 Scene 只承载源身份与分辨率假设,供任务画像判断细节能力。
+        assumed_gsd = {"sentinel2": 10, "sentinel1": 10, "copdem": 30, "tianditu": 1.2, "esri": 1.2}.get(current_source, 1.2)
         scene = type("Scene", (), {
             "source": current_source,
-            "gsd_m": 10 if current_source == "sentinel2" else 1.2,
+            "gsd_m": assumed_gsd,
         })()
         strategy = build_analysis_strategy(question, scene=scene, requested_active=True)
         recommendation = source_recommendation_payload(strategy, {"source": current_source}, question)

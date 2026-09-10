@@ -63,6 +63,9 @@ def normalized_payload(kind, payload=None):
     payload = dict(payload or {}) if isinstance(payload, dict) else {"summary": payload}
     phase = payload.pop("phase", None) or payload.pop("step", None) or ""
     status = payload.pop("status", None) or EVENT_STATUSES.get(kind, "running")
+    if kind == "tool_result" and isinstance(payload.get("result"), dict):
+        result_status = payload["result"].get("status")
+        status = "done" if result_status == "ok" else ("waiting_user" if result_status == "waiting" else "failed")
     summary = payload.get("summary") or payload.get("thought") or payload.get("message") or payload.get("error") or ""
     why = payload.get("why") or []
     if isinstance(why, str):
@@ -96,6 +99,17 @@ def emit(session_id, kind, payload=None, expected_claim=None):
             kind=str(kind)[:40],
             payload=_compact(normalized_payload(str(kind), payload)),
         )
+        run_id = (session.artifacts or {}).get("run_id")
+        v2_type = {
+            "model_decision": "decision.created", "plan_created": "plan.declared", "plan_changed": "plan.proposed",
+            "model_unavailable": "provider.failed", "tool_result": "tool.result",
+            "quality_check": "quality.gated", "user_confirmation_required": "user.required",
+            "user_action_received": "user.responded", "task_failed": "execution.failed",
+        }.get(kind)
+        if run_id and v2_type:
+            from ..run_journal import append_locked, lock_run
+            run = lock_run(run_id)
+            append_locked(run, v2_type, event.payload, command_key=f"legacy-event:{event.id}")
     return event
 
 

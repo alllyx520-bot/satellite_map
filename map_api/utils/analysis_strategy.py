@@ -140,7 +140,7 @@ def build_analysis_strategy(question, scene=None, gsd=None, requested_active=Tru
             method_notes.append("该问题偏细节判读，但 Sentinel-2 分辨率有限，应转为宏观判读并说明不可判读项")
         else:
             method_notes.append("使用 Sentinel-2 的时相、云量和宏观纹理进行区域级解译")
-    elif source == "mapbox":
+    elif source in ("mapbox", "tianditu", "esri"):
         strengths.extend(["高清视觉底图", "适合建筑形态、道路结构和空间格局分析"])
         limits.extend(["底图拍摄时间、云量和原始产品号不透明，不能把结论表述为已复核事实"])
         if query["is_detail"] and requested_active:

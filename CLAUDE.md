@@ -37,7 +37,7 @@ C:\Users\Lenovo\anaconda3\envs\general\python.exe scripts\download_remoteclip.py
 
 Deps: `requirements.txt` is a curated core list for local dev (`pip install -r requirements.txt`); `requirements-prod.txt` is the minimal production set. Key: Django 5.2, django-cors-headers, dashscope, Pillow, requests, numpy, python-docx, python-dotenv. **RemoteCLIP tile retrieval** needs `torch` (CUDA build for GPU — `pip install torch --index-url https://download.pytorch.org/whl/cu121`) + `open_clip_torch`; these are **optional** (commented out in `requirements.txt`) — without them the tile ranker falls back to a color/edge heuristic.
 
-Secrets in `.env` (gitignored, loaded by both `manage.py` and `start.py` via `load_dotenv` with absolute path): `MAPBOX_TOKEN`, `DASHSCOPE_API_KEY`, `AMAP_KEY`, `DEEPSEEK_API_KEY`. Optional tuning: `TITILER_ENDPOINT`, `SENTINEL_MIN_COVERAGE_RATIO`, `SENTINEL_MIN_VALID_IMAGE_RATIO`, `SENTINEL_MAX_MOSAIC_CANDIDATES`, `AGENT_SENTINEL_CANDIDATE_LIMIT`, `REMOTECLIP_CKPT`. Rate limiting (see Constraints): `RATELIMIT_API_PER_MINUTE` (default 120), `RATELIMIT_AI_PER_MINUTE` (default 30), `RATELIMIT_DISABLED=1` turns it off (demo mode). Production settings are env-driven: `DJANGO_DEBUG`, `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS`, `DJANGO_CSRF_TRUSTED_ORIGINS`, `CORS_ALLOW_ALL_ORIGINS` (see `.deploy/server.env` template + `DEPLOY.md`).
+Secrets in `.env` (gitignored, loaded by both `manage.py` and `start.py` via `load_dotenv` with absolute path): `MAPBOX_TOKEN`, `DASHSCOPE_API_KEY`, `AMAP_KEY`, `DEEPSEEK_API_KEY`. Optional data-source keys (2026-09-10): `FIRMS_MAP_KEY` (NASA FIRMS 火点工具), `TIANDITU_KEY` (天地图影像底图源) — 缺失时仅对应功能不可用. Optional tuning: `TITILER_ENDPOINT`, `SENTINEL_MIN_COVERAGE_RATIO`, `SENTINEL_MIN_VALID_IMAGE_RATIO`, `SENTINEL_MAX_MOSAIC_CANDIDATES`, `AGENT_SENTINEL_CANDIDATE_LIMIT`, `REMOTECLIP_CKPT`. Rate limiting (see Constraints): `RATELIMIT_API_PER_MINUTE` (default 120), `RATELIMIT_AI_PER_MINUTE` (default 30), `RATELIMIT_DISABLED=1` turns it off (demo mode). Production settings are env-driven: `DJANGO_DEBUG`, `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS`, `DJANGO_CSRF_TRUSTED_ORIGINS`, `CORS_ALLOW_ALL_ORIGINS` (see `.deploy/server.env` template + `DEPLOY.md`).
 
 ## Verification / Smoke Checks
 
@@ -53,6 +53,10 @@ Use the live flags only when you need to prove external dependencies:
 | `manage.py smoke_pipeline --live-ai` | Real DashScope visual model call, output parsing/fallback, history, and report chain work | `DASHSCOPE_API_KEY`, model quota |
 | `manage.py smoke_pipeline --agent` | Mocked RemoteSensingAgent loop, session state, Sentinel-2 selection, NDWI summary, VL analysis, DeepSeek review, and history persistence | none |
 | `manage.py smoke_pipeline --live-mapbox --live-sentinel --live-ai` | Full live dependency loop is currently usable | all of the above |
+| `manage.py smoke_pipeline --live-sentinel1` | Sentinel-1 GRD SAR STAC 检索、vv 线性拉伸渲染、source=sentinel1 落库 | Element84 Earth Search, TiTiler |
+| `manage.py smoke_pipeline --live-firms` | FIRMS 火点 CSV API 工具链 | `FIRMS_MAP_KEY`(缺失时输出 skipped) |
+| `manage.py smoke_pipeline --live-esri` | Esri World Imagery 瓦片拼接下载与场景落库 | Esri 瓦片(无 key,限非营收+署名) |
+| `manage.py smoke_pipeline --live-tianditu` | 天地图影像瓦片拼接下载 | `TIANDITU_KEY`(缺失时输出 skipped) |
 
 The command prints JSON with per-step `ok` values. It removes smoke images, report files, database records, and progress entries unless `--keep-artifacts` is passed. If a live flag fails but the default smoke check passes, treat it first as an external key/network/quota/provider problem rather than a local code failure.
 

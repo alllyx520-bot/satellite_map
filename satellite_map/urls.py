@@ -18,19 +18,21 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include, re_path
 from django.contrib.staticfiles.urls import staticfiles_urlpatterns
-from django.conf import settings
-from django.views.static import serve
+from django.contrib.staticfiles.views import serve as staticfiles_serve
 from map_api import views
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('map_api.urls')),
     path('workbench/', views.workbench_view, name='workbench'),
+    path('agent/', views.agent_workbench_view, name='agent_workbench'),
     path('design/', views.design_view, name='design'),
     path('', views.index_view, name='index'),
 ]
 
 # 本地 runserver 在默认生产式 DEBUG 配置下也必须能提供工作台 CSS/JS；
-# 生产环境仍由 Nginx/CDN 接管静态文件。
+# 生产环境仍由 Nginx/CDN 接管静态文件，不会走到这里。
+# insecure=True：让 staticfiles 走 finders（static/ + 各 app 的 static/），编辑源码后刷新即生效，
+# 不必先 collectstatic——指向 STATIC_ROOT 会一直返回上次构建的陈旧副本。
 urlpatterns += staticfiles_urlpatterns()
-urlpatterns += [re_path(r"^static/(?P<path>.*)$", serve, {"document_root": settings.STATIC_ROOT})]
+urlpatterns += [re_path(r"^static/(?P<path>.*)$", staticfiles_serve, {"insecure": True})]

@@ -157,6 +157,9 @@ AGENT_MODEL=glm-5.3-flash
 GLM_CHAT_URL=https://open.bigmodel.cn/api/paas/v4/chat/completions
 AMAP_KEY=replace-me
 TITILER_ENDPOINT=https://titiler.xyz
+# 可选数据源 key(2026-09-10;留空则仅对应功能不可用)
+FIRMS_MAP_KEY=
+TIANDITU_KEY=
 
 SENTINEL_MIN_COVERAGE_RATIO=0.92
 SENTINEL_MIN_VALID_IMAGE_RATIO=0.88
@@ -212,6 +215,10 @@ python manage.py smoke_pipeline --live-mapbox
 python manage.py smoke_pipeline --live-sentinel
 python manage.py smoke_pipeline --live-ai
 python manage.py smoke_pipeline --agent
+python manage.py smoke_pipeline --live-sentinel1
+python manage.py smoke_pipeline --live-firms      # 需 FIRMS_MAP_KEY
+python manage.py smoke_pipeline --live-esri
+python manage.py smoke_pipeline --live-tianditu   # 需 TIANDITU_KEY
 ```
 
 ## 7. Test Gunicorn Internally

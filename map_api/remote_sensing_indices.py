@@ -2,10 +2,10 @@
 import numpy as np
 
 INDEX_DEFINITIONS = {
-    "ndvi": {"label": "植被指数", "bands": ("red", "nir"), "range": (-1, 1), "formula": "(NIR-Red)/(NIR+Red)", "threshold_strategy": "分位数或 Otsu", "uses": ("植被健康", "农田筛查"), "status": "catalog_only", "implemented": False},
+    "ndvi": {"label": "植被指数", "bands": ("red", "nir"), "range": (-1, 1), "formula": "(NIR-Red)/(NIR+Red)", "threshold_strategy": "固定阈值 + Otsu/分位数敏感性", "uses": ("植被健康", "农田筛查"), "status": "implemented", "implemented": True, "native_resolution": {"red": 10, "nir": 10}, "resampling_policy": "continuous_bilinear", "mask_required": True, "supports_area": True, "supports_change_detection": True, "limitations": ["区域筛查级"]},
     "ndwi": {"label": "水体指数", "bands": ("green", "nir"), "range": (-1, 1), "formula": "(Green-NIR)/(Green+NIR)", "threshold_strategy": "固定阈值 + 质量说明", "uses": ("水体范围", "岸线变化"), "status": "implemented", "implemented": True},
-    "mndwi": {"label": "改进水体指数", "bands": ("green", "swir"), "range": (-1, 1), "formula": "(Green-SWIR)/(Green+SWIR)", "threshold_strategy": "Otsu", "uses": ("城市水体", "建筑背景抑制"), "status": "catalog_only", "implemented": False},
-    "ndbi": {"label": "建成区指数", "bands": ("swir", "nir"), "range": (-1, 1), "formula": "(SWIR-NIR)/(SWIR+NIR)", "threshold_strategy": "分位数或 Otsu", "uses": ("城市扩张", "建设活动"), "status": "catalog_only", "implemented": False},
+    "mndwi": {"label": "改进水体指数", "bands": ("green", "swir"), "range": (-1, 1), "formula": "(Green-SWIR)/(Green+SWIR)", "threshold_strategy": "固定阈值 + Otsu/分位数敏感性", "uses": ("城市水体", "建筑背景抑制"), "status": "implemented", "implemented": True, "native_resolution": {"green": 10, "swir": 20}, "resampling_policy": "swir_to_target_continuous_bilinear", "mask_required": True, "supports_area": True, "supports_change_detection": True, "limitations": ["SWIR 重采样后为筛查级"]},
+    "ndbi": {"label": "建成区指数", "bands": ("swir", "nir"), "range": (-1, 1), "formula": "(SWIR-NIR)/(SWIR+NIR)", "threshold_strategy": "分位数或 Otsu", "uses": ("城市扩张", "建设活动"), "status": "catalog_only", "implemented": False, "required_assets": ["swir", "nir"], "mask_required": True, "supports_area": False, "supports_change_detection": False, "limitations": ["尚未完成真实资产质量验证"]},
     "bsi": {"label": "裸土指数", "bands": ("swir", "red", "nir", "blue"), "range": (-1, 1), "formula": "((SWIR+Red)-(NIR+Blue))/((SWIR+Red)+(NIR+Blue))", "threshold_strategy": "分位数", "uses": ("裸地筛查", "施工扰动"), "status": "catalog_only", "implemented": False},
     "ndsi": {"label": "雪指数", "bands": ("green", "swir"), "range": (-1, 1), "formula": "(Green-SWIR)/(Green+SWIR)", "threshold_strategy": "Otsu", "uses": ("积雪范围", "冰雪变化"), "status": "catalog_only", "implemented": False},
 }

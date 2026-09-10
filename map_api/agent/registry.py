@@ -5,6 +5,7 @@
 """
 from dataclasses import dataclass
 import json
+from jsonschema import Draft202012Validator, ValidationError
 
 
 @dataclass(frozen=True)
@@ -17,31 +18,12 @@ class ToolDefinition:
     max_output_chars: int = 12000
 
     def validate_args(self, args):
-        if not isinstance(args, dict):
-            raise ValueError("工具参数必须是 JSON 对象")
-        required = self.parameters.get("required") or []
-        missing = [key for key in required if args.get(key) in (None, "")]
-        if missing:
-            raise ValueError(f"工具 {self.name} 缺少参数：{', '.join(missing)}")
-        properties = self.parameters.get("properties") or {}
-        unknown = sorted(set(args) - set(properties))
-        if unknown and self.parameters.get("additionalProperties") is False:
-            raise ValueError(f"工具 {self.name} 包含未知参数：{', '.join(unknown)}")
-        type_checks = {
-            "string": lambda value: isinstance(value, str),
-            "object": lambda value: isinstance(value, dict),
-            "array": lambda value: isinstance(value, list),
-            "boolean": lambda value: isinstance(value, bool),
-            "number": lambda value: isinstance(value, (int, float)) and not isinstance(value, bool),
-            "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
-        }
-        for key, schema in properties.items():
-            if key not in args or args[key] is None:
-                continue
-            expected = schema.get("type") if isinstance(schema, dict) else None
-            check = type_checks.get(expected)
-            if check and not check(args[key]):
-                raise ValueError(f"工具 {self.name} 参数 {key} 类型错误，应为 {expected}")
+        try:
+            json.dumps(args, allow_nan=False)
+            Draft202012Validator(self.parameters).validate(args)
+        except (ValidationError, TypeError, ValueError) as exc:
+            path = ".".join(str(item) for item in getattr(exc, "absolute_path", [])) or "$"
+            raise ValueError(f"工具 {self.name} 参数 {path} 不满足 JSON Schema") from exc
         return args
 
     def invoke(self, ctx, args):

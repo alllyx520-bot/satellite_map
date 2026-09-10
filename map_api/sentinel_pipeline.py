@@ -186,10 +186,10 @@ def sentinel_mosaic_cache_key(candidates, bbox, width, height):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def find_cached_sentinel_scene(candidate, bbox, width, height):
+def find_cached_sentinel_scene(candidate, bbox, width, height, source="sentinel2"):
     key = sentinel_cache_key(candidate, bbox, width, height)
     scenes = ImageryScene.objects.filter(
-        source="sentinel2",
+        source=source,
         product_id=candidate.product_id,
     ).order_by("-updated_at")
     for scene in scenes[:30]:
@@ -205,9 +205,9 @@ def find_cached_sentinel_scene(candidate, bbox, width, height):
     return None
 
 
-def find_cached_sentinel_mosaic_scene(candidates, bbox, width, height):
+def find_cached_sentinel_mosaic_scene(candidates, bbox, width, height, source="sentinel2"):
     key = sentinel_mosaic_cache_key(candidates, bbox, width, height)
-    scenes = ImageryScene.objects.filter(source="sentinel2").order_by("-updated_at")
+    scenes = ImageryScene.objects.filter(source=source).order_by("-updated_at")
     for scene in scenes[:50]:
         metadata = scene.metadata or {}
         if metadata.get("sentinel_mosaic_cache_key") != key:
@@ -353,6 +353,8 @@ def scene_from_candidate(
     selection_rank=1,
     selection_method="single_scene",
     render_errors=None,
+    source="sentinel2",
+    source_label="Sentinel-2 L2A",
 ):
     rendered_gsd_m = rendered_gsd_m if rendered_gsd_m is not None else candidate.gsd_m
     metadata = {
@@ -380,8 +382,8 @@ def scene_from_candidate(
         metadata["render_fallback_errors"] = render_errors
     return ImageryScene.objects.create(
         file_name=file_name,
-        source="sentinel2",
-        source_label="Sentinel-2 L2A",
+        source=source,
+        source_label=source_label,
         product_id=candidate.product_id,
         acquired_at=candidate.acquired_at,
         published_at=candidate.published_at,
@@ -414,6 +416,8 @@ def scene_from_sentinel_mosaic(
     valid_image_ratio,
     render_errors=None,
     item_summaries=None,
+    source="sentinel2",
+    source_label="Sentinel-2 L2A 多景拼接",
 ):
     primary = candidates[0]
     clouds = [c.cloud_percent for c in candidates if c.cloud_percent is not None]
@@ -471,8 +475,8 @@ def scene_from_sentinel_mosaic(
     )
     return ImageryScene.objects.create(
         file_name=file_name,
-        source="sentinel2",
-        source_label="Sentinel-2 L2A 多景拼接",
+        source=source,
+        source_label=source_label,
         product_id=product_id,
         acquired_at=max(acquired_values) if acquired_values else primary.acquired_at,
         published_at=max(published_values) if published_values else primary.published_at,
@@ -522,6 +526,9 @@ def sentinel_retrieval_result(
     allow_mosaic=True,
     max_auto_crop_ratio=None,
     polygon=None,
+    source="sentinel2",
+    source_label="Sentinel-2 L2A",
+    source_label_mosaic="Sentinel-2 L2A 多景拼接",
 ):
     if not candidates:
         return None
@@ -567,7 +574,7 @@ def sentinel_retrieval_result(
         ]
         for idx, candidate in enumerate(single_candidates, start=1):
             current_coverage = bbox_intersection_ratio(bbox, candidate.bbox)
-            cached = find_cached_sentinel_scene(candidate, bbox, plan["total_w"], plan["total_h"])
+            cached = find_cached_sentinel_scene(candidate, bbox, plan["total_w"], plan["total_h"], source=source)
             if cached:
                 metadata = cached.metadata or {}
                 return {
@@ -630,6 +637,8 @@ def sentinel_retrieval_result(
                 selection_rank=idx,
                 selection_method=selection_method,
                 render_errors=coverage_errors + render_errors,
+                source=source,
+                source_label=source_label,
             )
                 metadata = dict(scene.metadata or {})
                 metadata["requested_bbox"] = bbox
@@ -666,7 +675,7 @@ def sentinel_retrieval_result(
             raise ValueError("Sentinel-2 候选渲染失败或有效信息不足：" + "；".join(render_errors))
         raise ValueError("Sentinel-2 候选渲染后有效信息不足；请缩小范围、扩大时间范围，或切换高清底图。")
 
-    cached = find_cached_sentinel_mosaic_scene(selected, bbox, plan["total_w"], plan["total_h"])
+    cached = find_cached_sentinel_mosaic_scene(selected, bbox, plan["total_w"], plan["total_h"], source=source)
     if cached:
         metadata = cached.metadata or {}
         return {
@@ -750,6 +759,8 @@ def sentinel_retrieval_result(
             valid_image_ratio=valid_ratio,
             render_errors=coverage_errors + render_errors,
             item_summaries=item_summaries,
+            source=source,
+            source_label=source_label_mosaic,
         )
         metadata = dict(scene.metadata or {})
         metadata["requested_bbox"] = bbox

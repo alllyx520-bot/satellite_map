@@ -85,12 +85,13 @@ def apply_resume_action(session, code):
         return "已切换为快速模式（qwen3-vl-flash）。请重新调用 analyze_imagery。"
     if code == "continue":
         session.slots = slots
-        return "用户确认继续，忽略上述质量警告。请进入下一步（compute_ndwi / analyze_imagery）。"
+        return "用户请求继续。必须重新验证未通过的质量门禁，只有满足要求后才能进入下一步。"
     if code == "continue_rule_mode":
         slots["decision_mode"] = "rule"
         session.slots = slots
         return "用户明确接受规则流程。后续仅使用已确认规则和工具结果，不把规则决策描述为模型决策。"
     if code == "retry_step":
+        slots.pop("decision_mode", None)
         session.slots = slots
         return "用户要求重试当前步骤。请只重试上一次失败的工具，不重复已成功步骤。"
     session.slots = slots

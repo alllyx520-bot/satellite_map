@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 import uuid
+import dataclasses
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
@@ -32,10 +33,11 @@ class _ViewsProxy:
 
 _views = _ViewsProxy()
 from .geo_math import compute_image_plan, bbox_intersection_ratio, bbox_union_coverage_ratio, crop_sentinel_nodata_border, image_valid_ratio
-from .imagery_sources.earth_search import EarthSearchProvider
+from .imagery_sources import get_provider
+from .imagery_sources.earth_search import EarthSearchProvider, get_collection_profile
 from .imagery_sources.mapbox import MapboxProvider
 from .media_paths import SAVE_DIR
-from .models import AgentSession, ChatHistory, DownloadTask, ImageryScene
+from .models import AgentSession, ChatHistory, DownloadTask, ImageryScene, AgentRun, RunStep, RunCheckpoint
 from .payloads import (
     _scene_source_key, imagery_quality_payload, scene_brief_payload,
     scene_payload, sentinel_retrieval_timeline_payload,
@@ -89,6 +91,16 @@ def agent_session_payload(session):
             metadata["district_polygon_points"] = sum(len(r) for r in polygon if isinstance(r, list))
         public_scene["metadata"] = metadata
         artifacts["scene"] = public_scene
+    run_id = (session.artifacts or {}).get("run_id")
+    run = AgentRun.objects.filter(id=run_id).prefetch_related("steps", "checkpoints").first() if run_id else None
+    run_data = None
+    if run:
+        run_data = {"id": run.id, "run_key": run.run_key, "status": run.status,
+                    "current_step_id": run.current_step_id, "plan_version": run.plan_version,
+                    "context_version": run.context_version,
+                    "steps": [{"id": s.step_id, "kind": s.kind, "label": s.label, "status": s.status,
+                               "depends_on": s.depends_on, "attempt": s.attempt} for s in run.steps.all()],
+                    "checkpoint_count": run.checkpoints.count()}
     return {
         "id": session.id,
         "request_id": session.request_id,
@@ -107,6 +119,7 @@ def agent_session_payload(session):
         "history_id": session.history_id,
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+        "run": run_data,
     }
 
 
@@ -237,6 +250,8 @@ def _agent_step(session, step_id, label, status="done", message="", data=None, e
         }, expected_claim=expected_claim)
     except Exception:
         logger.debug("unable to append observer event", exc_info=True)
+    from .run_kernel import sync_session
+    sync_session(session.id, snapshot={"status": session.status, "step_id": step_id, "timeline": session.timeline}, expected_claim=expected_claim)
     return True
 
 
@@ -258,6 +273,8 @@ def _agent_fail(session, message):
             locked.artifacts = artifacts
             locked.save(update_fields=["status", "error", "messages", "artifacts", "timeline", "updated_at"])
             session = locked
+        from .run_kernel import sync_session
+        sync_session(session.id, error=message, snapshot={"status": "failed", "error": message})
         try:
             from .agent.events import emit
             emit(session.id, "task_failed", {"phase": "failed", "status": "failed", "summary": message, "error": message})
@@ -285,6 +302,8 @@ def _agent_wait(session, message, options=None, data=None, step_id="waiting_user
         locked.messages = list(locked.messages or []) + [{"role": "assistant", "content": message, "options": options or []}]
         locked.save(update_fields=["status", "artifacts", "messages", "updated_at"])
         session = locked
+        from .run_kernel import sync_session
+        sync_session(session.id)
     try:
         from .agent.events import emit
         emit(session.id, "user_confirmation_required", {
@@ -327,10 +346,13 @@ def _scene_matches_requested_dates(scene, slots):
 
 
 def _candidate_from_mosaic_metadata(item):
+    from .imagery_sources.earth_search import parse_stac_datetime
     return type("Candidate", (), {
         "product_id": item.get("product_id") or item.get("item_id") or "",
         "item_id": item.get("item_id") or item.get("product_id") or "",
         "assets": item.get("assets") or {},
+        "collection": item.get("collection") or "sentinel-2-l2a",
+        "acquired_at": parse_stac_datetime(item.get("acquired_at")),
     })()
 
 
@@ -342,6 +364,9 @@ def _run_agent_background(session_id, context=None, runner=None):
     默认 thread 模式保持本地开发兼容。
     """
     mode = str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower()
+    persisted_mode = AgentSession.objects.filter(pk=session_id).values_list("artifacts__execution_mode", flat=True).first()
+    if persisted_mode:
+        mode = persisted_mode
     if mode in {"queue", "worker", "persistent"}:
         return False
     threading.Thread(target=runner or run_agent_session, args=(session_id, context or {}), daemon=True).start()
@@ -378,20 +403,39 @@ def _rank_sentinel_grid_candidates(candidates, tile):
     )
 
 
-def _agent_fetch_sentinel(bbox, slots, force_grid=False):
+def _agent_fetch_sentinel(bbox, slots, force_grid=False, collection="sentinel-2-l2a"):
     resolution = 1024
     plan = compute_image_plan(bbox["min_lng"], bbox["min_lat"], bbox["max_lng"], bbox["max_lat"], resolution)
-    provider = EarthSearchProvider(titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
+    provider = get_provider("earth_search", titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
     candidates = provider.search(
         bbox,
         start_date=slots.get("date_start"),
         end_date=slots.get("date_end"),
         max_cloud=60,
         limit=int(os.environ.get("AGENT_SENTINEL_CANDIDATE_LIMIT", "40")) if plan["area_km2"] >= 1000 else int(os.environ.get("AGENT_SENTINEL_CANDIDATE_LIMIT", "15")),
-        collection="sentinel-2-l2a",
+        collection=collection,
     )
+    # L2A 无覆盖时自动回退到 L1C(仅光学哨兵2系;SAR/DEM 不回退,避免悄悄换传感器)。
+    # L1C 没有 SCL 云掩膜波段,光谱指数链会另行显式拒绝,这里只保证"有图可看"。
+    l1c_fallback = False
+    if not candidates and collection != "sentinel-2-l1c" and get_collection_profile(collection).get("source") == "sentinel2":
+        candidates = provider.search(
+            bbox,
+            start_date=slots.get("date_start"),
+            end_date=slots.get("date_end"),
+            max_cloud=60,
+            limit=int(os.environ.get("AGENT_SENTINEL_CANDIDATE_LIMIT", "40")) if plan["area_km2"] >= 1000 else int(os.environ.get("AGENT_SENTINEL_CANDIDATE_LIMIT", "15")),
+            collection="sentinel-2-l1c",
+        )
+        if candidates:
+            collection = "sentinel-2-l1c"
+            l1c_fallback = True
     if not candidates:
         return None, None, None
+    profile = get_collection_profile(collection)
+    source = profile["source"]
+    source_label = profile["source_label"]
+    source_label_mosaic = profile["source_label_mosaic"]
     large_area = plan["area_km2"] >= 1000
     has_full_candidate = any(bbox_intersection_ratio(bbox, c.bbox) >= 0.85 for c in candidates)
     # 与 sentinel_pipeline 的正式选景保持一致：云量是首要质量信号，
@@ -401,26 +445,58 @@ def _agent_fetch_sentinel(bbox, slots, force_grid=False):
     # 普通大范围行政区使用同一 bbox 的多景 mosaic，避免网格切片后的 no-data
     # 边缘把完整行政区误判为覆盖不足；仅显式 force_grid 才走网格实验路径。
     if force_grid or (large_area and not has_full_candidate and union_coverage < 0.85 and os.environ.get("AGENT_SENTINEL_GRID", "0") == "1"):
-        return _agent_fetch_sentinel_grid(provider, candidates, bbox, plan, resolution, polygon=(slots.get("resolved_place") or {}).get("polygon"))
-    retrieval = sentinel_retrieval_result(
-        provider,
-        candidates,
-        bbox,
-        plan,
-        resolution,
-        file_prefix="agent_sentinel",
-        # 大范围 bbox 不能用单景 60% 覆盖就算成功：那会把城市北/南侧
-        # 直接裁掉，再错误降级成 Mapbox。优先要求多景拼接达到 98% 覆盖。
-        min_coverage=0.98 if large_area else 0.85,
-        min_valid_ratio=0.60 if large_area else 0.80,
-        max_auto_crop_ratio=0.40 if large_area else 0.03,
-        max_mosaic_candidates=int(os.environ.get("AGENT_SENTINEL_MAX_MOSAIC_CANDIDATES", "12")) if large_area else None,
-        polygon=(slots.get("resolved_place") or {}).get("polygon"),
-    )
-    return retrieval["scene"], retrieval["candidate"], retrieval
+        scene, candidate, retrieval = _agent_fetch_sentinel_grid(
+            provider, candidates, bbox, plan, resolution,
+            polygon=(slots.get("resolved_place") or {}).get("polygon"),
+            source=source, source_label_mosaic=source_label_mosaic,
+        )
+    else:
+        retrieval = sentinel_retrieval_result(
+            provider,
+            candidates,
+            bbox,
+            plan,
+            resolution,
+            file_prefix="agent_sentinel",
+            # 大范围 bbox 不能用单景 60% 覆盖就算成功：那会把城市北/南侧
+            # 直接裁掉，再错误降级成 Mapbox。优先要求多景拼接达到 98% 覆盖。
+            min_coverage=0.98 if large_area else 0.85,
+            min_valid_ratio=0.60 if large_area else 0.80,
+            max_auto_crop_ratio=0.40 if large_area else 0.03,
+            max_mosaic_candidates=int(os.environ.get("AGENT_SENTINEL_MAX_MOSAIC_CANDIDATES", "12")) if large_area else None,
+            polygon=(slots.get("resolved_place") or {}).get("polygon"),
+            source=source,
+            source_label=source_label,
+            source_label_mosaic=source_label_mosaic,
+        )
+        scene, candidate = retrieval["scene"], retrieval["candidate"]
+    if l1c_fallback:
+        _mark_l1c_fallback(scene, candidate, retrieval)
+    return scene, candidate, retrieval
 
 
-def _agent_fetch_sentinel_grid(provider, candidates, bbox, plan, resolution, polygon=None):
+# L1C 兜底标注:让检索结果、场景元数据和限制文案都能被审计出"这是降级产品"。
+L1C_FALLBACK_LIMITATION = "L2A 无覆盖，已回退到 L1C（无 SCL 云掩膜，指数计算不可用）。"
+
+
+def _mark_l1c_fallback(scene, candidate, retrieval):
+    note = L1C_FALLBACK_LIMITATION
+    if retrieval is not None:
+        retrieval["collection_fallback"] = "sentinel-2-l1c"
+    if candidate is not None:
+        # ImageryCandidate 是 frozen dataclass，用 replace 追加限制文案并回填 retrieval。
+        candidate = dataclasses.replace(candidate, limitations=(candidate.limitations or "") + " " + note)
+        if retrieval is not None:
+            retrieval["candidate"] = candidate
+    if scene is not None:
+        metadata = dict(scene.metadata or {})
+        metadata["collection_fallback"] = "sentinel-2-l1c"
+        scene.metadata = metadata
+        scene.limitations = (scene.limitations or "") + " " + note
+        scene.save(update_fields=["metadata", "limitations", "updated_at"])
+
+
+def _agent_fetch_sentinel_grid(provider, candidates, bbox, plan, resolution, polygon=None, source="sentinel2", source_label_mosaic="Sentinel-2 L2A 多景拼接"):
     """大范围行政区按网格独立渲染，再进行空间拼接。"""
     # 2×2 已能覆盖大多数城市级 bbox；只有极大区域才升到 3×3，
     # 避免一次任务触发 9 次 TiTiler 网络请求。
@@ -493,6 +569,7 @@ def _agent_fetch_sentinel_grid(provider, candidates, bbox, plan, resolution, pol
         {"width": plan["total_w"], "height": plan["total_h"]},
         used_coverage, valid_ratio,
         render_errors=errors, item_summaries=item_summaries,
+        source=source, source_label=source_label_mosaic,
     )
     metadata = dict(scene.metadata or {})
     metadata.update({"grid_mosaic": True, "grid_shape": {"columns": columns, "rows": rows}, "requested_bbox": bbox, "no_data_crop": processed["metadata"]})
@@ -502,17 +579,21 @@ def _agent_fetch_sentinel_grid(provider, candidates, bbox, plan, resolution, pol
     return scene, used[0], {"scene": scene, "candidate": used[0], "selected_candidates": used, "plan": effective_plan, "candidate_count": len(candidates), "cache_hit": False, "mosaic": True, "selection_method": "grid_mosaic", "target_coverage_ratio": used_coverage, "valid_image_ratio": valid_ratio, "no_data_crop": processed["metadata"], "render_errors": errors}
 
 
-def _agent_fetch_mapbox(bbox):
+def _agent_fetch_mapbox(bbox, basemap_source="mapbox"):
+    basemap_source = (basemap_source or "mapbox").strip().lower()
+    if basemap_source not in ("mapbox", "tianditu", "esri"):
+        raise ValueError(f"不支持的底图影像源: {basemap_source}")
+    basemap_label = {"mapbox": "Mapbox", "tianditu": "天地图", "esri": "Esri"}[basemap_source]
     resolution = 1024
     min_lng = bbox["min_lng"]
     min_lat = bbox["min_lat"]
     max_lng = bbox["max_lng"]
     max_lat = bbox["max_lat"]
     plan = compute_image_plan(min_lng, min_lat, max_lng, max_lat, resolution)
-    file_name = f"agent_mapbox_{uuid.uuid4().hex[:8]}.jpg"
-    result_path = fetch_satellite_image(min_lng, min_lat, max_lng, max_lat, SAVE_DIR, file_name, target_resolution=resolution)
+    file_name = f"agent_{basemap_source}_{uuid.uuid4().hex[:8]}.jpg"
+    result_path = fetch_satellite_image(min_lng, min_lat, max_lng, max_lat, SAVE_DIR, file_name, target_resolution=resolution, basemap_source=basemap_source)
     if not result_path:
-        raise ValueError("Mapbox 高清底图下载失败，请检查 MAPBOX_TOKEN、网络或配额")
+        raise ValueError(f"{basemap_label} 高清底图下载失败，请检查服务密钥、网络或配额")
     progress = _download_progress.get(file_name) or {}
     if progress.get("status") == "partial" or int(progress.get("failed", 0) or 0) > 0:
         # Agent 结果会直接进入 VL 解译和报告，不能把带深灰占位瓦片的拼接图
@@ -522,9 +603,9 @@ def _agent_fetch_mapbox(bbox):
         except OSError:
             pass
         raise ValueError(
-            f"Mapbox 高清底图仅完成部分瓦片（失败 {progress.get('failed', 0)}），请重试或改用 Sentinel-2"
+            f"{basemap_label} 高清底图仅完成部分瓦片（失败 {progress.get('failed', 0)}），请重试或改用 Sentinel-2"
         )
-    metadata = MapboxProvider().metadata_for_bbox(bbox).as_dict()
+    metadata = get_provider(basemap_source).metadata_for_bbox(bbox).as_dict()
     scene = ImageryScene.objects.create(
         file_name=file_name,
         source=metadata["source"],

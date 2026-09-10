@@ -5,6 +5,7 @@ import time
 import requests
 
 from .base import ImageryCandidate, ImageryProvider
+from ..utils.http import request_proxies
 from ..utils.service_health import check_service, record_failure, record_success, service_key
 
 
@@ -18,11 +19,147 @@ EARTH_SEARCH_LIMITATIONS = (
     "结论可靠性，不应单独作为执法或行政裁量证据。"
 )
 
+# 数据源扩展 M0:collection profile 表驱动。candidate/渲染/落库元数据全部从这里取,
+# 新增 collection 只改表,不改管线代码。experimental=True 的占位 profile 仅打通机制,
+# 渲染参数(titiler_params)留待 M1 校准,不作为正式数据源开放。
+SENTINEL2_L2A_PROFILE = {
+    "source": "sentinel2",
+    "source_label": "Sentinel-2 L2A",
+    "source_label_mosaic": "Sentinel-2 L2A 多景拼接",
+    "processing_level": "sentinel-2-l2a",
+    "license_type": "sentinel_data_terms",
+    "limitations": EARTH_SEARCH_LIMITATIONS,
+    "decision_grade": "reference",
+    "product_id_keys": ["s2:product_uri"],
+    "cloud_property": "eo:cloud_cover",
+    "asset_keys": ["visual", "thumbnail", "red", "green", "blue", "nir", "swir16", "swir22", "scl"],
+    "gsd_keys": ["visual", "red", "green", "blue"],
+    "gsd_default": 10.0,
+    "render": {"asset": "visual"},
+    "qa_band": "scl",
+    "native_resolution_m": 10,
+    "experimental": False,
+}
 
-def request_proxies():
-    """默认遵循当前进程代理；仅显式要求时才强制直连。"""
-    direct = os.environ.get("SATELLITESENSE_DIRECT_HTTP", "").strip().lower()
-    return {"http": None, "https": None} if direct in {"1", "true", "yes"} else None
+COLLECTION_PROFILES = {
+    "sentinel-2-l2a": SENTINEL2_L2A_PROFILE,
+    "sentinel-2-c1-l2a": {
+        **SENTINEL2_L2A_PROFILE,
+        "processing_level": "sentinel-2-c1-l2a",
+        "experimental": False,
+    },
+    # L1C 没有 scl QA 波段,只作 L2A 无覆盖时的时效兜底;保持 experimental 不对外正式开放。
+    "sentinel-2-l1c": {
+        **SENTINEL2_L2A_PROFILE,
+        "processing_level": "sentinel-2-l1c",
+        "qa_band": None,
+        "experimental": True,
+    },
+    "sentinel-1-grd": {
+        "source": "sentinel1",
+        "source_label": "Sentinel-1 GRD",
+        "source_label_mosaic": "Sentinel-1 GRD 多景拼接",
+        "processing_level": "sentinel-1-grd",
+        "license_type": "sentinel_data_terms",
+        "limitations": (
+            "Sentinel-1 GRD 是 C 波段 SAR 后向散射产品，反映地表介电与粗糙度特征，"
+            "不是光学真彩色影像；可全天候获取、适合水体/洪涝与地表变化线索，"
+            "但斑点噪声、几何畸变和入射角差异会限制直接目视解译，"
+            "不应单独作为行政裁量证据。"
+        ),
+        "decision_grade": "reference",
+        "product_id_keys": [],
+        "cloud_property": None,
+        "asset_keys": ["vv", "vh", "thumbnail"],
+        "gsd_keys": ["vv", "vh"],
+        "gsd_default": 10.0,
+        "render": {"asset": "vv", "titiler_params": {"bidx": 1, "rescale": "0,400"}},
+        "native_resolution_m": 10,
+        "experimental": False,
+    },
+    "cop-dem-glo-30": {
+        "source": "copdem",
+        "source_label": "Copernicus DEM GLO-30",
+        "source_label_mosaic": "Copernicus DEM GLO-30 多景拼接",
+        "processing_level": "cop-dem-glo-30",
+        "license_type": "copernicus_dem_license",
+        "limitations": (
+            "Copernicus DEM GLO-30 是静态数字高程模型（采集基线为 TanDEM-X 2011-2015），"
+            "不反映拍摄时刻的地表状态；适合地形/坡度分析和水文背景判断，"
+            "不能用于任何时相变化监测或执法证据。"
+        ),
+        "decision_grade": "reference",
+        "product_id_keys": [],
+        "cloud_property": None,
+        "asset_keys": ["data", "thumbnail", "preview"],
+        "gsd_keys": ["data"],
+        "gsd_default": 30.0,
+        "render": {"asset": "data", "titiler_params": {"bidx": 1, "colormap_name": "terrain", "rescale": "0,2000"}},
+        "native_resolution_m": 30,
+        "experimental": False,
+    },
+    "landsat-c2-l2": {
+        "source": "landsat",
+        "source_label": "Landsat Collection 2 Level-2",
+        "source_label_mosaic": "Landsat Collection 2 Level-2 多景拼接",
+        "processing_level": "landsat-c2-l2",
+        "license_type": "usgs_landsat_terms",
+        "limitations": (
+            "Landsat Collection 2 Level-2 是 USGS 地表反射率产品，空间分辨率约 30 米，"
+            "重访周期 16 天；适合宏观变化与历史回溯，细节能力低于 Sentinel-2。"
+            "其资产存储在 usgs-landsat requester-pays 桶，当前部署的渲染服务无法匿名读取，"
+            "需要自带凭证的渲染链路支持。"
+        ),
+        "decision_grade": "reference",
+        "product_id_keys": ["landsat:product_id", "landsat:scene_id"],
+        "cloud_property": "eo:cloud_cover",
+        "asset_keys": ["red", "green", "blue", "nir08", "swir16", "qa_pixel", "thumbnail"],
+        "gsd_keys": ["red", "green", "blue"],
+        "gsd_default": 30.0,
+        "render": {"asset": "red"},
+        "experimental": True,
+    },
+}
+
+
+def get_collection_profile(collection):
+    """返回 collection 对应 profile；未知 collection 回退到默认 profile。"""
+    return COLLECTION_PROFILES.get(collection, COLLECTION_PROFILES[DEFAULT_COLLECTION])
+
+
+# 已知公开匿名可读的 S3 桶区域表(2026-09-10 实测 Earth Search v1)。
+PUBLIC_S3_BUCKET_REGIONS = {
+    "sentinel-s1-l1c": "eu-central-1",
+    "copernicus-dem-30m": "eu-central-1",
+    "copernicus-dem-90m": "eu-central-1",
+}
+# requester-pays 桶匿名 403,当前部署的渲染链路不支持。
+REQUESTER_PAYS_BUCKETS = {"usgs-landsat"}
+REQUESTER_PAYS_RENDER_ERROR = "该数据源需要自带凭证的渲染服务，当前部署暂不支持"
+
+
+def resolve_asset_href(href):
+    """把 STAC 资产 href 转成渲染服务可访问的 https URL。
+
+    已知公开桶按区域表转换；requester-pays 桶直接报错交给上层降级；
+    未知 s3:// 桶按 us-west-2 默认转换(未验证,由调用方在元数据标注)。
+    """
+    if not href or not str(href).startswith("s3://"):
+        return href
+    rest = str(href)[len("s3://"):]
+    bucket, _, key = rest.partition("/")
+    if bucket in REQUESTER_PAYS_BUCKETS:
+        raise ValueError(REQUESTER_PAYS_RENDER_ERROR)
+    region = PUBLIC_S3_BUCKET_REGIONS.get(bucket, "us-west-2")
+    return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
+
+
+def s3_bucket_unverified(href):
+    """s3:// 且不在已知桶表内(公开/付费都已知)时返回 True,用于元数据标注。"""
+    if not href or not str(href).startswith("s3://"):
+        return False
+    bucket = str(href)[len("s3://"):].partition("/")[0]
+    return bucket not in PUBLIC_S3_BUCKET_REGIONS and bucket not in REQUESTER_PAYS_BUCKETS
 
 
 def parse_stac_datetime(value):
@@ -55,7 +192,7 @@ def stac_datetime_range(start_date=None, end_date=None):
     return f"{normalize(start_date)}/{normalize(end_date, is_end=True)}"
 
 
-def score_candidate(acquired_at, cloud_percent, gsd_m, has_product_id=True):
+def score_candidate(acquired_at, cloud_percent, gsd_m, has_product_id=True, cloud_exempt=False):
     score = 0
     reasons = []
     now = datetime.now(timezone.utc)
@@ -77,7 +214,11 @@ def score_candidate(acquired_at, cloud_percent, gsd_m, has_product_id=True):
     else:
         reasons.append("缺少明确拍摄时间")
 
-    if cloud_percent is None:
+    if cloud_exempt:
+        # SAR/DEM 等无云量概念的 collection:云量项不参与评分,不能让这些源
+        # 因"缺少云量指标"恒被扣分垫底。
+        reasons.append("该数据源为 SAR/DEM 类型，不受云量影响，云量项不参与评分")
+    elif cloud_percent is None:
         reasons.append("缺少云量指标")
     elif cloud_percent <= 10:
         score += 25
@@ -203,10 +344,17 @@ class EarthSearchProvider(ImageryProvider):
     def render_candidate_jpeg(self, candidate, bbox, width, height):
         health_key = service_key("titiler", self.titiler_endpoint)
         check_service(health_key)
-        visual_asset = candidate.assets.get("visual") or {}
-        cog_url = visual_asset.get("href")
+        profile = get_collection_profile(getattr(candidate, "collection", "") or "")
+        render_spec = profile.get("render") or {}
+        render_asset_key = render_spec.get("asset") or "visual"
+        render_asset = candidate.assets.get(render_asset_key) or {}
+        # s3:// href 经 resolve_asset_href 转换;requester-pays 桶在此抛 ValueError,
+        # 由 sentinel_retrieval_result 的既有 render_errors 机制降级到下一候选。
+        cog_url = resolve_asset_href(render_asset.get("href"))
         if not cog_url:
-            raise ValueError("候选影像缺少可渲染的 true color 资产")
+            raise ValueError(f"候选影像缺少可渲染的 {render_asset_key} 资产")
+        titiler_params = {"url": cog_url}
+        titiler_params.update(render_spec.get("titiler_params") or {})
         endpoint = (
             f"{self.titiler_endpoint}/cog/bbox/"
             f"{bbox['min_lng']},{bbox['min_lat']},{bbox['max_lng']},{bbox['max_lat']}/"
@@ -218,7 +366,7 @@ class EarthSearchProvider(ImageryProvider):
             try:
                 response = requests.get(
                     endpoint,
-                    params={"url": cog_url},
+                    params=titiler_params,
                     # TiTiler 正常响应通常在秒级；失败时不应让一个候选阻塞整条
                     # Agent 流程一分钟。保留足够的网络余量，但将单候选上限控制在
                     # 20 秒以内，后续候选仍可继续尝试。
@@ -268,18 +416,47 @@ class EarthSearchProvider(ImageryProvider):
         properties = item.get("properties") or {}
         item_id = item.get("id", "")
         collection = item.get("collection", "")
+        profile = get_collection_profile(collection)
         acquired_at = parse_stac_datetime(properties.get("datetime"))
         published_at = parse_stac_datetime(properties.get("updated") or properties.get("created"))
-        product_id = properties.get("s2:product_uri") or item_id
-        cloud_percent = properties.get("eo:cloud_cover")
-        gsd_m = self._best_gsd(item.get("assets") or {})
-        score, reasons = score_candidate(acquired_at, cloud_percent, gsd_m, bool(product_id))
-        decision_grade = decision_grade_for_score(score)
+        product_id = next(
+            (properties.get(key) for key in profile["product_id_keys"] if properties.get(key)),
+            None,
+        ) or item_id
+        cloud_property = profile.get("cloud_property")
+        cloud_percent = properties.get(cloud_property) if cloud_property else None
+        assets = self._asset_links(item.get("assets") or {}, profile)
+        gsd_m = self._best_gsd(item.get("assets") or {}, profile)
+        score, reasons = score_candidate(
+            acquired_at, cloud_percent, gsd_m, bool(product_id),
+            cloud_exempt=cloud_property is None,
+        )
+        decision_grade = "screening" if score >= 45 else profile.get("decision_grade", "reference")
         min_lng, min_lat, max_lng, max_lat = item.get("bbox") or [None, None, None, None]
+
+        metadata = {
+            "platform": properties.get("platform"),
+            "constellation": properties.get("constellation"),
+            "instruments": properties.get("instruments"),
+            "processing_baseline": properties.get("s2:processing_baseline"),
+            "proj_epsg": properties.get("proj:epsg"),
+            "stac_version": item.get("stac_version"),
+        }
+        if profile.get("experimental"):
+            metadata["experimental_collection"] = True
+        unverified_buckets = sorted({
+            str(asset.get("href"))[len("s3://"):].partition("/")[0]
+            for asset in assets.values()
+            if s3_bucket_unverified(asset.get("href"))
+        })
+        if unverified_buckets:
+            # 未知 s3:// 桶默认按 us-west-2 转换,可用性未经实测,显式标注。
+            metadata["unverified_s3_buckets"] = unverified_buckets
+            reasons.append("资产位于未验证的 S3 桶（默认按 us-west-2 解析，可用性未实测）")
 
         return ImageryCandidate(
             source=self.source,
-            source_label="Element84 Earth Search / Sentinel-2 L2A",
+            source_label=f"Element84 Earth Search / {profile['source_label']}",
             collection=collection,
             item_id=item_id,
             product_id=product_id,
@@ -293,37 +470,32 @@ class EarthSearchProvider(ImageryProvider):
             },
             gsd_m=gsd_m,
             cloud_percent=cloud_percent,
-            processing_level="sentinel-2-l2a",
-            license_type="sentinel_data_terms",
+            processing_level=profile["processing_level"],
+            license_type=profile["license_type"],
             decision_grade=decision_grade,
             suitability_score=score,
             score_reasons=reasons,
-            limitations=EARTH_SEARCH_LIMITATIONS,
-            assets=self._asset_links(item.get("assets") or {}),
+            limitations=profile["limitations"],
+            assets=assets,
             links=self._links(item.get("links") or []),
-            metadata={
-                "platform": properties.get("platform"),
-                "constellation": properties.get("constellation"),
-                "instruments": properties.get("instruments"),
-                "processing_baseline": properties.get("s2:processing_baseline"),
-                "proj_epsg": properties.get("proj:epsg"),
-                "stac_version": item.get("stac_version"),
-            },
+            metadata=metadata,
         )
 
-    def _best_gsd(self, assets):
-        for key in ("visual", "red", "green", "blue"):
+    def _best_gsd(self, assets, profile=None):
+        profile = profile or COLLECTION_PROFILES[DEFAULT_COLLECTION]
+        for key in profile["gsd_keys"]:
             asset = assets.get(key) or {}
             if asset.get("gsd"):
                 return float(asset["gsd"])
             bands = asset.get("raster:bands") or []
             if bands and bands[0].get("spatial_resolution"):
                 return float(bands[0]["spatial_resolution"])
-        return 10.0
+        return profile["gsd_default"]
 
-    def _asset_links(self, assets):
+    def _asset_links(self, assets, profile=None):
+        profile = profile or COLLECTION_PROFILES[DEFAULT_COLLECTION]
         result = {}
-        for key in ("visual", "thumbnail", "red", "green", "blue", "nir", "scl"):
+        for key in profile["asset_keys"]:
             asset = assets.get(key)
             if asset and asset.get("href"):
                 result[key] = {

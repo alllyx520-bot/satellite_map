@@ -25,9 +25,12 @@ Core direction:
 - Frontend: server-rendered HTML, plain JavaScript, Leaflet, local CSS
 - AI/VL: DashScope Qwen VL
 - Agent controller: GLM-5.3-Flash (BigModel API); `DEEPSEEK_API_KEY` is legacy compatibility only
-- Map source:
-  - Mapbox static satellite imagery
-  - Sentinel-2 L2A through Element84 Earth Search + TiTiler
+- Map source(影像源矩阵,2026-09-10 扩展):
+  - 高清底图(参考级):Mapbox / 天地图 / Esri World Imagery,瓦片拼接下载
+  - Sentinel-2 L2A through Element84 Earth Search + TiTiler(同平台含 sentinel-2-c1-l2a / l1c)
+  - Sentinel-1 GRD SAR(全天候)与 Copernicus DEM GLO-30(地形),同一 STAC+TiTiler 管线
+  - NASA GIBS 每日宏观底图(前端图层)
+- Agent 证据工具(2026-09-10 新增):NASA FIRMS 火点、OSM Overpass 地物语义、Open-Meteo 气象、JRC GSW 水体基线、ESA WorldCover 土地覆盖
 - Reports: `python-docx`
 - Database: SQLite in local dev
 
@@ -107,6 +110,8 @@ DASHSCOPE_API_KEY=...
 DEEPSEEK_API_KEY=...
 AMAP_KEY=...
 TITILER_ENDPOINT=https://titiler.xyz
+FIRMS_MAP_KEY=...        # 可选,NASA FIRMS 火点工具(免费申请);缺失时该工具不可用
+TIANDITU_KEY=...         # 可选,天地图影像底图源;缺失时该源不可用
 ```
 
 Sentinel tuning knobs:
@@ -159,6 +164,11 @@ http://127.0.0.1:8000/             Landing page
 http://127.0.0.1:8000/workbench/   Analysis workbench
 ```
 
+UI 迭代注意（2026-09-09 实测）：`.env` 未设 `DJANGO_DEBUG` 时按 false 运行——模板被
+进程内缓存、`/static/` 改由 `STATIC_ROOT`（staticfiles/）提供。因此改模板需重启进程、
+改静态文件需再跑 `collectstatic` 才生效；纯前端截图迭代推荐直接设 `DJANGO_DEBUG=1`
+启动（模板与 static/ 都实时生效），验完再用默认模式复核一遍。
+
 Alternative user-facing launcher:
 
 ```powershell
@@ -207,6 +217,10 @@ C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --liv
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-sentinel
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-ai
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --agent
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-sentinel1
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-firms
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-esri
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-tianditu
 ```
 
 Default `smoke_pipeline` is mocked and does not call paid/network AI services. Live flags depend on external APIs and quota.
@@ -363,6 +377,7 @@ Recent design fixes:
 - Modal scrollbars are dark and subtle.
 - Sidebar collapse buttons have stable positions.
 - Image previews use `object-fit: contain` where aspect ratio matters.
+- 2026-09-09 基线内极致精修：工作台空状态雷达/准星仪器动画、链路状态 pill、地图边缘电影暗角、历史记录 hover 金条指示、spectral-chip 过渡补全；首页 Hero/章节文字深空投影、能力卡片 hover 斜切扫光、Agent 流程条级联流光。实现见 `static/home.css` 末尾「极致精修层」与 `static/browser.css` 对应区块；截图工具 `scripts/shot_ui.py`。
 
 Before changing UI heavily, verify with browser screenshots or at least reload `http://127.0.0.1:8000/` and check desktop/mobile/modal states.
 
@@ -373,6 +388,10 @@ Before changing UI heavily, verify with browser screenshots or at least reload `
 - Mapbox has better visual detail, but lacks traceable acquisition date/cloud/product metadata.
 - Sentinel-2 is traceable and recent, but clouds, no-data edges, spatial resolution, and revisit cycle limit confidence.
 - NDWI is a lightweight screening metric only. It is not a formal water-body mapping product.
+- Sentinel-1 SAR(2026-09-10 新增)是全天候雷达影像:非光学,VL 解译可靠性低,结论限水体/淹没与宏观地物;不支持光谱指数。
+- Cop-DEM(2026-09-10 新增)是静态高程模型(采集基线 2011-2015),只作地形参考,不代表拍摄时相地表状态。
+- 天地图/Esri(2026-09-10 新增)与 Mapbox 同为参考级底图:无拍摄时间与传感器 GSD,不进入物理测量;Esri 免费条款限非营收且需署名,天地图需 key 且有日配额。
+- FIRMS 火点工具需 FIRMS_MAP_KEY;GSW/WorldCover 为历史静态产品,不作近实时判断。
 - Generated Word reports should not contain Markdown-style formulas if future formulas are added.
 
 ## Git / Artifact Hygiene
@@ -401,16 +420,16 @@ Commit code, migrations, local static assets, tests, and docs.
 
 ## Recent Verified State
 
-Most recent handoff checks:
+Most recent handoff checks(2026-09-10,数据源扩展 M0-M2 完成后):
 
 ```powershell
 C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py check
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py test map_api
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py test map_api    # Ran 449 tests OK
+C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline  # passed (mocked)
 node --check static\browser.js
 ```
 
-All passed after the Sentinel mosaic hardening and UI cleanup.
+All passed. `smoke_pipeline --live-esri` 真调通过(瓦片拼接落盘+场景卡片);`--live-sentinel1` 旗标就绪;`--live-firms`/`--live-tianditu` 需配置对应 key 后真调。改动静态文件后已跑 collectstatic。
 
 ## Handoff Advice For The Next Agent
 

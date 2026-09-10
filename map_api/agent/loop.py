@@ -39,6 +39,12 @@ MAX_VL_TOOL_CALLS = 2
 MAX_AGENT_STEPS = 6
 MAX_EMPTY_DECISIONS = 2
 
+RECOVERY_FIELDS = (
+    "bbox", "scene_id", "file_name", "ndwi", "vision_answer", "analysis_method",
+    "facts", "hypotheses", "evidence", "vision_calls", "final_review_calls",
+    "vision_call_keys", "final_review_done", "completed_steps", "spectral_indices",
+)
+
 
 def _model_error_retryable(exc):
     """只把瞬时网络/限流/服务端错误标为可重试。"""
@@ -49,7 +55,7 @@ def _model_error_retryable(exc):
 
 STEP_VOCAB = [
     "understand", "locate", "select_source", "retrieve_imagery",
-    "quality_check", "ndwi", "vl_analysis", "review", "complete", "failed",
+    "quality_check", "ndwi", "compute_metric", "vl_analysis", "review", "complete", "failed",
 ]
 STEP_ORDER = {s: i for i, s in enumerate(STEP_VOCAB)}
 
@@ -61,13 +67,15 @@ SYSTEM_PROMPT = """你是 SatelliteSense 遥感调查 Agent。基于用户目标
 ## 输出格式（严格 JSON，不要任何额外文字、不要 markdown 代码块）
 {{
   "thought": "<一句话公开思路，给用户看，说明你这一步要做什么，不暴露内部推理细节>",
-  "current_step": "<understand|locate|select_source|retrieve_imagery|quality_check|ndwi|vl_analysis|review|complete>",
+  "current_step": "<understand|locate|select_source|retrieve_imagery|quality_check|ndwi|compute_metric|vl_analysis|review|complete>",
   "plan": [{{"id": "<上述 step 之一>", "label": "<中文标签>"}}],
   "tool_call": {{"name": "<工具名>", "args": {{...}}}} | null,
   "final_answer": "<最终复核结论>" | null,
   "visual_observation": "<仅当本轮附图时填写的可见事实摘要>" | null,
   "decision_confidence": "<high|medium|low>" | null,
   "evidence_basis": ["<本轮可审计依据>"],
+  "evidence_refs": ["<最终回答所引用的已保存 evidence_id；工具调用时可为空>"],
+  "limitations": ["<最终回答的明确数据限制；工具调用时可为空>"],
   "next_action": "<下一步动作摘要>" | null
 }}
 
@@ -75,11 +83,13 @@ SYSTEM_PROMPT = """你是 SatelliteSense 遥感调查 Agent。基于用户目标
 - tool_call 非空时 final_answer 必须为 null；每次只调一个工具。
 - 收集到足够信息后 tool_call=null，final_answer 给出复核结论。
 - 最终结论必须含"复核结论"三字，区分可见事实/模型推断/数据限制，不要夸大 bbox 筛查与 NDWI 的精度。
-- water/vegetation/agriculture/land_use 任务优先 Sentinel-2；small_target/built_up 优先 Mapbox。
+- 最终回答必须从当前上下文列出的 evidence_id 中引用当前场景的指标与视觉复核证据，并提供非空 limitations；不能编造引用。
+- water/vegetation/agriculture/land_use 任务优先 Sentinel-2；small_target/built_up 优先 Mapbox 高清底图（fetch_mapbox_imagery 可用 basemap_source 切换天地图/Esri：中国区行政区调查优先 tianditu，全球细节可用 esri）；洪水/淹没/多云/夜间等全天候需求优先 Sentinel-1 SAR；地形/坡度/高程需求用 Copernicus DEM。
 - 不要重复调用已成功的工具；复用工具返回的结果。
 - 工具失败时先判断失败类型：瞬时网络问题可有限重试，权限/参数问题要换方案或请求用户；不要盲目重复同一调用。
 - 计划不是固定流水线。可根据证据删减、插入或重排步骤，plan 中只保留当前真正需要的步骤。
-- 典型流程：geocode_place -> search_sentinel_imagery / fetch_mapbox_imagery -> (water 任务) compute_ndwi -> analyze_imagery -> final_answer。
+- 典型流程：geocode_place -> search_sentinel_imagery / fetch_mapbox_imagery -> (water 任务) compute_ndwi -> analyze_imagery -> final_answer。search_sentinel_imagery 支持 collection 参数：默认 sentinel-2-l2a；洪水/全天候用 sentinel-1-grd，地形用 cop-dem-glo-30，L2A 无覆盖可试 sentinel-2-l1c。
+- vegetation/agriculture 任务必须先调用 compute_spectral_index(index="ndvi")，current_step="compute_metric"，不能用视觉解译代替指标计算。
 - 若工具返回 status=waiting，说明已暂停征求用户确认，本轮不要重复调用该工具。"""
 
 
@@ -99,8 +109,8 @@ def agent_step(messages, tools_spec, session_ctx):
     if allowed and image_path:
         image_urls.append(image_file_to_data_url(image_path))
     raw = call_glm_json(request_messages, image_urls=image_urls or None)
-    if not isinstance(raw, dict):
-        raw = {}
+    from .decision import validate_legacy_decision
+    validate_legacy_decision(raw, DEFINITIONS)
     tc = raw.get("tool_call")
     if not isinstance(tc, dict):
         tc = None
@@ -117,6 +127,8 @@ def agent_step(messages, tools_spec, session_ctx):
         "plan": plan,
         "tool_call": tc,
         "final_answer": fa if isinstance(fa, str) and fa.strip() else None,
+        "evidence_refs": raw.get("evidence_refs") or [],
+        "limitations": raw.get("limitations") or [],
     }
     result["vision_used"] = bool(image_urls)
     result["vision_trigger"] = trigger if image_urls else None
@@ -139,6 +151,8 @@ def agent_step(messages, tools_spec, session_ctx):
 # ---------------- observer ----------------
 
 def _step_label(sid):
+    if sid == "compute_metric":
+        return "计算光谱指数"
     for s in _views.AGENT_OBSERVER_DEFAULT_STEPS:
         if s.get("id") == sid:
             return s.get("label", sid)
@@ -169,7 +183,6 @@ def _loop_set_observer(session, current_step, thought, plan, status="running",
             ids.append(current_step)
         ids.sort(key=lambda sid: STEP_ORDER.get(sid, 999))
         norm = [{"id": sid, "label": _step_label(sid)} for sid in ids if sid]
-    cur_idx = STEP_ORDER.get(current_step, 999)
     plan_steps = []
     for s in norm:
         sid = s["id"]
@@ -177,14 +190,8 @@ def _loop_set_observer(session, current_step, thought, plan, status="running",
             sstatus = status
         elif sid in completed_steps:
             sstatus = "done"
-        elif STEP_ORDER.get(sid, 999) < cur_idx:
-            sstatus = "done"
         else:
             sstatus = "pending"
-        # observer 是实时执行投影，不展示尚未发生的未来步骤；真实计划仍由
-        # plan_created/plan_changed durable events 记录并可在完整记录中复盘。
-        if sstatus == "pending":
-            continue
         plan_steps.append({"id": sid, "label": s["label"], "status": sstatus})
     current_label = _step_label(current_step)
     next_label = ""
@@ -264,6 +271,9 @@ def _persist(session, ctx, tool_history, expected_claim=None):
         artifacts["final_review_calls"] = int(ctx.get("final_review_calls") or 0)
         artifacts["vision_call_keys"] = list(ctx.get("vision_call_keys") or [])[:20]
         artifacts["final_review_done"] = bool(ctx.get("final_review_done"))
+        artifacts["working_memory"] = {key: ctx[key] for key in RECOVERY_FIELDS if key in ctx}
+        if ctx.get("spectral_indices"):
+            artifacts["spectral_indices"] = ctx["spectral_indices"]
         scene = _ctx_scene(ctx)
         if ctx.get("file_name"):
             artifacts["file_name"] = ctx["file_name"]
@@ -276,6 +286,8 @@ def _persist(session, ctx, tool_history, expected_claim=None):
         locked.artifacts = artifacts
         locked.slots = ctx["slots"]
         locked.save(update_fields=["artifacts", "slots", "scene", "updated_at"])
+        from ..run_kernel import sync_session
+        sync_session(locked.id, snapshot={"evidence": ctx.get("evidence") or []}, expected_claim=expected_claim)
         session = locked
     event_slots = dict(ctx.get("slots") or {})
     resolved = dict(event_slots.get("resolved_place") or {})
@@ -308,6 +320,7 @@ def _build_messages(ctx, tool_history):
         f"当前影像 file_name：{ctx.get('file_name') or '无'}\n"
         f"当前 scene_id：{ctx.get('scene_id') or '无'}\n"
         f"图像源：{slots.get('source', '未定')}\n"
+        f"已保存证据：{json.dumps([{'evidence_id': e.get('evidence_id'), 'tool': e.get('tool'), 'scene_id': e.get('scene_id'), 'metric': e.get('metric')} for e in ctx.get('evidence', [])], ensure_ascii=False)}\n"
         f"视觉证据摘要（仅在本轮附图时可直接观察）：{visual_text}"
     )
     messages = [{"role": "user", "content": preamble}]
@@ -334,8 +347,13 @@ def _deterministic_next_call(ctx):
         return {"name": "geocode_place", "args": {"place_name": slots["place_name"]}, "step": "locate"}
     if not ctx.get("scene_id"):
         source = slots.get("source") or "sentinel2"
-        if source == "mapbox":
-            return {"name": "fetch_mapbox_imagery", "args": {}, "step": "retrieve_imagery"}
+        if source in ("mapbox", "tianditu", "esri"):
+            args = {} if source == "mapbox" else {"basemap_source": source}
+            return {"name": "fetch_mapbox_imagery", "args": args, "step": "retrieve_imagery"}
+        if source == "sentinel1":
+            return {"name": "search_sentinel_imagery", "args": {"collection": "sentinel-1-grd"}, "step": "retrieve_imagery"}
+        if source == "copdem":
+            return {"name": "search_sentinel_imagery", "args": {"collection": "cop-dem-glo-30"}, "step": "retrieve_imagery"}
         return {"name": "search_sentinel_imagery", "args": {}, "step": "retrieve_imagery"}
     if slots.get("task") == "water" and slots.get("source") == "sentinel2" and ctx.get("ndwi") is None:
         return {"name": "compute_ndwi", "args": {}, "step": "ndwi"}
@@ -403,10 +421,14 @@ def _quality_requires_safe_fallback(ctx):
     return False
 
 
-def _complete(session, ctx, final_answer, tool_history, expected_claim=None):
+def _complete(session, ctx, final_answer, tool_history, expected_claim=None, *, evidence_refs=None, limitations=None):
     session.refresh_from_db(fields=["status", "cancel_requested", "artifacts"])
     if session.status == AgentSession.STATUS_FAILED or session.cancel_requested or (session.artifacts or {}).get("cancel_requested"):
         logger.info("skip Agent completion after cancellation: session=%s", session.id)
+        return
+    if (session.artifacts or {}).get("pause_requested"):
+        _views._agent_wait(session, "当前步骤已停止，可以修改条件并重新规划。", [option("retry_step"), option("cancel")],
+                           {"paused_by_user": True}, step_id="review", label="已暂停", expected_claim=expected_claim)
         return
     file_name = ctx.get("file_name")
     scene = _ctx_scene(ctx)
@@ -433,11 +455,30 @@ def _complete(session, ctx, final_answer, tool_history, expected_claim=None):
         return
     warning = _quality_warning(ctx)
     if _quality_requires_safe_fallback(ctx):
-        # 低于区域筛查所需证据门槛时，模型生成的具体地名、尺寸和成因解释
-        # 无法从当前影像验证；宁可保留可审计的保守结论，也不把幻觉正文落库。
-        final_answer = _fallback_final_answer(ctx, safe=True)
+        _views._agent_wait(session, "影像有效覆盖或分辨率未满足任务要求，不能生成正式结论。",
+                           [option("expand_dates"), option("cancel")], {"scene_id": ctx.get("scene_id")},
+                           step_id="quality_check", label="质量门禁未通过", expected_claim=expected_claim)
+        return
     if warning and not final_answer.startswith("数据质量警告："):
         final_answer = warning + final_answer
+    refs = evidence_refs if isinstance(evidence_refs, list) else []
+    available = {item["evidence_id"]: item for item in ctx.get("evidence", [])
+                 if isinstance(item, dict) and isinstance(item.get("evidence_id"), str)}
+    valid_refs = bool(refs) and all(isinstance(ref, str) and ref in available for ref in refs)
+    if not valid_refs:
+        refs = []
+    current_evidence = [available[ref] for ref in refs if ref in available and available[ref].get("scene_id") == ctx.get("scene_id")]
+    task = (ctx.get("slots") or {}).get("task")
+    required_metric = "ndwi" if task == "water" else ("ndvi" if task in {"vegetation", "agriculture"} else None)
+    visual_ok = any(item.get("tool") == "analyze_imagery" for item in current_evidence) and bool(ctx.get("vision_answer"))
+    metric_ok = not required_metric or any(item.get("metric") == required_metric and (item.get("summary") or {}).get("available") is True for item in current_evidence)
+    limits_ok = isinstance(limitations, list) and bool(limitations) and all(isinstance(item, str) and item.strip() for item in limitations)
+    if not (valid_refs and visual_ok and metric_ok and limits_ok):
+        _views._agent_wait(session, "最终回答缺少当前场景的必需指标、视觉证据引用或限制说明，不能标记为完成。",
+                           [option("retry_step"), option("cancel")], {"failed_phase": "final_review", "missing_metric": required_metric if not metric_ok else None},
+                           step_id="review", label="最终证据核验未通过", expected_claim=expected_claim)
+        return
+    final_answer += "\n\n证据引用：" + "、".join(refs) + "\n数据限制：" + "；".join(limitations)
     follow_up = ctx.get("follow_up")
     if follow_up:
         # 多轮追问：追加到现有对话，更新 ChatHistory 全量消息
@@ -468,6 +509,8 @@ def _complete(session, ctx, final_answer, tool_history, expected_claim=None):
             artifacts = {
                 **(locked.artifacts or {}),
                 "final_answer": final_answer,
+                "final_evidence_refs": refs,
+                "final_limitations": limitations,
                 "analysis_method": ctx.get("analysis_method"),
                 "tool_history": tool_history,
                 "history_id": history.id,
@@ -520,6 +563,8 @@ def _complete(session, ctx, final_answer, tool_history, expected_claim=None):
         "ndwi": ctx.get("ndwi"),
         "vision_answer": ctx.get("vision_answer"),
         "final_answer": final_answer,
+        "final_evidence_refs": refs,
+        "final_limitations": limitations,
         "analysis_method": ctx.get("analysis_method"),
         "history_id": history.id,
         "report_available": True,
@@ -556,7 +601,7 @@ def _run_loop(session, ctx, tool_history, context):
     last_tool_signature = None
     repeated_tool_count = 0
     last_tool_error = ""
-    completed_steps = {"understand"}
+    completed_steps = set(ctx.get("completed_steps") or ["understand"])
     if ctx.get("scene_id"):
         completed_steps.update({"locate", "select_source"})
 
@@ -566,6 +611,10 @@ def _run_loop(session, ctx, tool_history, context):
             logger.info("Agent session cancelled: session=%s", session.id)
             return
         if not _touch_worker_lease(session, expected_claim):
+            return
+        if (session.artifacts or {}).get("pause_requested"):
+            _views._agent_wait(session, "当前步骤已停止，可以修改条件并重新规划。", [option("retry_step"), option("cancel")],
+                               {"paused_by_user": True}, step_id="review", label="已暂停", expected_claim=expected_claim)
             return
         if iterations >= MAX_ITERATIONS or agent_step_calls >= MAX_AGENT_STEPS:
             _views._agent_fail(session, "Agent 超过最大迭代次数或决策调用上限，已停止。")
@@ -613,52 +662,19 @@ def _run_loop(session, ctx, tool_history, context):
                 _persist(session, ctx, tool_history, expected_claim)
         except Exception as exc:
             logger.warning("agent decision failed: %s", exc)
-            if rule_only:
-                fallback = _deterministic_next_call(ctx)
-                if fallback:
-                    step = {
-                        "thought": "规则流程：依据已确认事实继续执行，不使用模型自主决策。",
-                        "current_step": fallback["step"], "plan": None,
-                        "tool_call": {"name": fallback["name"], "args": fallback["args"]}, "final_answer": None,
-                    }
-                    emit_execution_event(session.id, "rule_decision", {
-                        "phase": fallback["step"], "status": "warning",
-                        "summary": "按用户确认的规则流程继续执行",
-                        "why": ["用户明确选择继续使用规则流程"],
-                        "action": {"type": "tool_call", "name": fallback["name"]},
-                    }, expected_claim=expected_claim)
-                    decision_kind = "rule_decision"
-                    exc = None
-                else:
-                    step = {"thought": "规则流程：已有证据足以整理保守结论。", "current_step": "complete", "plan": None, "tool_call": None, "final_answer": _fallback_final_answer(ctx, safe=True)}
-                    decision_kind = "rule_decision"
-                    exc = None
-            if exc is not None:
-                fallback = _deterministic_next_call(ctx)
-                allow_rule_fallback = bool(fallback and fallback.get("name") in {
-                    "geocode_place", "search_sentinel_imagery", "fetch_mapbox_imagery", "compute_ndwi",
-                })
-                emit_execution_event(session.id, "model_unavailable", {
-                    "phase": fallback["step"] if fallback else "review",
-                    "status": "warning" if allow_rule_fallback else "waiting_user",
-                    "summary": "GLM 决策服务暂不可用" if not allow_rule_fallback else "GLM 决策服务暂不可用，准备切换到规则路径",
-                    "why": [str(exc)[:240]],
-                    "error_type": type(exc).__name__,
-                    "retryable": _model_error_retryable(exc),
-                    "next": "按规则完成当前安全步骤" if allow_rule_fallback else "重试当前步骤，或明确选择规则流程继续",
-                }, expected_claim=expected_claim)
-                if allow_rule_fallback:
-                    step = {
-                        "thought": "规则兜底：依据已确认的任务类型和现有证据继续执行。",
-                        "current_step": fallback["step"],
-                        "plan": None,
-                        "tool_call": {"name": fallback["name"], "args": fallback["args"]},
-                        "final_answer": None,
-                    }
-                    decision_kind = "rule_decision"
-                else:
-                    _views._agent_wait(session, "GLM 决策服务暂不可用，当前步骤无法安全规则化。", [option("retry_step"), option("continue_rule_mode"), option("cancel")], {"error": str(exc)[:240]}, step_id="review", label="等待恢复操作", expected_claim=expected_claim)
-                    return
+            emit_execution_event(session.id, "model_unavailable", {
+                "phase": "review", "status": "waiting_user",
+                "summary": "主模型决策失败，任务已暂停",
+                "error_type": type(exc).__name__,
+                "retryable": _model_error_retryable(exc),
+            }, expected_claim=expected_claim)
+            _views._agent_wait(
+                session, "主模型决策失败，当前任务已暂停。请重试或取消。",
+                [option("retry_step"), option("cancel")],
+                {"error_type": type(exc).__name__, "retryable": _model_error_retryable(exc)},
+                step_id="review", label="等待模型服务恢复", expected_claim=expected_claim,
+            )
+            return
         thought = step["thought"]
         current_step = step["current_step"]
         plan = step["plan"]
@@ -704,7 +720,8 @@ def _run_loop(session, ctx, tool_history, context):
             _loop_set_observer(session, current_step or "review", thought, plan,
                                status="running", message=thought, completed_steps=completed_steps,
                                expected_claim=expected_claim)
-            _complete(session, ctx, final_answer, tool_history, expected_claim)
+            _complete(session, ctx, final_answer, tool_history, expected_claim,
+                      evidence_refs=step.get("evidence_refs"), limitations=step.get("limitations"))
             return
 
         if not _loop_set_observer(session, current_step, thought, plan,
@@ -712,15 +729,6 @@ def _run_loop(session, ctx, tool_history, context):
                                   expected_claim=expected_claim):
             return
 
-        if not tool_call:
-            fallback = _deterministic_next_call(ctx)
-            if fallback:
-                tool_call = {"name": fallback["name"], "args": fallback["args"]}
-                current_step = fallback["step"]
-            else:
-                final_answer = _fallback_final_answer(ctx)
-                _complete(session, ctx, final_answer, tool_history, expected_claim)
-                return
         if not tool_call:
             empty_decisions += 1
             if empty_decisions > MAX_EMPTY_DECISIONS:
@@ -783,16 +791,18 @@ def _run_loop(session, ctx, tool_history, context):
         started_at = time.perf_counter()
         result = None
         try:
-            result = definition.invoke(ctx, args)
+            from .durable_tools import invoke, ToolClaimLost
+            result = invoke(session, definition, ctx, args, current_step, expected_claim)
             result_text = json.dumps(result, ensure_ascii=False, default=str)
-            if isinstance(result, dict) and result.get("status") == "error":
+            if isinstance(result, dict) and result.get("status") != "ok":
                 last_tool_error = str(result.get("message") or "工具返回错误")[:300]
+        except ToolClaimLost:
+            return
         except WaitingForUser as w:
             tool_history.append({
                 "role": "tool_result",
                 "content": json.dumps({"status": "waiting", "message": w.message, "options": w.options, "data": w.data}, ensure_ascii=False, default=str),
             })
-            completed_steps.add(current_step)
             if not _persist(session, ctx, tool_history, expected_claim):
                 return
             wait_data = dict(w.data or {})
@@ -804,13 +814,14 @@ def _run_loop(session, ctx, tool_history, context):
         except Exception as exc:
             logger.exception("agent tool %s failed", name)
             last_tool_error = f"工具 {name} 执行异常：{str(exc)[:200]}"
-            result_text = json.dumps({
+            result = {
                 "status": "error",
                 "message": last_tool_error,
                 "error_type": "timeout" if isinstance(exc, (TimeoutError, ConnectionError)) else "unknown",
                 "retryable": isinstance(exc, (TimeoutError, ConnectionError)),
                 "attempts": 1,
-            }, ensure_ascii=False)
+            }
+            result_text = json.dumps(result, ensure_ascii=False)
 
         with transaction.atomic():
             locked = AgentSession.objects.select_for_update().get(id=session.id)
@@ -828,7 +839,16 @@ def _run_loop(session, ctx, tool_history, context):
         if isinstance(result, dict) and result.get("status") == "ok":
             result_body = result.get("result") if isinstance(result.get("result"), dict) else result
             ctx.setdefault("facts", {})[name] = result_body
-            ctx.setdefault("evidence", []).append({"tool": name, "summary": result_body})
+            evidence = {"tool": name, "kind": name, "summary": result_body, "scene_id": ctx.get("scene_id")}
+            if name in {"compute_ndwi", "compute_spectral_index"}:
+                limits = result_body.get("limitations") or []
+                evidence.update({"metric": result_body.get("index", "ndwi"), "method": result_body.get("method"),
+                                 "aoi": result_body.get("aoi") or ctx.get("bbox"), "data_contract": result_body.get("data_contract") or {},
+                                 "mask_statistics": {key: result_body.get(key) for key in ("sample_size_px", "valid_pixel_ratio", "aoi_pixel_count", "mask_source")},
+                                 "limitations": [limits] if isinstance(limits, str) else limits})
+            from ..run_kernel import evidence_key
+            evidence["evidence_id"] = evidence_key(evidence)
+            ctx.setdefault("evidence", []).append(evidence)
             ctx["evidence"] = ctx["evidence"][-40:]
         result_payload = result if isinstance(result, dict) else {"summary": result_text}
         nested = result_payload.get("result") if isinstance(result_payload.get("result"), dict) else {}
@@ -844,8 +864,15 @@ def _run_loop(session, ctx, tool_history, context):
                 "error": last_tool_error,
                 "suggestion": "分析失败类型后选择重试、替代工具或请求用户",
             }, expected_claim=expected_claim)
-        completed_steps.add(current_step)
+        if isinstance(result, dict) and result.get("status") == "ok":
+            completed_steps.add(current_step)
+        ctx["completed_steps"] = sorted(completed_steps)
         _persist(session, ctx, tool_history, expected_claim)
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            _views._agent_wait(session, last_tool_error or "工具没有返回完整可用结果，任务已暂停。",
+                               [option("retry_step"), option("cancel")], {"failed_tool": name, "failed_step": current_step},
+                               step_id=current_step, label="等待工具重试", expected_claim=expected_claim)
+            return
 
 
 def run_agent_loop(session_id, context=None):
@@ -864,9 +891,36 @@ def run_agent_loop(session_id, context=None):
         "why": ["已接收用户目标，准备建立可恢复执行上下文"],
     }, expected_claim=context.get("worker_claim"))
     try:
+        if session.status != AgentSession.STATUS_RUNNING or session.cancel_requested:
+            return
+        run_id = (session.artifacts or {}).get("run_id")
+        if run_id and not context.get("tool_history") and not (session.artifacts or {}).get("retry_planning"):
+            from ..models import RunCheckpoint
+            from ..run_journal import load_checkpoint
+            latest = RunCheckpoint.objects.filter(run_id=run_id).order_by("-sequence").first()
+            if latest and latest.state_snapshot.get("schema_version") == 1:
+                checkpoint = load_checkpoint(run_id)
+                saved = checkpoint["context"]
+                memory = saved.get("working_memory")
+                if isinstance(memory, dict) and memory:
+                    ctx = build_ctx(session, context)
+                    ctx.update({key: value for key, value in memory.items() if key in RECOVERY_FIELDS})
+                    ctx["slots"] = saved.get("slots") or session.slots
+                    refresh_ctx_scene(ctx)
+                    _run_loop(session, ctx, list(saved.get("tool_history") or []), context)
+                    return
         # 恢复：context 直接提供 tool_history（已含指令 result）
-        if context.get("tool_history"):
+        if context.get("tool_history") and not (session.artifacts or {}).get("retry_planning"):
             ctx = build_ctx(session, context)
+            memory = (session.artifacts or {}).get("working_memory") or {}
+            if isinstance(memory, dict):
+                ctx.update({key: value for key, value in memory.items() if key in RECOVERY_FIELDS})
+            # Current user input has priority over the checkpoint. Evidence from a
+            # different scene must not become the basis of a follow-up answer.
+            if context.get("scene_id") and context["scene_id"] != ctx.get("scene_id"):
+                ctx = build_ctx(session, context)
+            ctx["slots"] = dict(session.slots or {})
+            refresh_ctx_scene(ctx)
             ctx["follow_up"] = context.get("follow_up")
             tool_history = list(context["tool_history"])
             _run_loop(session, ctx, tool_history, context)
@@ -881,9 +935,13 @@ def run_agent_loop(session_id, context=None):
         try:
             plan = build_agent_plan(session.goal, mode=session.mode)
         except Exception as exc:
-            logger.warning("agent planning failed, using deterministic slots: %s", exc)
-            slots_fallback = merge_agent_slots({}, session.goal, defaults={"mode": session.mode})
-            plan = {"slots": slots_fallback, "steps": [dict(step) for step in _views.AGENT_OBSERVER_DEFAULT_STEPS]}
+            _views._agent_wait(
+                session, "主模型规划失败，任务已暂停。请重试或取消。",
+                [option("retry_step"), option("cancel")],
+                {"error_type": type(exc).__name__, "retryable": _model_error_retryable(exc), "failed_phase": "planning"},
+                step_id="understand", label="等待规划服务恢复", expected_claim=expected_claim,
+            )
+            return
         slots = dict(plan.get("slots") or {})
         slots.update(existing_slots)
         if context.get("bbox"):
@@ -899,7 +957,10 @@ def run_agent_loop(session_id, context=None):
                 return
             locked.slots = slots
             locked.plan = plan
-            locked.save(update_fields=["slots", "plan", "updated_at"])
+            artifacts = dict(locked.artifacts or {})
+            artifacts.pop("retry_planning", None)
+            locked.artifacts = artifacts
+            locked.save(update_fields=["slots", "plan", "artifacts", "updated_at"])
             session = locked
         emit_execution_event(session.id, "plan_created", {
             "plan": plan,
@@ -918,6 +979,8 @@ def run_agent_loop(session_id, context=None):
         logger.exception("agent loop failed id=%s", session_id)
         _views._agent_fail(session, str(exc)[:500])
     finally:
+        from ..run_kernel import acknowledge_cancel
+        acknowledge_cancel(session_id, context.get("worker_claim"))
         close_old_connections()
 
 
@@ -962,8 +1025,15 @@ def resume_waiting_agent_session(session, action):
             return
         artifacts = dict(locked.artifacts or {})
         waiting_data = ((artifacts.get("waiting") or {}).get("data") or {})
+        artifacts.pop("pause_requested", None)
+        if code == "retry_step" and waiting_data.get("call_key"):
+            from .durable_tools import authorize_retry
+            if not authorize_retry(locked, waiting_data["call_key"]):
+                return
+        if waiting_data.get("failed_phase") == "planning":
+            artifacts["retry_planning"] = True
         artifacts.pop("waiting", None)
-        execution_mode = str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower()
+        execution_mode = artifacts.get("execution_mode") or str(os.environ.get("AGENT_EXECUTION_MODE", "thread")).strip().lower()
         if execution_mode in {"queue", "worker", "persistent"}:
             artifacts.pop("worker_claim", None)
             artifacts.pop("worker_claimed_at", None)

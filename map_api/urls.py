@@ -1,11 +1,23 @@
 from django.urls import path
 from . import views
+from . import run_api
 
 urlpatterns = [
+    path('v2/agent/runs/', run_api.run_list, name='v2_agent_runs'),
+    path('v2/agent/runs/<int:run_id>/actions/', run_api.run_actions, name='v2_agent_run_actions'),
+    path('v2/agent/runs/<int:run_id>/replan/', run_api.run_replan, name='v2_agent_run_replan'),
+    path('v2/agent/runs/<int:run_id>/artifacts/', run_api.run_artifacts, name='v2_agent_run_artifacts'),
+    path('v2/agent/runs/<int:run_id>/artifacts/<str:artifact_id>/download/', run_api.run_artifact_download, name='v2_agent_run_artifact_download'),
+    path('v2/agent/runs/<int:run_id>/evidence/', run_api.run_evidence, name='v2_agent_run_evidence'),
+    path('v2/agent/runs/<int:run_id>/', views.agent_run_detail, name='v2_agent_run_detail'),
+    path('v2/agent/runs/<int:run_id>/events/', run_api.run_events, name='v2_agent_run_events'),
+    path('v2/agent/runs/<int:run_id>/events/stream/', run_api.run_events_stream, name='v2_agent_run_events_stream'),
     path('system/health/', views.system_health, name='system_health'),
     path('system/dependencies/', views.system_dependencies, name='system_dependencies'),
     path('system/dependencies/probe/', views.system_dependencies_probe, name='system_dependencies_probe'),
     path('analysis/indices/', views.spectral_indices_catalog, name='spectral_indices_catalog'),
+    path('analysis/change/', views.analysis_change, name='analysis_change'),
+    path('analysis/runs/<int:run_id>/', views.analysis_run_detail, name='analysis_run_detail'),
     path('satellite/get-img/', views.get_satellite_img_api, name='get_satellite_img'),
     path('satellite/get-sentinel-img/', views.get_sentinel_img_api, name='get_sentinel_img'),
     path('satellite/show-img/', views.show_satellite_image, name='show_satellite_image'),
@@ -17,6 +29,7 @@ urlpatterns = [
     path('imagery/scenes/<int:scene_id>/', views.imagery_scene_detail, name='imagery_scene_detail'),
     path('agent/sessions/', views.agent_session_list, name='agent_session_list'),
     path('agent/sessions/<int:session_id>/', views.agent_session_detail, name='agent_session_detail'),
+    path('agent/runs/<int:run_id>/', views.agent_run_detail, name='agent_run_detail'),
     path('agent/sessions/<int:session_id>/events/', views.agent_session_events, name='agent_session_events'),
     path('agent/sessions/<int:session_id>/events/stream/', views.agent_session_events_stream, name='agent_session_events_stream'),
     path('agent/sessions/<int:session_id>/transcript/', views.agent_session_transcript, name='agent_session_transcript'),

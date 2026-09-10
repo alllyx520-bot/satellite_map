@@ -9,9 +9,11 @@ from io import BytesIO
 
 import numpy as np
 import requests
+import tifffile
 from PIL import Image
 
 from .analysis_strategy import build_analysis_strategy
+from .http import request_proxies  # noqa: F401  # 唯一实现；此处保留原名，agent/providers.py 等旧 import 不受影响
 from ..remote_sensing_indices import ndwi as spectral_ndwi, summarize as summarize_index
 
 
@@ -54,6 +56,12 @@ TASK_ALIASES = {
     "landcover": "land_use",
     "land_cover": "land_use",
     "land_use": "land_use",
+    "flood": "flood",
+    "flood_monitoring": "flood",
+    "inundation": "flood",
+    "terrain": "terrain",
+    "terrain_analysis": "terrain",
+    "elevation": "terrain",
 }
 SEASONS = {
     "春季": (3, 5),
@@ -65,12 +73,6 @@ SEASONS = {
     "冬季": (12, 2),
     "冬天": (12, 2),
 }
-
-
-def request_proxies():
-    """默认遵循当前进程代理；仅显式要求时才强制直连。"""
-    direct = os.environ.get("SATELLITESENSE_DIRECT_HTTP", "").strip().lower()
-    return {"http": None, "https": None} if direct in {"1", "true", "yes"} else None
 
 
 def glm_headers():
@@ -163,19 +165,23 @@ def call_glm_json(messages, image_urls=None, timeout=45):
 
 
 def _parse_json_response(text):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("模型 JSON 含重复字段")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError("模型 JSON 含非有限数值")
+
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        cleaned = (text or "").strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                return json.loads(cleaned[start:end + 1])
-            except json.JSONDecodeError:
-                pass
+        value = json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_constant)
+        if not isinstance(value, dict):
+            raise ValueError("模型 JSON 必须是对象")
+        return value
+    except (ValueError, TypeError) as exc:
         raise ValueError("GLM 未返回有效 JSON") from exc
 
 
@@ -271,7 +277,12 @@ def deterministic_extract_slots(goal, today=None):
         slots["place_name"] = place
 
     lower_task = text.lower()
-    if any(word in text for word in ("水体", "水域", "河流", "湖泊", "水库", "岸线", "湿地")):
+    # flood/terrain 优先于通用 task 归类:它们决定专用传感器(SAR/DEM),不能被 water/land_use 抢走。
+    if any(word in text for word in ("洪水", "洪涝", "淹没", "内涝", "汛情")):
+        slots["task"] = "flood"
+    elif any(word in text for word in ("地形", "坡度", "高程", "山地", "地势")):
+        slots["task"] = "terrain"
+    elif any(word in text for word in ("水体", "水域", "河流", "湖泊", "水库", "岸线", "湿地")):
         slots["task"] = "water"
     elif any(word in text for word in ("植被", "绿地", "森林", "生态")):
         slots["task"] = "vegetation"
@@ -288,10 +299,19 @@ def deterministic_extract_slots(goal, today=None):
         slots["source"] = "sentinel2"
     if slots["task"] in ("small_target", "built_up"):
         slots["source"] = "mapbox"
+    if slots["task"] == "flood":
+        # SAR 全天候、对水体/淹没敏感,洪涝任务固定走 Sentinel-1。
+        slots["source"] = "sentinel1"
+    if slots["task"] == "terrain":
+        slots["source"] = "copdem"
     if any(word in text for word in ("近期", "最新", "现在", "当前", "变化", "新增", "扩张", "退化")):
         slots["needs_timeliness"] = True
-        if slots["task"] != "small_target":
+        # flood/terrain 的专用源优先级高于时效覆写。
+        if slots["task"] not in ("small_target", "flood", "terrain"):
             slots["source"] = "sentinel2"
+    # 多云/阴天/夜间等光学受限条件:SAR 全天候兜底,同样不抢 flood/terrain。
+    if any(word in text for word in ("多云", "阴天", "夜间成像", "全天候")) and slots["task"] not in ("flood", "terrain"):
+        slots["source"] = "sentinel1"
     if "flash" in lower_task or "快速" in text:
         slots["mode"] = "fast"
 
@@ -337,13 +357,18 @@ def merge_agent_slots(model_slots, goal, defaults=None, today=None):
         merged["time_granularity"] = "rolling_90d"
 
     merged["task"] = normalize_agent_task(merged.get("task"))
-    if merged["task"] not in ("water", "vegetation", "agriculture", "small_target", "built_up", "land_use"):
+    if merged["task"] not in ("water", "vegetation", "agriculture", "small_target", "built_up", "land_use", "flood", "terrain"):
         merged["task"] = rule_slots.get("task") or "land_use"
     if merged.get("source") == "earth_search":
         merged["source"] = "sentinel2"
-    if merged.get("source") not in ("sentinel2", "mapbox"):
+    if merged.get("source") not in ("sentinel2", "mapbox", "tianditu", "esri", "sentinel1", "copdem"):
         task = merged.get("task")
-        merged["source"] = "sentinel2" if task in ("water", "vegetation", "agriculture", "land_use") else "mapbox"
+        if task == "flood":
+            merged["source"] = "sentinel1"
+        elif task == "terrain":
+            merged["source"] = "copdem"
+        else:
+            merged["source"] = "sentinel2" if task in ("water", "vegetation", "agriculture", "land_use") else "mapbox"
     if merged.get("mode") not in ("fast", "precise"):
         merged["mode"] = "precise"
     return merged
@@ -357,7 +382,7 @@ def build_agent_plan(goal, mode="precise", today=None):
                 "你是遥感智能调查 Agent 的任务规划器。"
                 "只返回 JSON，不要解释。字段包含 place_name,date_start,date_end,"
                 "time_granularity,task,source,needs_timeliness,mode。"
-                "source 只能是 sentinel2 或 mapbox；mode 只能是 precise 或 fast。"
+                "source 只能是 sentinel2/mapbox/tianditu/esri/sentinel1/copdem：sentinel2 适合近期光学态势，mapbox 适合建筑道路细节；tianditu(天地图)同为高清底图，中国区行政区调查优先选用(合规)；esri(Esri World Imagery)同为高清底图，适合全球范围细节；洪水/淹没/多云/夜间等全天候需求用 sentinel1(SAR)，地形/坡度/高程用 copdem(静态 DEM)；mode 只能是 precise 或 fast。"
             ),
         },
         {"role": "user", "content": goal},
@@ -487,14 +512,14 @@ def resolve_district_bbox(place_name, timeout=12):
     }
 
 
-def fetch_cog_bbox_array(asset, bbox, titiler_endpoint, size=256, timeout=60, kind="reflectance"):
+def fetch_cog_bbox_array(asset, bbox, titiler_endpoint, size=256, timeout=60, kind="reflectance", verify_grid=False):
     """读取 Sentinel COG bbox，并按资产语义返回数组。
 
     反射率资产使用 STAC raster:bands 的 scale/offset；SCL 是离散分类栅格，
     禁止使用连续值 rescale，避免云/阴影类别被压成 0/255。
     """
     asset_info = asset if isinstance(asset, dict) else {}
-    asset_url = asset_info.get("href") if isinstance(asset_info, dict) else asset
+    asset_url = asset_info.get("href") if isinstance(asset, dict) else asset
     if not asset_url:
         raise ValueError("COG 资产缺少 href")
     endpoint = (
@@ -503,10 +528,13 @@ def fetch_cog_bbox_array(asset, bbox, titiler_endpoint, size=256, timeout=60, ki
         f"{size}x{size}.tif"
     )
     params = {"url": asset_url}
+    if verify_grid:
+        params["dst_crs"] = "EPSG:4326"
     if kind == "scl":
         params["resampling"] = "nearest"
     else:
-        params["rescale"] = "0,10000"
+        params["resampling"] = "bilinear"
+    # 反射率不能复用显示型 rescale；保留源 dtype 并在本地按 STAC scale/offset 转换。
     response = requests.get(
         endpoint,
         params=params,
@@ -514,15 +542,56 @@ def fetch_cog_bbox_array(asset, bbox, titiler_endpoint, size=256, timeout=60, ki
         proxies=request_proxies(),
     )
     response.raise_for_status()
-    image = Image.open(BytesIO(response.content))
-    arr = np.asarray(image, dtype=np.float32)
-    if arr.ndim == 3:
-        arr = arr[..., 0]
+    with tifffile.TiffFile(BytesIO(response.content)) as image:
+        page = image.pages[0]
+        if verify_grid:
+            scale = page.tags.get(33550)
+            tie = page.tags.get(33922)
+            keys = page.tags.get(34735)
+            if not scale or not tie or not keys:
+                raise ValueError("影像缺少可验证的地理网格元数据")
+            key_values = keys.value
+            geographic = {key_values[i]: key_values[i + 3] for i in range(4, len(key_values), 4) if key_values[i + 1] == 0}
+            if geographic.get(2048) != 4326:
+                raise ValueError("影像输出投影不是请求的 EPSG:4326")
+            sx, sy = scale.value[:2]
+            x0, y0 = tie.value[3:5]
+            expected = [bbox['min_lng'], bbox['max_lat'], bbox['max_lng'], bbox['min_lat']]
+            actual = [x0, y0, x0 + sx * page.imagewidth, y0 - sy * page.imagelength]
+            if page.imagewidth != size or page.imagelength != size or not np.allclose(expected, actual, rtol=0, atol=1e-7):
+                raise ValueError("影像输出地理网格与请求不一致")
+        if kind == "palette":
+            # 调色板 COG（如 GSW occurrence / ESA WorldCover）经 TiTiler 输出的是
+            # RGB(A) 颜色而非原始值；这里返回 RGB(A) 数组，由调用方结合
+            # /cog/colormap 反查数值。alpha==0 的像元整体置 NaN 表示无效。
+            if len(image.pages) != 1 or int(page.photometric) != 2 or page.samplesperpixel not in (3, 4):
+                raise ValueError("palette 读取必须返回 RGB/RGBA TIFF 栅格")
+            arr = np.moveaxis(np.asarray(page.asarray(), dtype=np.float32), page.axes.index("S"), -1)
+            if page.samplesperpixel == 4:
+                arr[arr[..., 3] == 0] = np.nan
+            return arr
+        if len(image.pages) != 1 or int(page.photometric) not in (0, 1):
+            raise ValueError("COG 读取必须返回单波段 TIFF 栅格（可含 alpha 有效掩膜）")
+        arr = np.asarray(page.asarray(), dtype=np.float32)
+        if arr.ndim == 3 and page.samplesperpixel == 2 and tuple(int(v) for v in page.extrasamples) in {(1,), (2,)}:
+            # TiTiler's GeoTIFF carries data + uint16 alpha. Pillow cannot read
+            # this TIFF layout; the alpha must also participate in validity.
+            samples = np.moveaxis(arr, page.axes.index("S"), -1)
+            arr = np.where(samples[..., 1] > 0, samples[..., 0], np.nan)
+        elif arr.ndim != 2:
+            raise ValueError("COG 读取必须返回单波段 TIFF 栅格（可含 alpha 有效掩膜）")
+    bands = asset_info.get("raster:bands") or []
+    band = bands[0] if bands and isinstance(bands[0], dict) else {}
+    nodata = band.get("nodata")
+    if nodata is not None:
+        arr[arr == float(nodata)] = np.nan
     if kind != "scl":
-        bands = asset_info.get("raster:bands") or []
-        band = bands[0] if bands and isinstance(bands[0], dict) else {}
-        scale = float(band.get("scale", 1.0) or 1.0)
-        offset = float(band.get("offset", 0.0) or 0.0)
+        if "scale" not in band or "offset" not in band:
+            raise ValueError("反射率资产缺少明确的 scale/offset")
+        scale = float(band["scale"])
+        offset = float(band["offset"])
+        if not np.isfinite(scale) or not np.isfinite(offset) or scale <= 0:
+            raise ValueError("反射率 scale/offset 无效")
         if scale != 1.0 or offset != 0.0:
             arr = arr * scale + offset
     return arr
@@ -553,7 +622,19 @@ def compute_ndwi_from_arrays(green, nir, threshold=NDWI_THRESHOLD, min_valid_pix
         "max_ndwi": stats["max"],
         "sample_size_px": valid_count,
         "valid_pixel_ratio": stats.get("valid_pixel_ratio", 0.0),
-        "limitations": "轻量 NDWI 仅用于 bbox 内水体线索筛查；已按 SCL 排除云、云影、卷云和雪，但未做行政边界精确裁剪或严格多景合成。",
+        "masked_pixel_ratio": round(1.0 - float(stats.get("valid_pixel_ratio", 0.0)), 4),
+        "thresholded_water_pixel_ratio": round(ratio, 4),
+        "thresholded_water_area_m2": None,
+        "threshold_method": "fixed",
+        "alternative_thresholds": [
+            {"threshold": round(float(threshold) + delta, 4), "water_ratio": round(float(np.mean(values > float(threshold) + delta)), 4)}
+            for delta in (-0.05, -0.02, 0.02, 0.05)
+        ],
+        "aoi_pixel_ratio": stats.get("valid_pixel_ratio", 0.0),
+        "mask_source": "nodata_and_common_valid_mask",
+        "measurement_grade": "screening",
+        "change_detection_allowed": False,
+        "limitations": "结果仅统计输入的共同有效像元；QA、行政区掩膜和反射率校准由上游数据读取步骤负责。",
     }
 
 
@@ -586,129 +667,120 @@ def polygon_mask_for_bbox(polygon, bbox, shape):
         return inside
 
     mask = np.zeros((h, w), dtype=bool)
-    for ring in polygon:
-        mask |= ring_mask(ring)
+    if isinstance(polygon, dict):
+        geometry = polygon.get("geometry") if polygon.get("type") == "Feature" else polygon
+        if geometry.get("type") == "Polygon":
+            polygons = [geometry.get("coordinates") or []]
+        elif geometry.get("type") == "MultiPolygon":
+            polygons = geometry.get("coordinates") or []
+        else:
+            raise ValueError("AOI 必须是 Polygon 或 MultiPolygon")
+        for rings in polygons:
+            if not rings:
+                continue
+            part = ring_mask(rings[0])
+            for hole in rings[1:]:
+                part &= ~ring_mask(hole)
+            mask |= part
+    else:
+        for ring in polygon:
+            mask |= ring_mask(ring)
     return mask
 
 
-def compute_ndwi_summary(candidate, bbox, titiler_endpoint=None, threshold=NDWI_THRESHOLD, polygon=None):
+def _read_ndwi_inputs(candidate, bbox, titiler_endpoint):
+    # 无 SCL 的 collection(如 sentinel-2-l1c 兜底)显式拒绝,不做无掩膜 NDWI。
+    from ..imagery_sources.earth_search import get_collection_profile
+    collection = getattr(candidate, "collection", None) or "sentinel-2-l2a"
+    if get_collection_profile(collection).get("qa_band") is None:
+        raise ValueError(f"{collection} 无 SCL 云掩膜，光谱指数不可用，请改用 L2A 影像")
     assets = candidate.assets or {}
-    green_url = (assets.get("green") or {}).get("href")
-    nir_url = (assets.get("nir") or {}).get("href")
-    if not green_url or not nir_url:
-        return {
-            "available": False,
-            "method": "NDWI=(Green-NIR)/(Green+NIR)",
-            "reason": "候选影像缺少 green 或 nir 资产，无法计算 NDWI。",
-            "limitations": "仍可使用真彩色影像做视觉解译，但水体比例不提供量化结果。",
-        }
+    missing = [name for name in ("green", "nir", "scl") if not (assets.get(name) or {}).get("href")]
+    if missing:
+        raise ValueError("候选影像缺少 " + ", ".join("SCL" if name == "scl" else name for name in missing) + " 资产")
+    green = fetch_cog_bbox_array(assets["green"], bbox, titiler_endpoint)
+    nir = fetch_cog_bbox_array(assets["nir"], bbox, titiler_endpoint)
+    scl = fetch_cog_bbox_array(assets["scl"], bbox, titiler_endpoint, kind="scl")
+    if scl.shape != green.shape or nir.shape != green.shape:
+        raise ValueError("波段与 SCL 网格尺寸不一致")
+    return green, nir, np.isfinite(scl) & np.isin(scl, [4, 5, 6, 7])
+
+
+def _ndwi_product(green, nir, qa, bbox, polygon, threshold):
+    polygon_mask = polygon_mask_for_bbox(polygon, bbox, green.shape) if polygon else None
+    valid_mask = qa.copy()
+    if polygon_mask is not None:
+        valid_mask &= polygon_mask
+    calibrated = np.isfinite(green) & np.isfinite(nir) & (green >= 0) & (nir >= 0) & (green <= 1) & (nir <= 1)
+    reflectance_rejected = int((valid_mask & ~calibrated).sum())
+    valid_mask &= calibrated
+    aoi_count = int(polygon_mask.sum()) if polygon_mask is not None else green.size
+    usable = valid_mask & (np.abs(green + nir) > 1e-6)
+    if aoi_count == 0 or int(usable.sum()) / aoi_count < 0.6:
+        raise ValueError("AOI 内有效像元低于 60%，不能输出水体比例")
+    result = compute_ndwi_from_arrays(green, nir, threshold=threshold, valid_mask=valid_mask)
+    result.update({
+        "mask_source": "sentinel-2-scl+aoi+nodata" if polygon_mask is not None else "sentinel-2-scl+nodata",
+        "masked_pixel_count": int((~usable).sum()), "aoi_pixel_count": aoi_count,
+        "invalid_reflectance_pixel_count": reflectance_rejected,
+        "valid_pixel_ratio": round(int(usable.sum()) / aoi_count, 4),
+        "data_contract": {"source": "sentinel-2-l2a", "reflectance_scale_applied": True,
+                          "scl_resampling": "nearest", "measurement_grade": "screening"},
+        "limitations": "仅统计共同有效像元；排除校准反射率不在 [0,1] 的像元；输出网格可能经过重采样，不代表原生分辨率测量。",
+    })
+    if polygon_mask is not None:
+        result["polygon_clipped"] = True
+        result["limitations"] += "已按行政区 polygon 裁剪。"
+    return result
+
+
+def _ndwi_error(exc):
+    response = getattr(exc, "response", None)
+    return {
+        "available": False, "method": "NDWI=(Green-NIR)/(Green+NIR)",
+        "reason": str(exc)[:180] if isinstance(exc, ValueError) else "外部 COG/TiTiler 资产读取失败，请检查服务状态后重试。",
+        "diagnostics": {"error_type": type(exc).__name__, "http_status": getattr(response, "status_code", None)},
+        "limitations": "指标未完成，不能输出水体比例或正式结论。",
+    }
+
+
+def compute_ndwi_summary(candidate, bbox, titiler_endpoint=None, threshold=NDWI_THRESHOLD, polygon=None):
     try:
-        green_asset = assets.get("green") or {}
-        nir_asset = assets.get("nir") or {}
-        green = fetch_cog_bbox_array(green_asset, bbox, titiler_endpoint)
-        nir = fetch_cog_bbox_array(nir_asset, bbox, titiler_endpoint)
-        scl_url = (assets.get("scl") or {}).get("href")
-        valid_mask = None
-        if scl_url:
-            scl = fetch_cog_bbox_array(assets.get("scl") or {}, bbox, titiler_endpoint, kind="scl")
-            # Sentinel-2 SCL: 3 cloud shadow, 8/9 cloud, 10 cirrus, 11 snow/ice
-            valid_mask = ~np.isin(np.rint(scl).astype(np.int16), [3, 8, 9, 10, 11])
-        polygon_mask = polygon_mask_for_bbox(polygon, bbox, green.shape) if polygon else None
-        if polygon_mask is not None:
-            valid_mask = polygon_mask if valid_mask is None else (valid_mask & polygon_mask)
-        result = compute_ndwi_from_arrays(green, nir, threshold=threshold, valid_mask=valid_mask)
-        if valid_mask is not None:
-            result["mask_source"] = "sentinel-2-scl"
-            result["masked_pixel_count"] = int((~valid_mask).sum())
-        result["data_contract"] = {
-            "source": "sentinel-2-l2a",
-            "reflectance_scale_applied": True,
-            "scl_resampling": "nearest" if scl_url else None,
-            "measurement_grade": "screening",
-        }
-        if polygon_mask is not None:
-            result["limitations"] = result["limitations"].replace("未做行政边界精确裁剪", "已按行政区 polygon 裁剪")
-            result["polygon_clipped"] = True
+        return _ndwi_product(*_read_ndwi_inputs(candidate, bbox, titiler_endpoint), bbox, polygon, threshold)
+    except Exception as exc:
+        return _ndwi_error(exc)
+
+
+def compute_ndwi_mosaic_summary(candidates, bbox, titiler_endpoint=None, threshold=NDWI_THRESHOLD, polygon=None):
+    """Compose calibrated bands on one requested grid; overlapping pixels count once."""
+    try:
+        candidates = list(candidates or [])
+        dates = [getattr(candidate, "acquired_at", None) for candidate in candidates]
+        if not dates or any(value is None for value in dates):
+            raise ValueError("多景统计必须提供每个场景的明确拍摄日期")
+        date_ids = sorted({value.date().isoformat() for value in dates})
+        if len(date_ids) != 1:
+            raise ValueError("禁止跨日期拼接后输出单期水体比例")
+        green = nir = covered = None
+        contributions = []
+        for candidate in candidates:
+            g, n, qa = _read_ndwi_inputs(candidate, bbox, titiler_endpoint)
+            if green is None:
+                green = np.full(g.shape, np.nan, dtype=np.float32)
+                nir = np.full(g.shape, np.nan, dtype=np.float32)
+                covered = np.zeros(g.shape, dtype=bool)
+            if g.shape != green.shape:
+                raise ValueError("多景输出网格尺寸不一致")
+            usable = qa & np.isfinite(g) & np.isfinite(n) & (g >= 0) & (n >= 0) & (g <= 1) & (n <= 1) & (np.abs(g+n) > 1e-6)
+            new = usable & ~covered
+            green[new], nir[new] = g[new], n[new]
+            covered |= new
+            contributions.append({"product_id": getattr(candidate, "product_id", ""), "contributed_pixels": int(new.sum())})
+        result = _ndwi_product(green, nir, covered, bbox, polygon, threshold)
+        result.update({"aggregation": "同一目标网格逐像元合成，重叠像元只统计一次",
+                       "candidate_count": len(candidates), "candidate_summaries": contributions,
+                       "acquisition_dates": date_ids, "temporal_consistency": "same_date",
+                       "change_detection_allowed": False, "failed_candidates": []})
         return result
     except Exception as exc:
-        return {
-            "available": False,
-            "method": "NDWI=(Green-NIR)/(Green+NIR)",
-            "reason": str(exc)[:180],
-            "limitations": "NDWI 计算失败时仅保留视觉解译结论，不输出水体比例量化。",
-        }
-
-
-def compute_ndwi_mosaic_summary(
-    candidates,
-    bbox,
-    titiler_endpoint=None,
-    threshold=NDWI_THRESHOLD,
-    polygon=None,
-):
-    summaries = []
-    weighted_water = 0
-    weighted_mean = 0
-    weighted_max = None
-    sample_total = 0
-    failed = []
-    for candidate in candidates or []:
-        summary = compute_ndwi_summary(
-            candidate,
-            bbox,
-            titiler_endpoint=titiler_endpoint,
-            threshold=threshold,
-            polygon=polygon,
-        )
-        product_id = getattr(candidate, "product_id", "") or getattr(candidate, "item_id", "")
-        if summary.get("available"):
-            sample_size = int(summary.get("sample_size_px") or 0)
-            if sample_size <= 0:
-                failed.append({"product_id": product_id, "reason": "NDWI 缺少有效样本数"})
-                continue
-            summaries.append({"product_id": product_id, **summary})
-            weighted_water += float(summary.get("water_ratio") or 0) * sample_size
-            weighted_mean += float(summary.get("mean_ndwi") or 0) * sample_size
-            sample_total += sample_size
-            max_ndwi = summary.get("max_ndwi")
-            if max_ndwi is not None:
-                weighted_max = max(float(max_ndwi), weighted_max) if weighted_max is not None else float(max_ndwi)
-        else:
-            failed.append({"product_id": product_id, "reason": summary.get("reason") or "NDWI 不可用"})
-    if sample_total <= 0:
-        return {
-            "available": False,
-            "method": "NDWI=(Green-NIR)/(Green+NIR)",
-            "reason": "多景候选均未能提供可用 NDWI 样本。",
-            "failed_candidates": failed,
-            "limitations": "NDWI 计算失败时仅保留视觉解译结论，不输出水体比例量化。",
-            "polygon_clipped": bool(polygon),
-        }
-    water_ratio = weighted_water / sample_total
-    dates = [getattr(candidate, "acquired_at", None).date().isoformat() for candidate in candidates or [] if getattr(candidate, "acquired_at", None)]
-    return {
-        "available": True,
-        "method": "NDWI=(Green-NIR)/(Green+NIR)",
-        "aggregation": "按每景有效像元数加权汇总",
-        "threshold": threshold,
-        "water_ratio": round(water_ratio, 4),
-        "water_percent": round(water_ratio * 100, 1),
-        "mean_ndwi": round(weighted_mean / sample_total, 4),
-        "max_ndwi": round(weighted_max, 4) if weighted_max is not None else None,
-        "sample_size_px": sample_total,
-        "candidate_count": len(summaries),
-        "acquisition_dates": sorted(set(dates)),
-        "temporal_consistency": "same_date_required_for_change" if len(set(dates)) > 1 else "same_date_or_single_scene",
-        "change_detection_allowed": len(set(dates)) <= 1,
-        "candidate_summaries": summaries,
-        "failed_candidates": failed,
-        "polygon_clipped": bool(polygon),
-        "limitations": (
-            "多景 NDWI 为行政区 polygon 内有效像元加权结果，已按 SCL 排除云、云影、卷云和雪；"
-            "仍不等同于严格辐射一致化月度合成。"
-            if polygon
-            else
-            "多景 NDWI 为 bbox 内有效像元加权结果，已按 SCL 排除云、云影、卷云和雪；"
-            "未做行政边界精确裁剪，仍不等同于严格辐射一致化月度合成。"
-        ),
-    }
+        return _ndwi_error(exc)

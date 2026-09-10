@@ -17,11 +17,7 @@ BLANK_PIXEL_THRESHOLD = 10
 MIN_VALID_PIXEL_RATIO = 0.02
 logger = logging.getLogger(__name__)
 
-
-def request_proxies():
-    """默认遵循当前进程代理；显式设置直连时才绕过代理。"""
-    direct = os.environ.get("SATELLITESENSE_DIRECT_HTTP", "").strip().lower()
-    return {"http": None, "https": None} if direct in {"1", "true", "yes"} else None
+from .http import request_proxies  # noqa: F401  # 唯一实现移入 utils/http.py，此处保留原名供既有 import
 
 _download_progress = {}
 MAX_PROGRESS_ENTRIES = 50
@@ -77,7 +73,7 @@ def _save_jpeg_atomic(img, full_save_path, quality):
             os.remove(tmp_path)
 
 
-def _fetch_tile(url, proxies, retries=3, timeout=30):
+def _fetch_tile(url, proxies, retries=3, timeout=30, headers=None):
     last_err = None
     retries = max(1, int(retries))
     attempts_made = 0
@@ -92,8 +88,12 @@ def _fetch_tile(url, proxies, retries=3, timeout=30):
             retry_strategy = Retry(total=0)
             adapter = HTTPAdapter(max_retries=retry_strategy)
             session.mount("https://", adapter)
-            resp = session.get(url, timeout=timeout, proxies=proxies)
+            resp = session.get(url, timeout=timeout, proxies=proxies, headers=headers)
             if resp.status_code == 200:
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                # 天地图等底图服务出错时可能返回 200 + XML 错误信息,必须先校验内容类型。
+                if "image" not in content_type:
+                    raise Exception(f"tile fetch failed: unexpected content-type {content_type or 'unknown'}")
                 img = Image.open(BytesIO(resp.content))
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
@@ -140,10 +140,13 @@ def _mapbox_static_base_url():
     return os.environ.get("MAPBOX_STATIC_BASE_URL", "https://api.mapbox.com").rstrip("/")
 
 
-def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_name="satellite_result.jpg",
-                          target_resolution=1024, ultra_hd=False, progress_callback=None):
-    global _download_progress
-    token = _mapbox_token()
+def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_name="satellite_result.jpg",
+                          target_resolution=1024, ultra_hd=False, progress_callback=None, basemap_source="mapbox"):
+    global _download_progress
+    basemap_source = (basemap_source or "mapbox").strip().lower()
+    if basemap_source not in ("mapbox", "tianditu", "esri"):
+        raise ValueError(f"不支持的底图影像源: {basemap_source}")
+    token = _mapbox_token() if basemap_source == "mapbox" else ""
     target_resolution = min(MAX_TOTAL, max(1, target_resolution))
 
     lon_diff = max_lon - min_lon
@@ -161,10 +164,18 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
     os.makedirs(save_dir, exist_ok=True)
     full_save_path = os.path.join(save_dir, file_name)
 
-    if not token:
+    if basemap_source == "mapbox" and not token:
         _set_progress(file_name, {"total": 0, "done": 0, "failed": 1, "status": "error", "error": "缺少 MAPBOX_TOKEN"}, progress_callback)
         logger.warning("Mapbox token missing")
         return None
+
+    if basemap_source in ("tianditu", "esri"):
+        return _fetch_web_mercator_image(
+            min_lon, min_lat, max_lon, max_lat,
+            full_save_path=full_save_path, file_name=file_name,
+            total_w=total_w, total_h=total_h,
+            basemap_source=basemap_source, progress_callback=progress_callback,
+        )
 
     proxies = request_proxies()
     retina = "@2x" if ultra_hd else ""
@@ -264,4 +275,127 @@ def fetch_satellite_image(min_lon, min_lat, max_lon, max_lat, save_dir, file_nam
 
     _update_progress(file_name, {"status": "partial" if failed_tiles else "done", "failed": failed_tiles}, progress_callback)
     logger.info("Mapbox stitched image saved: %sx%s -> %s", total_w, total_h, full_save_path)
+    return full_save_path
+
+
+TILE_SIZE = 256
+MERCATOR_MAX_LAT = 85.05112878
+
+
+def _tianditu_key():
+    key = os.environ.get("TIANDITU_KEY", "")
+    if not key:
+        raise ValueError("缺少 TIANDITU_KEY：请先在 .env 中配置天地图服务密钥(tk)后重试")
+    return key
+
+
+def _web_mercator_tile_url(basemap_source, z, x, y, seq=0):
+    if basemap_source == "tianditu":
+        return f"https://t{seq % 8}.tianditu.gov.cn/DataServer?T=img_w&x={x}&y={y}&l={z}&tk={_tianditu_key()}"
+    if basemap_source == "esri":
+        return f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+    raise ValueError(f"不支持的底图影像源: {basemap_source}")
+
+
+def _web_mercator_headers(basemap_source):
+    if basemap_source == "esri":
+        return {"Referer": "https://www.arcgis.com/", "User-Agent": "SatelliteSense/1.0"}
+    return None
+
+
+def _lonlat_to_global_px(lon, lat, z):
+    lat = max(-MERCATOR_MAX_LAT, min(MERCATOR_MAX_LAT, lat))
+    scale = TILE_SIZE * (2 ** z)
+    x = (lon + 180.0) / 360.0 * scale
+    siny = math.sin(math.radians(lat))
+    y = (0.5 - math.log((1 + siny) / (1 - siny)) / (4 * math.pi)) * scale
+    return x, y
+
+
+def _fetch_web_mercator_image(min_lon, min_lat, max_lon, max_lat, full_save_path, file_name,
+                              total_w, total_h, basemap_source, progress_callback=None):
+    """天地图/Esri 的 z/x/y 瓦片拼接路径;缩放层级语义与 Mapbox 一致(web mercator z)。"""
+    proxies = request_proxies()
+    headers = _web_mercator_headers(basemap_source)
+
+    z = 1
+    for cand in range(1, 20):
+        x0, y1 = _lonlat_to_global_px(min_lon, min_lat, cand)
+        x1, y0 = _lonlat_to_global_px(max_lon, max_lat, cand)
+        tiles = math.ceil(max(1.0, x1 - x0) / TILE_SIZE) * math.ceil(max(1.0, y1 - y0) / TILE_SIZE)
+        z = cand
+        if (x1 - x0) >= total_w and (y1 - y0) >= total_h:
+            break
+        if tiles > 64:
+            break
+
+    x0, y1 = _lonlat_to_global_px(min_lon, min_lat, z)
+    x1, y0 = _lonlat_to_global_px(max_lon, max_lat, z)
+    tx0, tx1 = int(math.floor(x0 / TILE_SIZE)), int(math.floor((x1 - 1e-9) / TILE_SIZE))
+    ty0, ty1 = int(math.floor(y0 / TILE_SIZE)), int(math.floor((y1 - 1e-9) / TILE_SIZE))
+    cols, rows = tx1 - tx0 + 1, ty1 - ty0 + 1
+    total_tiles = cols * rows
+
+    _set_progress(file_name, {"total": total_tiles, "done": 0, "failed": 0, "status": "downloading"}, progress_callback)
+    progress_lock = threading.Lock()
+    canvas = Image.new("RGB", (cols * TILE_SIZE, rows * TILE_SIZE))
+    failed_tiles = 0
+
+    def _fetch_one(tx, ty):
+        nonlocal failed_tiles
+        url = _web_mercator_tile_url(basemap_source, z, tx, ty, seq=tx + ty)
+        failed = False
+        try:
+            tile = _fetch_tile(
+                url,
+                proxies,
+                headers=headers,
+                retries=max(1, int(os.environ.get("MAPBOX_TILE_RETRIES", "3"))),
+                timeout=max(1, int(os.environ.get("MAPBOX_TILE_TIMEOUT", "30"))),
+            )
+            if tile.size != (TILE_SIZE, TILE_SIZE):
+                tile = tile.resize((TILE_SIZE, TILE_SIZE), Image.LANCZOS)
+            logger.info("%s tile z%s x%s y%s OK", basemap_source, z, tx, ty)
+        except Exception as e:
+            logger.warning("%s tile z%s x%s y%s failed: %s", basemap_source, z, tx, ty, e)
+            failed = True
+            tile = Image.new("RGB", (TILE_SIZE, TILE_SIZE), (40, 40, 40))
+        with progress_lock:
+            if failed:
+                failed_tiles += 1
+            info = _download_progress[file_name]
+            _update_progress(
+                file_name,
+                {"done": info.get("done", 0) + 1, "failed": failed_tiles},
+                progress_callback,
+            )
+        return ((tx - tx0) * TILE_SIZE, (ty - ty0) * TILE_SIZE, tile)
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_fetch_one, tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
+        for fut in as_completed(futures):
+            px, py, tile = fut.result()
+            canvas.paste(tile, (px, py))
+
+    if failed_tiles == total_tiles:
+        _update_progress(file_name, {"status": "error", "failed": failed_tiles}, progress_callback)
+        logger.warning("%s all tiles failed for %s", basemap_source, file_name)
+        return None
+
+    crop = (int(round(x0 - tx0 * TILE_SIZE)), int(round(y0 - ty0 * TILE_SIZE)),
+            int(round(x1 - tx0 * TILE_SIZE)), int(round(y1 - ty0 * TILE_SIZE)))
+    canvas = canvas.crop((crop[0], crop[1], max(crop[0] + 1, crop[2]), max(crop[1] + 1, crop[3])))
+    if canvas.size != (total_w, total_h):
+        canvas = canvas.resize((total_w, total_h), Image.LANCZOS)
+
+    try:
+        _ensure_not_blank(canvas, f"{basemap_source} stitched image")
+        _save_jpeg_atomic(canvas, full_save_path, quality=92)
+    except Exception as e:
+        _update_progress(file_name, {"status": "error", "failed": failed_tiles, "error": str(e)[:200]}, progress_callback)
+        logger.warning("%s stitched image validation failed for %s: %s", basemap_source, file_name, e)
+        return None
+
+    _update_progress(file_name, {"status": "partial" if failed_tiles else "done", "failed": failed_tiles}, progress_callback)
+    logger.info("%s stitched image saved: %sx%s -> %s", basemap_source, total_w, total_h, full_save_path)
     return full_save_path

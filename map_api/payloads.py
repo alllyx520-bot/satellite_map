@@ -62,10 +62,16 @@ def imagery_quality_payload(scene):
     fetched_days = _days_since(scene.fetched_at)
     gsd = scene.gsd_m or 0
     scene_metadata = getattr(scene, "metadata", None) or {}
+    try:
+        from .data_contract import build_scene_contract
+        data_contract = build_scene_contract(scene, polygon=scene_metadata.get("district_polygon"))
+    except Exception:
+        data_contract = None
     preview_gsd = scene_metadata.get("preview_scale_m") or scene_metadata.get("rendered_gsd_m")
     original_gsd = scene_metadata.get("source_asset_gsd_m") or gsd
     cloud_label = _cloud_label(scene.cloud_percent)
     grade_label = _grade_label(scene.decision_grade)
+    timeliness_override = None
     cautions = []
 
     if source == "sentinel2":
@@ -81,8 +87,29 @@ def imagery_quality_payload(scene):
             cautions.append("缺少明确拍摄时间，不能说明时效性。")
         elif acquired_days > 30:
             cautions.append("拍摄时间超过30天，近期态势判断需谨慎。")
-    elif source == "mapbox":
-        summary = "Mapbox 高清底图，视觉细节较强，但时相和原始产品信息不可追溯。"
+    elif source == "sentinel1":
+        summary = "Sentinel-1 GRD SAR 后向散射影像，全天候可获取，不受云影响。"
+        best_for = "适合水体/洪涝淹没范围、宏观地物和地表变化线索筛查。"
+        spatial_note = f"原始 GSD 约 {float(original_gsd):g} m/像素。" if original_gsd else "约 10m 级 SAR 影像。"
+        cloud_label = "不受云影响（SAR）"
+        cautions.extend([
+            "SAR 非光学影像，存在斑点噪声与几何畸变，视觉解译可靠性低于光学影像。",
+            "结论限于水体/淹没与宏观地物，不支持光谱指数与细节判读。",
+        ])
+    elif source == "copdem":
+        summary = "Copernicus DEM GLO-30 静态数字高程模型（采集基线 2011-2015）。"
+        best_for = "适合地形、坡度、地势分析和水文背景判断。"
+        spatial_note = "原生分辨率约 30 m/像素。"
+        cloud_label = "不适用（静态 DEM）"
+        acquired_days = None
+        timeliness_override = "静态 DEM（采集基线 2011-2015）"
+        cautions.extend([
+            "静态 DEM，不代表拍摄时相的地表状态，不能用于变化监测。",
+            "不支持光谱指数、云量与时相类质量判断。",
+        ])
+    elif source in ("mapbox", "tianditu", "esri"):
+        basemap_name = {"mapbox": "Mapbox 高清底图", "tianditu": "天地图影像高清底图", "esri": "Esri World Imagery 高清底图"}[source]
+        summary = f"{basemap_name}，视觉细节较强，但时相和原始产品信息不可追溯。"
         best_for = "适合建筑形态、道路结构、空间格局和地物纹理的视觉解译。"
         spatial_note = (
             f"渲染约 {gsd:g} m/像素；该数值用于当前截图尺度估算，不等同于原始传感器 GSD。"
@@ -105,13 +132,17 @@ def imagery_quality_payload(scene):
         "spatial_resolution": spatial_note,
         "original_gsd_m": original_gsd or None,
         "preview_scale_m": preview_gsd,
-        "timeliness": _timeliness_label(acquired_days),
+        "timeliness": timeliness_override or _timeliness_label(acquired_days),
         "acquired_days_ago": acquired_days,
         "fetched_days_ago": fetched_days,
         "cloud_quality": cloud_label,
         "decision_grade": scene.decision_grade,
         "decision_grade_label": grade_label,
         "cautions": cautions,
+        "data_contract": data_contract,
+        "quality": (data_contract or {}).get("quality", {}),
+        "spatial": (data_contract or {}).get("spatial", {}),
+        "limitations": (data_contract or {}).get("limitations", []),
     }
 
 
@@ -129,7 +160,7 @@ def analysis_confidence_payload(strategy=None, imagery_quality=None):
     basis = []
     required_checks = []
 
-    if source == "mapbox":
+    if source in ("mapbox", "tianditu", "esri"):
         level = "reference"
         label = "视觉参考级"
         basis.extend([
@@ -137,6 +168,19 @@ def analysis_confidence_payload(strategy=None, imagery_quality=None):
             "拍摄时间、云量和原始产品号不可追溯",
         ])
         required_checks.append("涉及时效性或行政决策时，需使用可追溯公开影像或现场资料复核")
+    elif source == "sentinel1":
+        level = "screening"
+        label = "筛查级"
+        basis.extend([
+            "Sentinel-1 SAR 全天候影像，不受云影响，可追溯拍摄时间",
+            "SAR 非光学影像，VL 解译可靠性低，结论限于水体/淹没与宏观地物",
+        ])
+        required_checks.append("洪水/淹没范围等重要结论建议结合光学影像或现场资料复核")
+    elif source == "copdem":
+        level = "reference"
+        label = "参考级"
+        basis.append("Copernicus DEM 为静态地形数据（采集基线 2011-2015），不代表拍摄时相地表状态")
+        required_checks.append("涉及时相变化或地表现状的结论需改用可追溯时相影像")
     elif source == "sentinel2":
         basis.append(f"Sentinel-2 L2A 可追溯公开影像，{cloud}")
         if acquired_days is not None:
@@ -203,8 +247,18 @@ def source_recommendation_payload(strategy=None, imagery_quality=None, question=
     time_keywords = ("近期", "最新", "现在", "当前", "变化", "变迁", "新增", "扩张", "退化", "灾情", "汛情")
     needs_timeliness = any(word in question_text for word in time_keywords)
     sentinel_macro_tasks = {"land_use", "water", "vegetation", "agriculture", "terrain_hazard"}
+    flood_hit = task_key == "flood" or any(word in question_text for word in ("洪水", "洪涝", "淹没", "内涝", "汛情"))
+    terrain_hit = task_key == "terrain" or any(word in question_text for word in ("地形", "坡度", "高程", "山地", "地势"))
 
-    if is_detail or entities & {"building", "road", "infrastructure", "vehicle"}:
+    if flood_hit:
+        recommended_source = "sentinel1"
+        label = "建议使用 Sentinel-1 SAR 影像"
+        reason = "问题涉及洪水/淹没/汛情，Sentinel-1 SAR 全天候可获取、对水体敏感，不受云雨影响。"
+    elif terrain_hit:
+        recommended_source = "copdem"
+        label = "建议使用 Copernicus DEM 高程数据"
+        reason = "问题涉及地形/坡度/高程，静态 DEM 更适合地势分析；注意其不代表拍摄时相地表状态。"
+    elif is_detail or entities & {"building", "road", "infrastructure", "vehicle"}:
         recommended_source = "mapbox"
         label = "建议使用高清底图"
         reason = "问题包含建筑、道路、设施或计数等细节判读需求，需要更高视觉细节。"
@@ -213,7 +267,7 @@ def source_recommendation_payload(strategy=None, imagery_quality=None, question=
         label = "建议使用近期公开影像"
         reason = "问题偏宏观地类、水体、生态农业、地形灾害或变化筛查，Sentinel-2 的拍摄时间和云量更可追溯。"
     else:
-        recommended_source = source if source in ("mapbox", "sentinel2") else "mapbox"
+        recommended_source = source if source in ("mapbox", "tianditu", "esri", "sentinel2", "sentinel1", "copdem") else "mapbox"
         label = "当前图像源可用于初步分析"
         reason = "问题未表现出强时效或强细节偏好，可先按当前图像源进行初步判读。"
 
@@ -226,7 +280,11 @@ def source_recommendation_payload(strategy=None, imagery_quality=None, question=
     elif recommended_source == "sentinel2":
         action = "建议切换到“近期公开影像”获取可追溯时相后再分析。"
     elif recommended_source == "mapbox":
-        action = "建议切换到“高清底图”观察细节后再分析。"
+        action = "建议切换到“高清底图”（mapbox/天地图/Esri）观察细节后再分析。"
+    elif recommended_source == "sentinel1":
+        action = "建议切换到 Sentinel-1 SAR 影像，全天候获取水体/淹没线索。"
+    elif recommended_source == "copdem":
+        action = "建议切换到 Copernicus DEM 高程数据进行地形分析。"
     else:
         action = "建议先补充图像源信息。"
 
@@ -347,8 +405,14 @@ def scene_payload(scene):
 def imagery_context_text(scene):
     if not scene:
         return ""
+    source_key = _scene_source_key(scene)
     acquired = scene.acquired_at.strftime("%Y-%m-%d %H:%M") if scene.acquired_at else "未知"
     cloud = f"{scene.cloud_percent}%" if scene.cloud_percent is not None else "未知"
+    if source_key == "sentinel1":
+        cloud = "不受云影响（SAR）"
+    elif source_key == "copdem":
+        cloud = "不适用（静态 DEM）"
+        acquired = "静态 DEM（采集基线 2011-2015）"
     scene_metadata = getattr(scene, "metadata", None) or {}
     quality = imagery_quality_payload(scene) or {}
     quality_lines = ""
