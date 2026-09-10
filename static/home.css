@@ -22,6 +22,37 @@
   padding: 0 32px;
 }
 
+/* ------------------------------------------------- 电影级光层（球体与文案之间）
+   压暗幕：hero 文案压在明亮球面上时的稳定暗底，右侧球体光泽完整保留
+   体积光：与地球着色器 sunDir 同侧（左上）的暖金泛光 + 斜向光柱 */
+.hero-scrim,
+.solar-bloom {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+.hero-scrim {
+  z-index: 2;
+  background:
+    linear-gradient(90deg,
+      rgba(7, 9, 14, .94) 0%,
+      rgba(7, 9, 14, .87) 20%,
+      rgba(7, 9, 14, .64) 42%,
+      rgba(7, 9, 14, .35) 60%,
+      rgba(7, 9, 14, .11) 76%,
+      transparent 88%),
+    radial-gradient(76% 66% at 8% 54%, rgba(7, 9, 14, .74), transparent 74%);
+}
+
+.solar-bloom {
+  z-index: 3;
+  mix-blend-mode: screen;
+  background:
+    radial-gradient(40% 32% at 15% 11%, rgba(255, 216, 156, .17), rgba(228, 179, 106, .06) 46%, transparent 73%),
+    linear-gradient(122deg, rgba(255, 224, 174, .10) 0%, transparent 27%, transparent 73%, rgba(228, 179, 106, .05) 100%);
+}
+
 /* ---------------------------------------------------------------- 导航 */
 .nav {
   position: fixed;
@@ -131,6 +162,9 @@
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
+  /* text-shadow 是继承属性：h1 的强投影会盖在 background-clip:text 绘制的金色渐变之上、
+     把渐变压浊，故此处显式还原为原本的轻投影，保住渐变的通透金。 */
+  text-shadow: 0 0 60px rgba(228, 179, 106, .14), 0 2px 30px rgba(7, 9, 14, .6);
 }
 
 .slogan {
@@ -440,4 +474,106 @@ a.btn-portal {
   }
   .a-step { min-width: 0; }
   .a-step::before { display: none; }
+}
+
+/* ==========================================================================
+   极致精修层（2026-09）：光影 / 材质 / 动画 微调，不改结构
+   ========================================================================== */
+
+/* Hero 文字压过亮地球：提高自身不透明度 + 深空投影，任何球面亮度下都可读 */
+.kicker {
+  color: rgba(242, 238, 230, .78);
+}
+
+.slogan {
+  color: rgba(242, 238, 230, .93);
+}
+
+.kicker,
+.slogan {
+  text-shadow: 0 1px 18px rgba(7, 9, 14, .95), 0 0 8px rgba(7, 9, 14, .85);
+}
+
+/* hero 上的 chip 加压暗玻璃底：波段色仍由文字与描边承担，亮球面下不再糊 */
+.hero-meta .chip {
+  background-color: rgba(9, 11, 18, .58);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .07), 0 6px 18px -10px rgba(0, 0, 0, .8);
+}
+
+/* 章节描述：球体会在背后移动，提高自身不透明度保证稳定可读 */
+.ch-title,
+.ch-desc {
+  text-shadow: 0 1px 14px rgba(7, 9, 14, .8), 0 0 6px rgba(7, 9, 14, .6);
+}
+
+.ch-desc {
+  color: rgba(242, 238, 230, .8);
+}
+
+/* 章节玻璃加压：背景球体移动/明暗变化时，卡片内容始终有稳定暗底 */
+.feat-card,
+.metric,
+.agent-strip {
+  background-color: rgba(10, 12, 19, .74);
+  backdrop-filter: blur(30px) saturate(150%);
+  -webkit-backdrop-filter: blur(30px) saturate(150%);
+}
+
+.hero h1 {
+  text-shadow:
+    0 2px 18px rgba(7, 9, 14, .95),
+    0 6px 46px rgba(7, 9, 14, .9),
+    0 0 90px rgba(228, 179, 106, .16);
+}
+
+/* 能力卡片：hover 时一道斜切扫光掠过玻璃面 */
+.feat-card { overflow: hidden; }
+
+.feat-card::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -60%;
+  width: 45%;
+  z-index: 1;
+  background: linear-gradient(100deg, transparent, rgba(242, 238, 230, .07), transparent);
+  transform: skewX(-12deg);
+  pointer-events: none;
+}
+
+.feat-card:hover::after {
+  left: 125%;
+  transition: left .9s var(--ease-orbital);
+}
+
+/* Agent 流程条：连接线光脉冲顺序流动，节点呼吸辉光同步级联 */
+.a-step::before {
+  background: linear-gradient(90deg, rgba(228, 179, 106, .1), rgba(228, 179, 106, .5), rgba(228, 179, 106, .1));
+  background-size: 200% 100%;
+  animation: flow-line 3.2s linear infinite;
+}
+
+.a-dot { animation: dot-glow 3.2s ease-in-out infinite; }
+
+.a-step:nth-child(2)::before, .a-step:nth-child(2) .a-dot { animation-delay: .45s; }
+.a-step:nth-child(3)::before, .a-step:nth-child(3) .a-dot { animation-delay: .9s; }
+.a-step:nth-child(4)::before, .a-step:nth-child(4) .a-dot { animation-delay: 1.35s; }
+.a-step:nth-child(5)::before, .a-step:nth-child(5) .a-dot { animation-delay: 1.8s; }
+.a-step:nth-child(6)::before, .a-step:nth-child(6) .a-dot { animation-delay: 2.25s; }
+
+@keyframes flow-line {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+
+@keyframes dot-glow {
+  50% { box-shadow: 0 0 14px rgba(228, 179, 106, .4); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feat-card:hover::after { transition: none; }
+  .a-step::before, .a-dot { animation: none; }
 }

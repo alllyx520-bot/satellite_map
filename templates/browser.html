@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SatelliteSense · 遥感分析</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23E4B36A' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23E4B36A'/%3E%3C/svg%3E">
     <link rel="preconnect" href="https://unpkg.com" crossorigin>
     <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -19,9 +20,10 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/400.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/500.css">
     <link rel="stylesheet" href="/static/spectra.css?v=4">
-    <link rel="stylesheet" href="/static/browser.css?v=30">
+    <link rel="stylesheet" href="/static/browser.css?v=34">
 </head>
-<body>
+<body data-run-engine="{% if legacy_agent %}legacy{% else %}dag{% endif %}">
+    <div hidden>{% csrf_token %}</div>
     <div class="main-wrapper">
         <div id="map-container">
             <div id="map"></div>
@@ -49,7 +51,11 @@
                         <span id="imagery-source-label">分析影像</span>
                         <select id="imagery-source-toggle" class="custom-select" title="AI 分析实际使用的图像源，不等于地图显示样式">
                             <option value="mapbox" selected>高清底图 · 细节</option>
+                            <option value="tianditu">高清底图 · 天地图</option>
+                            <option value="esri">高清底图 · Esri</option>
                             <option value="sentinel2">近期影像 · 时效</option>
+                            <option value="sentinel1">雷达 · 全天候</option>
+                            <option value="copdem">地形 · DEM</option>
                         </select>
                     </div>
                     <div class="toolbar-control">
@@ -57,10 +63,11 @@
                         <select id="map-style-toggle" class="custom-select" title="只改变地图背景显示，不影响 AI 分析影像源">
                             <option value="normal">街道显示</option>
                             <option value="satellite" selected>卫星显示</option>
+                            <option value="gibs" title="NASA 每日 250m 宏观影像，仅态势参考">每日动态 · NASA</option>
                         </select>
                     </div>
                 </div>
-                <div class="mission-status"><span>链路正常</span></div>
+                <div class="mission-status"><i class="status-dot" aria-hidden="true"></i><span>链路正常</span></div>
             </header>
             <aside id="agent-console" class="glass">
                 <div class="agent-sidebar-resizer" id="agent-sidebar-resizer" aria-hidden="true"></div>
@@ -79,17 +86,47 @@
                 </div>
                 <div id="agent-session-panel" hidden></div>
                 <div class="agent-empty" id="agent-empty">
-                    <i class="ri-compass-discover-line" aria-hidden="true"></i>
-                    <p>用一句自然语言目标，启动一次受控的遥感调查。</p>
+                    <div class="agent-standby">
+                        <span class="agent-empty-radar" aria-hidden="true"><i class="ri-compass-discover-line"></i></span>
+                        <div class="agent-standby-text">
+                            <b>待机中</b>
+                            <p>用一句自然语言目标，启动一次受控的遥感调查。</p>
+                        </div>
+                    </div>
+
+                    <div class="agent-block">
+                        <div class="agent-block-head">调查流程</div>
+                        <ol class="agent-flow">
+                            <li><span class="n mono">01</span><span>解析目标与时间</span></li>
+                            <li><span class="n mono">02</span><span>定位行政区域</span></li>
+                            <li><span class="n mono">03</span><span>选择影像源</span></li>
+                            <li><span class="n mono">04</span><span>获取影像并质检</span></li>
+                            <li><span class="n mono">05</span><span>指标计算与视觉解译</span></li>
+                            <li><span class="n mono">06</span><span>复核结论</span></li>
+                        </ol>
+                    </div>
+
+                    <div class="agent-block">
+                        <div class="agent-block-head">试试这些</div>
+                        <div class="agent-examples">
+                            <button type="button" class="agent-example" data-goal="调查南宁市在2026年四月的水体情况"><i class="ri-water-flash-line" aria-hidden="true"></i>调查南宁市 2026 年四月的水体情况</button>
+                            <button type="button" class="agent-example" data-goal="分析南宁市近三个月植被覆盖变化"><i class="ri-plant-line" aria-hidden="true"></i>分析南宁市近三个月植被覆盖变化</button>
+                            <button type="button" class="agent-example" data-goal="调查南宁市建成区扩张与用地结构"><i class="ri-building-2-line" aria-hidden="true"></i>调查南宁市建成区扩张与用地结构</button>
+                        </div>
+                    </div>
                 </div>
             </aside>
             <div class="wb-bottom">
-                <button id="backButton"><i class="ri-arrow-left-line" aria-hidden="true"></i>返回全国</button>
-                <div id="map-hint">长按拖拽框选区域 · 右键取消</div>
+                <div class="wb-bottom-transient">
+                    <button id="backButton"><i class="ri-arrow-left-line" aria-hidden="true"></i>返回全国</button>
+                    <div id="map-hint">长按拖拽框选区域 · 右键取消</div>
+                </div>
                 <div class="map-scale-card glass">
-                    <span>缩放 <b id="map-zoom-readout" class="mono">4</b></span>
+                    <span class="ro"><span class="ro-k">缩放</span><b id="map-zoom-readout" class="mono">4</b></span>
                     <i class="dot" aria-hidden="true"></i>
-                    <span>分辨率 <b id="map-gsd-readout" class="mono">—</b></span>
+                    <span class="ro"><span class="ro-k">分辨率</span><b id="map-gsd-readout" class="mono">—</b></span>
+                    <i class="dot" aria-hidden="true"></i>
+                    <span class="ro"><span class="ro-k">光标</span><b id="map-cursor-readout" class="mono">—</b></span>
                     <i class="dot" aria-hidden="true"></i>
                     <span class="ok">任务画布就绪</span>
                 </div>
@@ -149,7 +186,9 @@
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     
-    <script src="/static/browser.js?v=30"></script>
+    <script src="/static/agent-events.js?v=1"></script>
+    <script src="/static/map-run.js?v=1"></script>
+    <script src="/static/browser.js?v=34"></script>
     <script src="/static/workbench-ui.js?v=2"></script>
 <div id="chat-modal" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="chat-modal-title">
         <div class="chat-modal-content glass glass-thick">

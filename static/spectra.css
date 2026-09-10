@@ -79,7 +79,14 @@
 /* 基底 */
 *, *::before, *::after { box-sizing: border-box; }
 
-html { color-scheme: dark; }
+html {
+  color-scheme: dark;
+  /* 阻断滚动链/下拉刷新，地图类页面体验更稳 */
+  overscroll-behavior-y: none;
+  /* Firefox 滚动条：与下方 webkit 细轨对齐 */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .14) transparent;
+}
 
 body {
   margin: 0;
@@ -94,19 +101,22 @@ body {
 
 ::selection { background: rgba(228, 179, 106, .3); color: #FFF8EA; }
 
+/* 不覆写 border-radius：现代浏览器 outline 自动贴合元素自身圆角，
+   原先固定 4px 会把 .btn 等胶囊控件在聚焦时切成方角 */
 :focus-visible {
   outline: 2px solid rgba(228, 179, 106, .55);
   outline-offset: 2px;
-  border-radius: 4px;
 }
 
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-corner { background: transparent; }
 ::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, .12);
   border: 2px solid transparent;
   border-radius: 99px;
   background-clip: content-box;
+  min-height: 32px;
 }
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(228, 179, 106, .4);
@@ -550,6 +560,29 @@ body {
   transition: transform var(--dur-micro);
 }
 
+/* Firefox 对齐 webkit 的轨道与旋钮 */
+.slider::-moz-range-track {
+  height: 3px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, .12);
+}
+
+.slider::-moz-range-progress {
+  height: 3px;
+  border-radius: 99px;
+  background: var(--gold);
+}
+
+.slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #FBF3E2;
+  border: 2px solid var(--gold);
+  box-shadow: 0 0 12px rgba(228, 179, 106, .6);
+  transition: transform var(--dur-micro);
+}
+
 .slider::-webkit-slider-thumb:hover { transform: scale(1.2); }
 
 /* --------------------------------------------------------------------------
@@ -682,6 +715,9 @@ body {
    动效纪律：尊重减弱动态偏好
    -------------------------------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
+  /* home.css 在 html 上启用了 smooth，降级时必须复位 */
+  html { scroll-behavior: auto !important; }
+
   *, *::before, *::after {
     animation-duration: .01ms !important;
     animation-iteration-count: 1 !important;

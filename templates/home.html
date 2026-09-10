@@ -20,13 +20,15 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5/500.css">
     <link rel="stylesheet" href="/static/remixicon.css?v=1">
     <link rel="stylesheet" href="/static/spectra.css?v=4">
-    <link rel="stylesheet" href="/static/home.css?v=6">
+    <link rel="stylesheet" href="/static/home.css?v=9">
 </head>
 <body>
     <div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
     <canvas id="earth-canvas" aria-hidden="true"></canvas>
     <div class="vignette" aria-hidden="true"></div>
     <div class="grain" aria-hidden="true"></div>
+    <div class="hero-scrim" aria-hidden="true"></div>
+    <div class="solar-bloom" aria-hidden="true"></div>
 
     <nav class="nav glass glass-thin">
         <a class="mark" href="/">
@@ -47,8 +49,8 @@
             <h1 data-reveal data-delay="0.1">Satellite<span class="accent">Sense</span></h1>
             <p class="slogan" data-reveal data-delay="0.2">以卫星视角，看见地表变化背后的答案。</p>
             <div class="hero-meta" data-reveal data-delay="0.3">
-                <span class="chip chip-gold">MAPBOX 高清底图</span>
-                <span class="chip chip-glacier">SENTINEL-2 溯源影像</span>
+                <span class="chip chip-gold">MAPBOX · 天地图 · ESRI 高清底图</span>
+                <span class="chip chip-glacier">SENTINEL-2/1 光学+雷达</span>
                 <span class="chip chip-iris">QWEN VL 视觉解译</span>
             </div>
             <div class="hero-actions" data-reveal data-delay="0.42">
@@ -67,13 +69,13 @@
             <section class="chapter" data-reveal>
                 <div class="ch-head">
                     <span class="ch-idx mono">01</span>
-                    <h2 class="ch-title">双源影像，各就其位</h2>
-                    <p class="ch-desc">细节判读用 Mapbox 高清底图，时效与溯源用 Sentinel-2 L2A 公开影像。系统按任务自动选择、验证并解释来源，你不需要成为影像专家。</p>
+                    <h2 class="ch-title">多源影像，各就其位</h2>
+                    <p class="ch-desc">细节判读用 Mapbox/天地图/Esri 高清底图，时效与溯源用 Sentinel-2 公开影像，阴雨夜间有 Sentinel-1 雷达兜底，每日宏观态势看 NASA GIBS。系统按任务自动选择、验证并解释来源，你不需要成为影像专家。</p>
                 </div>
                 <div class="card-row">
                     <div class="feat-card glass">
                         <div class="feat-top">
-                            <span class="chip chip-gold">MAPBOX</span>
+                            <span class="chip chip-gold">MAPBOX · 天地图 · ESRI</span>
                             <span class="feat-no mono">≤0.5 m/px</span>
                         </div>
                         <h3>高清底图 · 细节判读</h3>
@@ -88,6 +90,24 @@
                         <h3>近期影像 · 可溯源</h3>
                         <p>采集日期、云量、产品编号全程可查，适合水体、植被、农业与时序变化筛查。</p>
                         <div class="feat-spec mono">EARTH SEARCH · TITILER · MOSAIC QC</div>
+                    </div>
+                    <div class="feat-card glass">
+                        <div class="feat-top">
+                            <span class="chip chip-iris">SENTINEL-1 GRD</span>
+                            <span class="feat-no mono">10 m/px</span>
+                        </div>
+                        <h3>雷达影像 · 全天候</h3>
+                        <p>穿云透雨、昼夜成像，洪水淹没与多云季节筛查的兜底影像源。</p>
+                        <div class="feat-spec mono">SAR · EARTH SEARCH · CLOUD-FREE</div>
+                    </div>
+                    <div class="feat-card glass">
+                        <div class="feat-top">
+                            <span class="chip chip-glacier">NASA GIBS · DEM</span>
+                            <span class="feat-no mono">250 m/px</span>
+                        </div>
+                        <h3>每日动态 · 宏观态势</h3>
+                        <p>NASA 每日全球真彩底图把握大尺度变化，Copernicus DEM 提供地形背景。</p>
+                        <div class="feat-spec mono">DAILY BASEMAP · TERRAIN</div>
                     </div>
                 </div>
             </section>
@@ -153,7 +173,7 @@
 
         <footer class="hero-footer" aria-hidden="true">
             <span class="meta-item mono">22.82°N&#8194;108.37°E · NANNING DEMO REGION</span>
-            <span class="meta-item meta-status mono"><span class="pulse-dot"></span>SENTINEL-2 / MAPBOX · LINK ACTIVE</span>
+            <span class="meta-item meta-status mono"><span class="pulse-dot"></span>SENTINEL-2/1 · 多源 · LINK ACTIVE</span>
             <span class="meta-item mono" id="meta-clock"></span>
         </footer>
     </main>

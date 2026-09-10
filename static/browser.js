@@ -24,6 +24,33 @@ document.addEventListener('DOMContentLoaded', () => {
         attribution: '&copy; 高德地图(卫星)'
     });
 
+    // GIBS 每日产品有日级延迟，取 UTC 昨天
+    function gibsDefaultDate() {
+        return new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    }
+    const gibsUrl = (date) => `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/${date}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`;
+    let gibsDate = gibsDefaultDate();
+    const gibsMap = L.tileLayer(gibsUrl(gibsDate), {
+        maxZoom: MAP_MAX_ZOOM,
+        maxNativeZoom: 9,
+        errorTileUrl: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+        attribution: '&copy; NASA GIBS'
+    });
+    // 昨日产品偶尔尚未发布（404），整体回退到再前一天
+    gibsMap.on('tileerror', () => {
+        if (gibsDate === gibsDefaultDate()) {
+            gibsDate = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+            gibsMap.setUrl(gibsUrl(gibsDate));
+        }
+    });
+
+    // 当前底图坐标系：高德底图为 GCJ-02，GIBS 为 WGS84（框选换算据此分支）
+    let activeBasemap = 'satellite';
+    let gibsHidProvince = false;
+    function isGcjBasemap() {
+        return activeBasemap !== 'gibs';
+    }
+
     const INITIAL_VIEW = { center: [36.0, 105.0], zoom: 4 };
     const map = L.map('map', {
         minZoom: 3, maxZoom: MAP_MAX_ZOOM,
@@ -95,11 +122,13 @@ document.addEventListener('DOMContentLoaded', () => {
             { lng: nw.lng, lat: nw.lat },
             { lng: se.lng, lat: se.lat }
         ]);
+        if (!isGcjBasemap()) return { mapBbox, dataBbox: mapBbox };
         const dataBbox = bboxFromPoints(bboxCorners(mapBbox).map(p => gcj02ToWgs84(p.lng, p.lat)));
         return { mapBbox, dataBbox };
     }
 
     function dataBboxToMapBounds(bbox) {
+        if (!isGcjBasemap()) return [[bbox.min_lat, bbox.min_lng], [bbox.max_lat, bbox.max_lng]];
         const mapBbox = bboxFromPoints(bboxCorners(bbox).map(p => wgs84ToGcj02(p.lng, p.lat)));
         return [[mapBbox.min_lat, mapBbox.min_lng], [mapBbox.max_lat, mapBbox.max_lng]];
     }
@@ -136,7 +165,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const workspaceResizer = document.getElementById('workspace-sidebar-resizer');
     const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
     // 窄屏下左右两栏(各最大 340px 叠层)物理上无法并存,触发手风琴/默认收起,避免重叠。桌面布局不受影响。
-    const narrowLayout = () => window.innerWidth <= 960;  // 与 CSS 响应式断点(max-width: 960px)一致
+    // innerWidth 为 0 时(初始化或渲染器未合成)不能判为窄屏,否则会把窄屏默认永久写进 localStorage。
+    const narrowLayout = () => {
+        const w = window.innerWidth;
+        return Number.isFinite(w) && w > 0 && w <= 960;  // 与 CSS 响应式断点(max-width: 960px)一致
+    };
+    // 1280–1440 这类紧凑桌面：两侧面板默认收窄，保证地图(主内容)仍占足够宽度
+    const compactDesktop = () => {
+        const w = window.innerWidth;
+        return Number.isFinite(w) && w > 960 && w <= 1440;
+    };
 
     function readWorkbenchLayout() {
         try {
@@ -157,11 +195,11 @@ document.addEventListener('DOMContentLoaded', () => {
         let agentCollapsed = Boolean(layout.agentCollapsed);
         let workspaceCollapsed = Boolean(layout.workspaceCollapsed);
         if (narrowLayout() && !agentCollapsed && !workspaceCollapsed) {
+            // 响应式默认：本次会话收起即可，不落盘——否则一次窄屏会永久收掉桌面端右栏
             workspaceCollapsed = true;
-            saveWorkbenchLayout({ workspaceCollapsed: true });
         }
-        const agentWidth = clamp(Number(layout.agentWidth) || 360, 300, 560);
-        const workspaceWidth = clamp(Number(layout.workspaceWidth) || 388, 320, 560);
+        const agentWidth = clamp(Number(layout.agentWidth) || (compactDesktop() ? 330 : 360), 300, 560);
+        const workspaceWidth = clamp(Number(layout.workspaceWidth) || (compactDesktop() ? 348 : 388), 320, 560);
         document.documentElement.style.setProperty('--agent-sidebar-width', `${agentWidth}px`);
         document.documentElement.style.setProperty('--workspace-sidebar-width', `${workspaceWidth}px`);
         document.body.classList.toggle('agent-collapsed', agentCollapsed);
@@ -298,6 +336,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 const text = document.createElement('span');
                 text.textContent = option.textContent;
+                if (option.title) button.title = option.title;
                 const icon = document.createElement('i');
                 icon.className = 'ri-check-line';
                 icon.setAttribute('aria-hidden', 'true');
@@ -413,12 +452,26 @@ document.addEventListener('DOMContentLoaded', () => {
     const imagerySourceToggle = document.getElementById('imagery-source-toggle');
     if (styleToggle) {
         styleToggle.addEventListener('change', (e) => {
-            if (e.target.value === 'satellite') {
-                map.removeLayer(normalMap);
-                satelliteMap.addTo(map);
+            const value = e.target.value;
+            [normalMap, satelliteMap, gibsMap].forEach((layer) => {
+                if (map.hasLayer(layer)) map.removeLayer(layer);
+            });
+            activeBasemap = value;
+            if (value === 'gibs') {
+                gibsMap.addTo(map);
+                // 行政区 GeoJSON 是 GCJ-02，与 WGS84 的 GIBS 底图错位：暂隐并记录，切回 GCJ 底图恢复
+                if (provinceLayer && map.hasLayer(provinceLayer)) {
+                    map.removeLayer(provinceLayer);
+                    gibsHidProvince = true;
+                }
             } else {
-                map.removeLayer(satelliteMap);
-                normalMap.addTo(map);
+                (value === 'satellite' ? satelliteMap : normalMap).addTo(map);
+                if (gibsHidProvince) {
+                    gibsHidProvince = false;
+                    if (provinceLayer && document.getElementById('layer-admin')?.checked !== false) {
+                        provinceLayer.addTo(map);
+                    }
+                }
             }
         });
     }
@@ -474,10 +527,68 @@ document.addEventListener('DOMContentLoaded', () => {
         return map[grade] || grade || '未知';
     }
 
+    // 影像源配置表：key 同时是 toggle value 与后端 scene.source 的约定值
+    const IMAGERY_SOURCE_CONFIG = {
+        mapbox: {
+            label: '高清底图',
+            historyPrefix: '高清底图',
+            endpoint: '/api/satellite/get-img/',
+            collection: null,
+            skipTileProgress: false,
+            badge: 'HD'
+        },
+        tianditu: {
+            label: '高清底图·天地图',
+            historyPrefix: '高清底图·天地图',
+            endpoint: '/api/satellite/get-img/',
+            collection: null,
+            basemapSource: 'tianditu',
+            skipTileProgress: false,
+            badge: 'TD'
+        },
+        esri: {
+            label: '高清底图·Esri',
+            historyPrefix: '高清底图·Esri',
+            endpoint: '/api/satellite/get-img/',
+            collection: null,
+            basemapSource: 'esri',
+            skipTileProgress: false,
+            badge: 'ES'
+        },
+        sentinel2: {
+            label: '近期公开影像',
+            historyPrefix: '近期公开影像',
+            endpoint: '/api/satellite/get-sentinel-img/',
+            collection: 'sentinel-2-l2a',
+            skipTileProgress: true,
+            badge: 'S2'
+        },
+        sentinel1: {
+            label: '雷达影像',
+            historyPrefix: '雷达·全天候',
+            endpoint: '/api/satellite/get-sentinel-img/',
+            collection: 'sentinel-1-grd',
+            skipTileProgress: true,
+            badge: 'S1'
+        },
+        copdem: {
+            label: '地形 DEM',
+            historyPrefix: '地形·DEM',
+            endpoint: '/api/satellite/get-sentinel-img/',
+            collection: 'cop-dem-glo-30',
+            skipTileProgress: true,
+            badge: 'DEM'
+        }
+    };
+
+    function imagerySourceConfig(source) {
+        return IMAGERY_SOURCE_CONFIG[source] || null;
+    }
+
     function sceneBrief(scene) {
         if (!scene) return '';
         const parts = [scene.source_label || scene.source || '影像源', sceneGradeText(scene.decision_grade)];
-        if (scene.source === 'sentinel2') {
+        if (imagerySourceConfig(scene.source)?.collection) {
             const acquired = scene.acquired_at ? formatSceneDate(scene.acquired_at).split(' ')[0] : '';
             if (acquired) parts.push(acquired);
             if (scene.cloud_percent != null) parts.push(`云量 ${scene.cloud_percent}%`);
@@ -491,9 +602,9 @@ document.addEventListener('DOMContentLoaded', () => {
         // 截断后清尾部悬挂分隔符（"· "、" / "等），避免标题以孤立符号结尾
         const trimTail = (s) => s.replace(/[\s·/|-]+$/, '');
         if (!scene) return trimTail((history.spatial_context || history.image_file).substring(0, 36));
-        const prefix = scene.source === 'sentinel2' ? '近期公开影像' : '高清底图';
+        const prefix = imagerySourceConfig(scene.source)?.historyPrefix || '高清底图';
         const acquired = scene.acquired_at ? formatSceneDate(scene.acquired_at).split(' ')[0] : '';
-        const detail = scene.source === 'sentinel2'
+        const detail = imagerySourceConfig(scene.source)?.collection
             ? [acquired, scene.cloud_percent != null ? `云量${scene.cloud_percent}%` : '', scene.selection?.suitability_score != null ? `评分${scene.selection.suitability_score}` : ''].filter(Boolean).join(' / ')
             : (history.spatial_context || scene.decision_grade_label || sceneGradeText(scene.decision_grade));
         return trimTail(`${prefix}${detail ? ' · ' + detail : ''}`.substring(0, 42));
@@ -508,18 +619,16 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function historySourceCode(history) {
-        const source = history.scene?.source;
-        if (source === 'sentinel2') return 'S2';
-        if (source === 'mapbox') return 'HD';
-        return 'IMG';
+        return imagerySourceConfig(history.scene?.source)?.badge || 'IMG';
     }
 
     function getImagerySource() {
-        return imagerySourceToggle?.value === 'sentinel2' ? 'sentinel2' : 'mapbox';
+        const value = imagerySourceToggle?.value;
+        return IMAGERY_SOURCE_CONFIG[value] ? value : 'mapbox';
     }
 
     function imagerySourceLabel(source) {
-        return source === 'sentinel2' ? '近期公开影像' : '高清底图';
+        return imagerySourceConfig(source)?.label || '高清底图';
     }
 
     function formatCompactDate(value) {
@@ -878,6 +987,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function startAgentSession(extra = {}) {
+        if (document.body.dataset.runEngine === 'dag') {
+            if (!window.SatelliteRun) {
+                showToast('调查控制模块未加载，请刷新页面后重试', 'error');
+                return;
+            }
+            return window.SatelliteRun.start(extra);
+        }
         const goal = (extra.goal || agentGoalInput?.value || '').trim();
         if (!goal) {
             showToast('请输入调查目标', 'warning');
@@ -979,6 +1095,14 @@ document.addEventListener('DOMContentLoaded', () => {
             if (e.key === 'Enter') startAgentSession();
         });
     }
+    // 待机简报里的示例目标：填入输入框并聚焦，由用户确认后再启动（不自动消耗配额）
+    document.getElementById('agent-empty')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('.agent-example');
+        if (!btn || !agentGoalInput) return;
+        agentGoalInput.value = btn.dataset.goal || btn.textContent.trim();
+        agentGoalInput.focus();
+        agentGoalInput.setSelectionRange(agentGoalInput.value.length, agentGoalInput.value.length);
+    });
 
     // 全局快捷键：让高频入口始终可达，并避免浏览器默认行为抢占焦点。
     const placeSearchInput = document.querySelector('input[placeholder*="搜索地点"]');
@@ -1001,6 +1125,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const backBtn = document.getElementById('backButton');
     const zoomReadout = document.getElementById('map-zoom-readout');
     const gsdReadout = document.getElementById('map-gsd-readout');
+    const cursorReadout = document.getElementById('map-cursor-readout');
+    // 光标经纬度读数：方位后缀跟随半球，便于直接读方位
+    function formatCursorLatLng(latlng) {
+        const lat = Math.abs(latlng.lat).toFixed(3);
+        const lng = Math.abs(latlng.lng).toFixed(3);
+        return `${lat}°${latlng.lat >= 0 ? 'N' : 'S'} ${lng}°${latlng.lng >= 0 ? 'E' : 'W'}`;
+    }
     // Web 墨卡托地面分辨率实时估算：156543.03392 * cos(lat) / 2^zoom (m/px)
     function formatGroundResolution() {
         const metersPerPx = 156543.03392 * Math.cos(map.getCenter().lat * Math.PI / 180) / Math.pow(2, map.getZoom());
@@ -1210,6 +1341,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     map.on('mousemove', (e) => {
+        if (cursorReadout) cursorReadout.textContent = formatCursorLatLng(e.latlng);
         if (!isSelecting) return;
         const bounds = L.latLngBounds(startLatLng, e.latlng);
         if (!selectionRect) {
@@ -1217,6 +1349,10 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             selectionRect.setBounds(bounds);
         }
+    });
+
+    map.on('mouseout', () => {
+        if (cursorReadout) cursorReadout.textContent = '—';
     });
 
     map.on('mouseup', (e) => {
@@ -1538,7 +1674,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const fill = progressBar.querySelector('.progress-bar-fill');
         const progressText = progressBar.querySelector('.progress-text');
         const imagerySource = getImagerySource();
-        const endpoint = imagerySource === 'sentinel2' ? "/api/satellite/get-sentinel-img/" : "/api/satellite/get-img/";
+        const sourceCfg = imagerySourceConfig(imagerySource) || IMAGERY_SOURCE_CONFIG.mapbox;
+        const endpoint = sourceCfg.endpoint;
 
         try {
             setRegionStage(itemEl, 'pending', '请求影像中');
@@ -1548,7 +1685,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const r = await fetch(endpoint, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ min_lng, max_lng, min_lat, max_lat })
+                body: JSON.stringify({ min_lng, max_lng, min_lat, max_lat, ...(sourceCfg.collection ? { collection: sourceCfg.collection } : {}), ...(sourceCfg.basemapSource ? { basemap_source: sourceCfg.basemapSource } : {}) })
             });
             const d = await r.json();
 
@@ -1605,11 +1742,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     };
                 };
 
-                if (imagerySource === 'sentinel2') {
+                if (sourceCfg.skipTileProgress) {
                     progressBar.style.display = 'none';
                     progressBar.hidden = true;
                     showReadyImage();
-                    showToast('近期公开影像已生成', 'success');
+                    showToast(`${imagerySourceLabel(imagerySource)}已生成`, 'success');
                 } else {
                     setRegionStage(itemEl, 'downloading', '瓦片下载中');
                     status.innerHTML = '<span class="spinner"></span> 正在下载瓦片...';
@@ -1720,11 +1857,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const sourceGsd = Number(scene.metadata?.source_asset_gsd_m || 0);
         const renderedGsd = Number(scene.metadata?.rendered_gsd_m || scene.gsd_m || 0);
-        const isSentinel = scene.source === 'sentinel2' || String(scene.source_label || '').includes('Sentinel-2');
+        const sceneCfg = imagerySourceConfig(scene.source);
+        const isSentinel = !!(sceneCfg && sceneCfg.collection) || String(scene.source_label || '').includes('Sentinel-2');
         const gsd = isSentinel && sourceGsd > 0 && renderedGsd > 0
             ? `原始 ${sourceGsd}m · 预览采样约 ${renderedGsd}m/像素`
             : renderedGsd > 0 ? `约 ${renderedGsd} m/像素` : '未知';
-        const cloud = scene.cloud_percent != null ? `${scene.cloud_percent}%` : '未知';
+        const cloud = scene.cloud_percent != null
+            ? `${scene.cloud_percent}%`
+            : (scene.source === 'sentinel1' ? '不受云影响' : '未知');
         const acquiredAt = formatSceneDate(scene.acquired_at);
         const grade = sceneGradeText(scene.decision_grade);
         const limitations = scene.limitations || '公开影像辅助筛查';
@@ -1736,6 +1876,17 @@ document.addEventListener('DOMContentLoaded', () => {
                     : ''
             }`
             : '';
+        let sourceChip = '';
+        if (scene.source === 'sentinel1') {
+            const instruments = scene.metadata?.instruments || scene.source_label || 'SAR · 全天候';
+            sourceChip = `<span title="极化 / 合成孔径雷达"><i class="ri-radar-line" aria-hidden="true"></i>${escapeHtml(String(instruments))}</span>`;
+        } else if (scene.source === 'copdem') {
+            sourceChip = `<span title="静态 DEM"><i class="ri-mountain-line" aria-hidden="true"></i>静态 DEM · 采集基线 2011-2015</span>`;
+        } else if (scene.source === 'tianditu' || scene.source === 'esri') {
+            const basemapLabel = scene.source === 'tianditu' ? '天地图影像' : 'Esri World Imagery';
+            sourceChip = `<span title="高清底图，无拍摄时间，仅视觉参考"><i class="ri-map-2-line" aria-hidden="true"></i>${basemapLabel} · 无拍摄时间</span>`;
+        }
+        const cloudChip = scene.source === 'copdem' ? '' : `<span title="云量"><i class="ri-cloudy-line" aria-hidden="true"></i>${escapeHtml(cloud)}</span>`;
         panel.innerHTML = `
             <div class="scene-compact-head">
                 <span>${escapeHtml(scene.source_label || scene.source || '影像源')}</span>
@@ -1744,7 +1895,8 @@ document.addEventListener('DOMContentLoaded', () => {
             <div class="scene-chip-row">
                 <span title="拍摄日期"><i class="ri-calendar-line" aria-hidden="true"></i>${escapeHtml(acquiredAt)}</span>
                 <span title="原始影像分辨率与当前预览采样尺度"><i class="ri-ruler-line" aria-hidden="true"></i>${escapeHtml(gsd)}</span>
-                <span title="云量"><i class="ri-cloudy-line" aria-hidden="true"></i>${escapeHtml(cloud)}</span>
+                ${cloudChip}
+                ${sourceChip}
                 ${scene.processing_level ? `<span title="处理级别"><i class="ri-stack-line" aria-hidden="true"></i>${escapeHtml(scene.processing_level)}</span>` : ''}
             </div>
             ${selection ? `<button class="scene-mini-note" type="button" title="${escapeHtml(selectionTitle)}"><i class="ri-check-double-line" aria-hidden="true"></i>已选最佳候选</button>` : ''}
@@ -2372,6 +2524,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     ? `${meta.label || key} · 波段 ${(meta.bands || []).join(' / ')} · 已接通`
                     : `${meta.label || key} · 当前仅为指标目录，尚未接通真实波段执行链`;
                 item.textContent = meta.implemented ? key.toUpperCase() : `${key.toUpperCase()} · 目录`;
+                item.dataset.implemented = meta.implemented ? 'true' : 'false';
+                item.setAttribute('aria-disabled', meta.implemented ? 'false' : 'true');
+                item.classList.toggle('is-catalog-only', !meta.implemented);
                 spectralIndexList.appendChild(item);
             });
         } catch (error) {

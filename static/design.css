@@ -79,10 +79,11 @@ html { overflow-x: clip; }
   display: inline-flex;
   align-items: center;
   gap: 12px;
-  color: var(--ink-low);
+  color: rgba(242, 238, 230, .72);
   font: 500 11px var(--font-mono);
   letter-spacing: .32em;
   text-transform: uppercase;
+  text-shadow: 0 1px 14px rgba(7, 9, 14, .85);
 }
 
 .hero .kicker::before,
@@ -246,7 +247,7 @@ html { overflow-x: clip; }
 .type-row { display: flex; align-items: baseline; gap: 26px; padding: 20px 0; }
 .type-row + .type-row { border-top: 1px solid rgba(255, 255, 255, .06); }
 
-.type-row .lbl { flex: none; width: 150px; }
+.type-row .lbl { flex: none; width: 178px; }
 
 .type-display { font: 700 42px var(--font-display); letter-spacing: -.02em; }
 .type-body { font: 300 16px var(--font-body); color: var(--ink-mid); }
