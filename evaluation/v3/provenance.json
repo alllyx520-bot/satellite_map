@@ -1,0 +1,11 @@
+{
+  "dataset": "dmarsili/RSVQA-HR-2k",
+  "revision": "bde073e47328d0e1815bd5d3801d0fd4cbcea5a2",
+  "license": "CC-BY-4.0",
+  "download_url": "https://hf-mirror.com/datasets/dmarsili/RSVQA-HR-2k/resolve/main/data/validation-00000-of-00002.parquet",
+  "raw_sha256": "80ef7d5f45790dabf8b69fade0085ba63bebccc20b1140163efde9afc281e1d4",
+  "sample_count": 120,
+  "selection": "validation parquet part 0, rows 0-119, in source order",
+  "manifest_sha256": "e58a859fdc40ec7ad51cf46013a7cb9c6b1f690ed01b76ee3fa26ff067ff258c",
+  "reference_sha256": "6ea19c2299e2f03302cc0e68d8b1e89b79178f10c603e1da6c4e247318822dd0"
+}

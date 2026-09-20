@@ -10,6 +10,39 @@
   padding: 0 32px 140px;
 }
 
+/* 经典版横幅：一行高，链回新工作台 */
+.legacy-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+  background: rgba(209, 184, 133, .07);
+  border-bottom: 1px solid rgba(209, 184, 133, .14);
+  color: rgba(209, 184, 133, .72);
+  font: 400 11px var(--font-body);
+  letter-spacing: .06em;
+  text-decoration: none;
+  transition: color var(--dur-ui), background var(--dur-ui);
+}
+
+.legacy-banner:hover {
+  color: var(--gold-hi);
+  background: rgba(209, 184, 133, .12);
+}
+
+/* 「历史存档」角标：SPECTRA 品牌旁 */
+.archive-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border: 1px solid rgba(209, 184, 133, .45);
+  border-radius: 999px;
+  color: var(--gold);
+  font: 500 10.5px var(--font-mono);
+  letter-spacing: .08em;
+  white-space: nowrap;
+}
+
 #stars {
   position: fixed;
   inset: 0;
@@ -47,7 +80,7 @@ html { overflow-x: clip; }
 .nav .mark [class^="ri-"], .nav .mark [class*=" ri-"] {
   font-size: 19px;
   color: var(--gold);
-  filter: drop-shadow(0 0 8px rgba(228, 179, 106, .7));
+  filter: drop-shadow(0 0 8px rgba(209, 184, 133, .7));
 }
 
 .nav .mark b {
@@ -91,22 +124,22 @@ html { overflow-x: clip; }
   content: "";
   width: 42px;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(228, 179, 106, .5));
+  background: linear-gradient(90deg, transparent, rgba(209, 184, 133, .5));
 }
 
 .hero .kicker::after {
-  background: linear-gradient(90deg, rgba(228, 179, 106, .5), transparent);
+  background: linear-gradient(90deg, rgba(209, 184, 133, .5), transparent);
 }
 
 .hero h1 {
   margin: 26px 0 10px;
   font: 700 clamp(56px, 9vw, 110px)/1.05 var(--font-display);
   letter-spacing: -.03em;
-  background: linear-gradient(115deg, #FBF5E8 18%, #F2CD90 46%, #B7A5E8 80%, #8FB4E8 100%);
+  background: linear-gradient(115deg, #FBF5E8 18%, #ead3a4 46%, #B7A5E8 80%, #8FB4E8 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  filter: drop-shadow(0 0 32px rgba(228, 179, 106, .22));
+  filter: drop-shadow(0 0 32px rgba(209, 184, 133, .22));
 }
 
 .hero h1 .cn {
@@ -128,6 +161,7 @@ html { overflow-x: clip; }
   color: var(--ink-mid);
   font-size: 15.5px;
   font-weight: 300;
+  text-wrap: pretty;
 }
 
 .hero .meta {
@@ -172,6 +206,7 @@ html { overflow-x: clip; }
   max-width: 640px;
   color: var(--ink-mid);
   font-size: 14px;
+  text-wrap: pretty;
 }
 
 /* ---------------------------------------------------------------- 色板 */
@@ -199,7 +234,7 @@ html { overflow-x: clip; }
 }
 
 .swatch .name { font: 500 13px var(--font-body); }
-.swatch .hex { font: 400 11.5px var(--font-mono); color: var(--ink-low); margin-top: 3px; }
+.swatch .hex { font: 400 11.5px var(--font-mono); color: var(--ink-mid); margin-top: 3px; }
 .swatch .mean { font: 300 11.5px var(--font-body); color: var(--ink-mid); margin-top: 7px; }
 
 .strip-row {
@@ -239,7 +274,7 @@ html { overflow-x: clip; }
 
 .material-card .tag { align-self: flex-start; margin-bottom: 14px; }
 
-.material-card p { margin: auto 0 0; font-size: 12.5px; color: var(--ink-mid); }
+.material-card p { margin: auto 0 0; font-size: 12.5px; color: var(--ink-mid); text-wrap: pretty; }
 
 /* ---------------------------------------------------------------- 字体 */
 .type-panel { padding: 34px 38px; }
@@ -280,8 +315,8 @@ html { overflow-x: clip; }
   border-radius: var(--r-lg);
   overflow: hidden;
   background:
-    linear-gradient(rgba(228, 179, 106, .05) 1px, transparent 1px) 0 0 / 44px 44px,
-    linear-gradient(90deg, rgba(228, 179, 106, .05) 1px, transparent 1px) 0 0 / 44px 44px,
+    linear-gradient(rgba(209, 184, 133, .05) 1px, transparent 1px) 0 0 / 44px 44px,
+    linear-gradient(90deg, rgba(209, 184, 133, .05) 1px, transparent 1px) 0 0 / 44px 44px,
     radial-gradient(90% 120% at 50% 0%, rgba(14, 22, 38, .9), rgba(6, 10, 18, .95));
   border: 1px solid var(--glass-stroke);
 }
@@ -291,6 +326,7 @@ html { overflow-x: clip; }
   left: 42px;
   bottom: 14px;
   z-index: 3;
+  color: rgba(242, 238, 230, .55);
 }
 
 .stage .stage-readout {
@@ -315,8 +351,8 @@ html { overflow-x: clip; }
   z-index: 2;
   background: linear-gradient(180deg,
       transparent,
-      rgba(228, 179, 106, .16) 55%,
-      rgba(228, 179, 106, .45) 82%,
+      rgba(209, 184, 133, .16) 55%,
+      rgba(209, 184, 133, .45) 82%,
       rgba(210, 250, 255, .9) 100%);
   animation: scan 2.8s var(--ease-orbital) infinite;
 }
@@ -329,7 +365,7 @@ html { overflow-x: clip; }
   bottom: 0;
   height: 2px;
   background: #FBE8C8;
-  box-shadow: 0 0 18px 4px rgba(228, 179, 106, .8);
+  box-shadow: 0 0 18px 4px rgba(209, 184, 133, .8);
 }
 
 @keyframes scan {
@@ -346,7 +382,7 @@ html { overflow-x: clip; }
   width: 18px;
   height: 18px;
   border: 2px solid var(--gold);
-  filter: drop-shadow(0 0 6px rgba(228, 179, 106, .6));
+  filter: drop-shadow(0 0 6px rgba(209, 184, 133, .6));
 }
 
 .brackets i:nth-child(1) { top: 0; left: 0; border-right: 0; border-bottom: 0; }
@@ -379,7 +415,12 @@ html { overflow-x: clip; }
 .proto-panel > .spec { display: block; margin-bottom: 16px; }
 
 /* 原型面板内的说明文字 */
-.proto-note { margin: 0; font-size: 13.5px; color: var(--ink-mid); }
+.proto-note { margin: 0; font-size: 13.5px; color: var(--ink-mid); text-wrap: pretty; }
+
+/* 07 业务原型：4 块面板在宽屏走 2×2，避免 3 列网格第二行只剩一块的空旷 */
+#proto .proto-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(460px, 100%), 1fr));
+}
 
 /* 时间线 */
 .timeline {
@@ -413,7 +454,7 @@ html { overflow-x: clip; }
 }
 
 .t-step:first-child::before { display: none; }
-.t-step.done::before { background: linear-gradient(90deg, rgba(143, 188, 155, .5), rgba(228, 179, 106, .5)); }
+.t-step.done::before { background: linear-gradient(90deg, rgba(143, 188, 155, .5), rgba(209, 184, 133, .5)); }
 
 .t-dot {
   width: 31px;
@@ -436,8 +477,8 @@ html { overflow-x: clip; }
 
 .t-step.active .t-dot {
   color: #fff;
-  border-color: rgba(228, 179, 106, .7);
-  background: rgba(228, 179, 106, .15);
+  border-color: rgba(209, 184, 133, .7);
+  background: rgba(209, 184, 133, .15);
   animation: breathe 2s ease-in-out infinite;
 }
 
@@ -445,7 +486,7 @@ html { overflow-x: clip; }
 .t-step.active .t-label { color: var(--ink-hi); }
 
 @keyframes breathe {
-  50% { box-shadow: 0 0 0 6px rgba(228, 179, 106, .12), 0 0 20px rgba(228, 179, 106, .5); }
+  50% { box-shadow: 0 0 0 6px rgba(209, 184, 133, .12), 0 0 20px rgba(209, 184, 133, .5); }
 }
 
 
@@ -497,8 +538,8 @@ html { overflow-x: clip; }
 .chat-user {
   align-self: flex-end;
   border-bottom-right-radius: 6px;
-  background: linear-gradient(135deg, rgba(228, 179, 106, .16), rgba(143, 180, 232, .12));
-  border: 1px solid rgba(228, 179, 106, .28);
+  background: linear-gradient(135deg, rgba(209, 184, 133, .16), rgba(143, 180, 232, .12));
+  border: 1px solid rgba(209, 184, 133, .28);
 }
 
 .chat-ai { align-self: flex-start; border-bottom-left-radius: 6px; }
@@ -554,7 +595,7 @@ html { overflow-x: clip; }
   width: 120px;
   height: 1px;
   margin: 0 auto 28px;
-  background: linear-gradient(90deg, transparent, rgba(228, 179, 106, .5), transparent);
+  background: linear-gradient(90deg, transparent, rgba(209, 184, 133, .5), transparent);
 }
 
 .footer p { margin: 6px 0; font-size: 12.5px; }
@@ -572,14 +613,40 @@ html { overflow-x: clip; }
   .page { padding: 0 18px 100px; }
   .hero { padding: 70px 0 60px; }
   .hero .kicker { letter-spacing: .18em; }
+  .hero h1 .cn { letter-spacing: .2em; margin-right: -.2em; }
   .nav { gap: 10px; padding: 10px 14px; }
   /* 次要 chip 让位，保住「返回首页」 */
   .nav .chip { display: none; }
   .type-panel, .comp-panel { padding: 22px; }
   .type-display { font-size: 28px; }
+  /* 窄屏下字体标本改为上下堆叠，固定标签列不再挤压样文 */
+  .type-row { flex-direction: column; align-items: flex-start; gap: 10px; }
+  .type-row .lbl { width: auto; }
   .timeline { flex-wrap: wrap; gap: 14px; }
   .t-step { flex: 1 1 30%; }
   .t-step::before { display: none; }
 }
 
-.strip .lbl { font: 400 10.5px var(--font-mono); color: var(--ink-low); }
+.strip .lbl { font: 400 10.5px var(--font-mono); color: var(--ink-mid); }
+
+/* 时间线演示的说明文字（模板里不再用内联样式） */
+.tl-note { margin: 22px 0 0; font-size: 12.5px; color: var(--ink-mid); }
+
+/* TAGS 面板两行布局：溯源按钮的 tooltip 强制上方弹出，避免压住下行的「模拟通知」 */
+#components [data-tip-pos="bottom"]::after {
+  bottom: calc(100% + 10px);
+  top: auto;
+  transform: translateX(-50%) translateY(4px);
+}
+#components [data-tip-pos="bottom"]:hover::after,
+#components [data-tip-pos="bottom"]:focus-visible::after {
+  transform: translateX(-50%) translateY(0);
+}
+
+/* 组件展台小工具类（替代内联样式） */
+.u-none { flex: none; }
+.u-grow { flex: 1; }
+.switch-label { font-size: 13px; color: var(--ink-mid); }
+.slider-val { color: var(--glacier); }
+.comp-panel .comp-row + .comp-row { margin-top: 16px; }
+.motion-actions { margin-top: 20px; }

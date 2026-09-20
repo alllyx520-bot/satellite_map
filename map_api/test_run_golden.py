@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 from io import BytesIO
 from unittest.mock import Mock, patch
@@ -28,6 +29,16 @@ class RunGoldenTests(TestCase):
         self.fail_band = None
         self.corrupt_model = False
         self.calls = []
+        # 夹具执行器是 GLMProvider;run 记录的 provider 必须与执行遥测一致,否则验收门
+        # 报 unexpected_provider_switch(2026-09-11 控制器默认已切 DeepSeek)。
+        self._old_provider = os.environ.get("AGENT_PROVIDER")
+        os.environ["AGENT_PROVIDER"] = "glm"
+        def _restore_provider():
+            if self._old_provider is None:
+                os.environ.pop("AGENT_PROVIDER", None)
+            else:
+                os.environ["AGENT_PROVIDER"] = self._old_provider
+        self.addCleanup(_restore_provider)
 
     def response(self, body=None, content=None):
         response = Mock(status_code=200, content=content, headers={"Content-Type": "image/tiff"})
@@ -70,7 +81,10 @@ class RunGoldenTests(TestCase):
         if band == self.fail_band:
             import requests
             raise requests.Timeout()
-        value = {"green": 6000, "red": 2000, "blue": 2000, "nir": 2000 if self.task == "water" else 6000, "swir16": 2000,
+        # DN 与 sentinel-2-l2a 的 radiometry_override(scale=1e-4, offset=0)配套:
+        # 5000→0.5、1000→0.1,保持 NDVI/NDWI/MNDWI 期望值 2/3 不变;fixture 元数据仍写
+        # offset=-0.1,恰好同时验证"profile 覆盖优先于资产元数据"。
+        value = {"green": 5000, "red": 1000, "blue": 1000, "nir": 1000 if self.task == "water" else 5000, "swir16": 1000,
                  "scl": 9 if self.bad_scl else 6}[band]
         data = np.full((256, 256), value, dtype=np.uint16)
         buf = BytesIO()

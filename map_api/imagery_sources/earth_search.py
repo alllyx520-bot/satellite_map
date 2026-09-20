@@ -1,8 +1,11 @@
 from datetime import datetime, timezone
+from io import BytesIO
 import os
 import time
 
+import numpy as np
 import requests
+from PIL import Image
 
 from .base import ImageryCandidate, ImageryProvider
 from ..utils.http import request_proxies
@@ -42,7 +45,14 @@ SENTINEL2_L2A_PROFILE = {
 }
 
 COLLECTION_PROFILES = {
-    "sentinel-2-l2a": SENTINEL2_L2A_PROFILE,
+    "sentinel-2-l2a": {
+        **SENTINEL2_L2A_PROFILE,
+        # 2026-09-10 实测两景(48QZL/48QYK):Element84 自产 Sen2Cor COG 的 DN 未含
+        # ESA 基线>=4 的 +1000 谐波偏移,STAC 元数据 offset=-0.1 与实际数据不符
+        # (强行应用会让植被 NDVI 爆 inf、绿光反射率 78% 为负被范围过滤误杀);
+        # c1-l2a 实测 DN 带偏移(绿光 mean 1726),元数据正确,不要照搬此覆盖。
+        "radiometry_override": {"scale": 0.0001, "offset": 0.0},
+    },
     "sentinel-2-c1-l2a": {
         **SENTINEL2_L2A_PROFILE,
         "processing_level": "sentinel-2-c1-l2a",
@@ -74,6 +84,12 @@ COLLECTION_PROFILES = {
         "gsd_keys": ["vv", "vh"],
         "gsd_default": 10.0,
         "render": {"asset": "vv", "titiler_params": {"bidx": 1, "rescale": "0,400"}},
+        # 2026-09-10 实测:SAR 暗区(水体/光滑地表)是有效信号,亮度启发式把本场景
+        # valid_ratio 误判为 0.62;改用 PNG alpha(真实 nodata)判定,并关闭亮度裁边。
+        "valid_check": "alpha",
+        "render_nodata": 0,
+        "auto_crop": False,
+        "min_valid_ratio": 0.5,
         "native_resolution_m": 10,
         "experimental": False,
     },
@@ -94,10 +110,18 @@ COLLECTION_PROFILES = {
         "asset_keys": ["data", "thumbnail", "preview"],
         "gsd_keys": ["data"],
         "gsd_default": 30.0,
-        "render": {"asset": "data", "titiler_params": {"bidx": 1, "colormap_name": "terrain", "rescale": "0,2000"}},
+        "render": {"asset": "data", "titiler_params": {"bidx": 1, "colormap_name": "terrain"}, "adaptive_rescale": True},
+        # 静态 DEM:Earth Search 上 datetime 是 2021 生产发布日期而非采集时相,
+        # 任何日期过滤都会零候选(2026-09-10 实测)——检索跳过 datetime。
+        "static": True,
+        "valid_check": "alpha",
+        "auto_crop": False,
+        "min_valid_ratio": 0.5,
         "native_resolution_m": 30,
         "experimental": False,
     },
+    # M3-3a:经 Microsoft Planetary Computer 匿名 SAS 签名接入为正式源;
+    # 渲染走后端 rgb_compose 合成(red/green/blue 分别签名经 titiler 取数组)。
     "landsat-c2-l2": {
         "source": "landsat",
         "source_label": "Landsat Collection 2 Level-2",
@@ -106,18 +130,25 @@ COLLECTION_PROFILES = {
         "license_type": "usgs_landsat_terms",
         "limitations": (
             "Landsat Collection 2 Level-2 是 USGS 地表反射率产品，空间分辨率约 30 米，"
-            "重访周期 16 天；适合宏观变化与历史回溯，细节能力低于 Sentinel-2。"
-            "其资产存储在 usgs-landsat requester-pays 桶，当前部署的渲染服务无法匿名读取，"
-            "需要自带凭证的渲染链路支持。"
+            "重访周期 16 天（双星约 8 天），经 Microsoft Planetary Computer 匿名 SAS 签名访问"
+            "（有速率限制，服务可持续性依赖微软）。适合 1982 年起的历史回溯与宏观变化筛查，"
+            "细节判读能力低于 Sentinel-2；热红外 lwir11 资产已索引，LST 产品化留待后续。"
         ),
         "decision_grade": "reference",
+        "provider": "planetary_computer",
         "product_id_keys": ["landsat:product_id", "landsat:scene_id"],
         "cloud_property": "eo:cloud_cover",
-        "asset_keys": ["red", "green", "blue", "nir08", "swir16", "qa_pixel", "thumbnail"],
+        "asset_keys": ["red", "green", "blue", "nir08", "swir16", "swir22", "lwir11", "qa_pixel", "thumbnail"],
         "gsd_keys": ["red", "green", "blue"],
         "gsd_default": 30.0,
-        "render": {"asset": "red"},
-        "experimental": True,
+        "render": {"strategy": "rgb_compose", "assets": ["red", "green", "blue"], "stretch": [0.0, 0.3]},
+        "qa_band": "qa_pixel",
+        "qa_kind": "bitmask",
+        # Landsat QA_PIXEL 位标志:bit1 稀释云 / bit2 卷云 / bit3 云 / bit4 云影。
+        "qa_bad_bits": [1, 2, 3, 4],
+        "band_aliases": {"nir": "nir08"},
+        "native_resolution_m": 30,
+        "experimental": False,
     },
 }
 
@@ -261,6 +292,9 @@ def decision_grade_for_score(score):
 
 class EarthSearchProvider(ImageryProvider):
     source = "earth_search"
+    # 熔断 kind 与环境变量前缀可被子类覆盖(如 Planetary Computer)。
+    circuit_kind = "earth-search"
+    env_prefix = "EARTH_SEARCH"
 
     def __init__(self, endpoint=EARTH_SEARCH_URL, titiler_endpoint=TITILER_URL, timeout=20):
         self.endpoint = endpoint
@@ -268,7 +302,7 @@ class EarthSearchProvider(ImageryProvider):
         self.timeout = timeout
 
     def search(self, bbox, start_date=None, end_date=None, max_cloud=30, limit=10, collection=DEFAULT_COLLECTION):
-        health_key = service_key("earth-search", self.endpoint)
+        health_key = service_key(self.circuit_kind, self.endpoint)
         check_service(health_key)
         payload = {
             "collections": [collection],
@@ -276,13 +310,17 @@ class EarthSearchProvider(ImageryProvider):
             "limit": limit,
             "sortby": [{"field": "properties.datetime", "direction": "desc"}],
         }
+        profile = get_collection_profile(collection)
         datetime_range = stac_datetime_range(start_date, end_date)
-        if datetime_range:
+        if datetime_range and not profile.get("static"):
+            # 静态数据集(如 Cop-DEM)的 datetime 是生产发布日期,日期过滤会零候选
             payload["datetime"] = datetime_range
-        if max_cloud is not None:
-            payload["query"] = {"eo:cloud_cover": {"lte": float(max_cloud)}}
+        cloud_property = profile.get("cloud_property")
+        if max_cloud is not None and cloud_property:
+            # SAR/DEM 等 collection 没有 eo:cloud_cover 属性;带上云量过滤会把它们全部排除
+            payload["query"] = {cloud_property: {"lte": float(max_cloud)}}
 
-        retries = max(0, min(3, int(os.environ.get("EARTH_SEARCH_RETRIES", "2"))))
+        retries = max(0, min(3, int(os.environ.get(f"{self.env_prefix}_RETRIES", "2"))))
         response = None
         for attempt in range(retries + 1):
             try:
@@ -298,8 +336,8 @@ class EarthSearchProvider(ImageryProvider):
                     record_failure(
                         health_key,
                         exc,
-                        threshold=int(os.environ.get("EARTH_SEARCH_CIRCUIT_FAILURES", "2")),
-                        cooldown_seconds=int(os.environ.get("EARTH_SEARCH_CIRCUIT_SECONDS", "30")),
+                        threshold=int(os.environ.get(f"{self.env_prefix}_CIRCUIT_FAILURES", "2")),
+                        cooldown_seconds=int(os.environ.get(f"{self.env_prefix}_CIRCUIT_SECONDS", "30")),
                     )
                     raise
                 time.sleep(min(2 ** attempt, 4))
@@ -315,8 +353,8 @@ class EarthSearchProvider(ImageryProvider):
                 record_failure(
                     health_key,
                     exc,
-                    threshold=int(os.environ.get("EARTH_SEARCH_CIRCUIT_FAILURES", "2")),
-                    cooldown_seconds=int(os.environ.get("EARTH_SEARCH_CIRCUIT_SECONDS", "30")),
+                    threshold=int(os.environ.get(f"{self.env_prefix}_CIRCUIT_FAILURES", "2")),
+                    cooldown_seconds=int(os.environ.get(f"{self.env_prefix}_CIRCUIT_SECONDS", "30")),
                 )
             raise
         try:
@@ -325,8 +363,8 @@ class EarthSearchProvider(ImageryProvider):
             record_failure(
                 health_key,
                 exc,
-                threshold=int(os.environ.get("EARTH_SEARCH_CIRCUIT_FAILURES", "2")),
-                cooldown_seconds=int(os.environ.get("EARTH_SEARCH_CIRCUIT_SECONDS", "30")),
+                threshold=int(os.environ.get(f"{self.env_prefix}_CIRCUIT_FAILURES", "2")),
+                cooldown_seconds=int(os.environ.get(f"{self.env_prefix}_CIRCUIT_SECONDS", "30")),
             )
             raise ValueError("Earth Search 返回了无效 JSON") from exc
         if not isinstance(data, dict) or not isinstance(data.get("features"), list):
@@ -334,14 +372,14 @@ class EarthSearchProvider(ImageryProvider):
             record_failure(
                 health_key,
                 error,
-                threshold=int(os.environ.get("EARTH_SEARCH_CIRCUIT_FAILURES", "2")),
-                cooldown_seconds=int(os.environ.get("EARTH_SEARCH_CIRCUIT_SECONDS", "30")),
+                threshold=int(os.environ.get(f"{self.env_prefix}_CIRCUIT_FAILURES", "2")),
+                cooldown_seconds=int(os.environ.get(f"{self.env_prefix}_CIRCUIT_SECONDS", "30")),
             )
             raise error
         record_success(health_key)
         return [self.candidate_from_item(item) for item in data.get("features", [])]
 
-    def render_candidate_jpeg(self, candidate, bbox, width, height):
+    def _render_image(self, candidate, bbox, width, height, image_format="jpg", extra_params=None):
         health_key = service_key("titiler", self.titiler_endpoint)
         check_service(health_key)
         profile = get_collection_profile(getattr(candidate, "collection", "") or "")
@@ -355,10 +393,17 @@ class EarthSearchProvider(ImageryProvider):
             raise ValueError(f"候选影像缺少可渲染的 {render_asset_key} 资产")
         titiler_params = {"url": cog_url}
         titiler_params.update(render_spec.get("titiler_params") or {})
+        titiler_params.update(extra_params or {})
+        if render_spec.get("adaptive_rescale") and "rescale" not in titiler_params:
+            # 固定拉伸区间对低起伏地区会把 colormap 压进窄带(2026-09-11 实测南宁几乎全蓝);
+            # 按 bbox 内 p2~p98 自适应拉伸,失败则不加 rescale 交给 TiTiler 默认。
+            adaptive = self._adaptive_rescale_range(cog_url, bbox)
+            if adaptive:
+                titiler_params["rescale"] = adaptive
         endpoint = (
             f"{self.titiler_endpoint}/cog/bbox/"
             f"{bbox['min_lng']},{bbox['min_lat']},{bbox['max_lng']},{bbox['max_lat']}/"
-            f"{width}x{height}.jpg"
+            f"{width}x{height}.{image_format}"
         )
         retries = max(0, min(2, int(os.environ.get("TITILER_RETRIES", "1"))))
         response = None
@@ -411,6 +456,59 @@ class EarthSearchProvider(ImageryProvider):
             raise ValueError("影像渲染服务未返回图片")
         record_success(health_key)
         return response.content
+
+    def _adaptive_rescale_range(self, cog_url, bbox):
+        """按 bbox 内像元 p2~p98 生成 rescale 字符串;任何失败返回 None(不加 rescale)。"""
+        health_key = service_key("titiler", self.titiler_endpoint)
+        try:
+            response = requests.get(
+                f"{self.titiler_endpoint}/cog/statistics",
+                params={
+                    "url": cog_url,
+                    "bidx": 1,
+                    "bbox": f"{bbox['min_lng']},{bbox['min_lat']},{bbox['max_lng']},{bbox['max_lat']}",
+                    "max_size": 256,
+                },
+                timeout=max(self.timeout, 20),
+                proxies=request_proxies(),
+            )
+            response.raise_for_status()
+            band = (response.json() or {}).get("b1") or {}
+            lo, hi = band.get("percentile_2"), band.get("percentile_98")
+            if lo is None or hi is None or not float(hi) > float(lo):
+                return None
+            record_success(health_key)
+            return f"{float(lo):.2f},{float(hi):.2f}"
+        except Exception:
+            # 统计失败不应阻塞渲染主流程
+            return None
+
+    def render_candidate_jpeg(self, candidate, bbox, width, height):
+        return self._render_image(candidate, bbox, width, height, image_format="jpg")
+
+    def render_candidate_with_validity(self, candidate, bbox, width, height):
+        """返回 (jpeg_bytes, valid_ratio|None)。
+
+        默认 None:由管线用亮度启发式 image_valid_ratio。profile valid_check=="alpha"
+        时改走 PNG alpha 通道(真实 nodata):SAR/DEM 的暗区(水体/低海拔)是有效信号,
+        亮度启发式会误杀(2026-09-10 实测 SAR 亮度 valid 0.62,alpha 真实 ~1.0)。
+        """
+        profile = get_collection_profile(getattr(candidate, "collection", "") or "")
+        if profile.get("valid_check") != "alpha":
+            return self.render_candidate_jpeg(candidate, bbox, width, height), None
+        extra = {}
+        if profile.get("render_nodata") is not None:
+            extra["nodata"] = profile["render_nodata"]
+        png_bytes = self._render_image(candidate, bbox, width, height, image_format="png", extra_params=extra)
+        image = Image.open(BytesIO(png_bytes))
+        rgba = np.asarray(image.convert("RGBA"))
+        alpha_ratio = round(float((rgba[..., 3] > 0).mean()), 4)
+        rgba_img = Image.fromarray(rgba, "RGBA")
+        background = Image.new("RGB", rgba_img.size, (0, 0, 0))
+        background.paste(rgba_img, mask=rgba_img.split()[3])
+        buffer = BytesIO()
+        background.save(buffer, "JPEG", quality=92)
+        return buffer.getvalue(), alpha_ratio
 
     def candidate_from_item(self, item):
         properties = item.get("properties") or {}

@@ -1,442 +1,112 @@
-# SatelliteSense Remote Sensing Workbench
+# SatelliteSense · 大场景遥感图像智能问答
 
-SatelliteSense is a Django + Leaflet remote-sensing analysis workbench. It lets users draw a region on a map, fetch imagery from Mapbox or Sentinel-2, run Qwen VL analysis, save history, generate Word reports, and start a controlled investigation Agent from a natural-language goal.
+面向非专业用户的遥感影像 Agent。地图框选、PNG/JPEG 和 GeoTIFF 进入同一段对话；主控按问题查看原图窗口、调用数据产品、标注发现并交付可点击证据。工作台采用深石墨色、暖金强调，以及可调整的聊天与影像画布。
 
-This README is written for the next coding agent or teammate taking over the project.
+## 本地启动
 
-## Current Project Direction
-
-Build a stable, usable intelligent remote-sensing interpretation tool for a student innovation project.
-
-Core direction:
-
-- Keep Mapbox high-resolution basemap as the default visual-detail workflow.
-- Add Sentinel-2 L2A recent public imagery as an optional traceable source.
-- Keep only two analysis modes:
-  - `precise`: `glm-5.3-flash` controller + `qwen3-vl-plus`
-  - `fast`: `glm-5.3-flash` controller + `qwen3-vl-flash`
-- Default mode is `precise`.
-- Focus on the product and analysis chain first. Do not prioritize slides, reports, or defense materials before the tool itself is stable.
-- Important product principle: users should not be forced to manually verify image-source suitability. The system should choose, validate, and explain image sources as much as possible.
-
-## Tech Stack
-
-- Backend: Django 5.2
-- Frontend: server-rendered HTML, plain JavaScript, Leaflet, local CSS
-- AI/VL: DashScope Qwen VL
-- Agent controller: GLM-5.3-Flash (BigModel API); `DEEPSEEK_API_KEY` is legacy compatibility only
-- Map source(影像源矩阵,2026-09-10 扩展):
-  - 高清底图(参考级):Mapbox / 天地图 / Esri World Imagery,瓦片拼接下载
-  - Sentinel-2 L2A through Element84 Earth Search + TiTiler(同平台含 sentinel-2-c1-l2a / l1c)
-  - Sentinel-1 GRD SAR(全天候)与 Copernicus DEM GLO-30(地形),同一 STAC+TiTiler 管线
-  - NASA GIBS 每日宏观底图(前端图层)
-- Agent 证据工具(2026-09-10 新增):NASA FIRMS 火点、OSM Overpass 地物语义、Open-Meteo 气象、JRC GSW 水体基线、ESA WorldCover 土地覆盖
-- Reports: `python-docx`
-- Database: SQLite in local dev
-
-There is no frontend build step.
-
-## Project Layout
-
-```text
-manage.py                     Django entrypoint (loads .env first)
-start.py                      User-facing launcher (auto-opens browser, --noreload)
-requirements.txt              Curated dev dependencies (core + optional extras)
-requirements-prod.txt         Minimal production dependencies
-README.md                     This file: product direction, setup, verification
-CLAUDE.md                     Agent-oriented implementation deep dive
-DEPLOY.md                     Alibaba Cloud ECS deployment runbook
-
-satellite_map/                Django project package
-  settings.py                 Env-driven settings (DEBUG/hosts/CSRF/CORS)
-  urls.py                     / (landing), /workbench/, /api/, /admin/
-  env.py                      Shared .env loader
-
-map_api/                      Single Django app with all backend logic
-  views.py                    HTTP layer + AI analysis pipeline + reports (~1.5k lines)
-  orchestrator.py             RemoteSensingAgent session orchestration
-  sentinel_pipeline.py        Sentinel-2 selection / mosaic / render fallback / cache
-  payloads.py                 Response payload builders + output normalization
-  geo_math.py                 Pure bbox/GSD/no-data-crop math (no Django deps)
-  media_paths.py              SAVE_DIR/REPORT_DIR + path-traversal guard
-  middleware.py               Per-IP rate limiting for paid API endpoints
-  models.py                   ChatHistory, DownloadTask, ImageryScene, AgentSession
-  urls.py                     /api/ routes
-  tests.py                    162 tests: units + mocked Sentinel/Agent/report integration
-  imagery_sources/            Provider abstraction: mapbox.py, earth_search.py
-  utils/                      Download, preprocessing, query analysis, RemoteCLIP,
-                              active perception, analysis strategy, Agent tools
-  management/commands/
-    smoke_pipeline.py         Project-level acceptance check
-    cleanup_stale_tasks.py    Mark zombie downloads error; release stale Agent leases for recovery
-    cleanup_media.py          Age-based media cleanup (+ DB record sync)
-
-templates/
-  home.html                   Landing page (route /)
-  browser.html                Main workbench page (route /workbench/)
-  design.html                 SPECTRA design-system reference page (route /design/)
-
-static/
-  home.css / home.js          Landing page assets (Three.js globe via CDN)
-  browser.css / browser.js    Workbench UI styling and logic
-  workbench-ui.js             Workbench micro-interactions
-  design.css / design.js / spectra.css   Design page assets
-  remixicon.css / .woff2      Local icon assets
-
-deploy/                       nginx config + Gunicorn/Agent worker systemd units for the ECS
-scripts/                      One-off utilities (RemoteCLIP weight download)
-
-models/                       RemoteCLIP weights, ignored by git
-media/                        Runtime images/reports/logs, ignored by git
-output/                       Screenshots/logs, ignored by git
-test-results/                 Playwright/test artifacts, ignored by git
-```
-
-Use the conda Python environment explicitly:
+当前项目隔离环境位于 `.codex-runtime/venv/`，无需修改全局 Python。首次配置先安装 `requirements-v3.txt`，前端使用 Node 和 npm：
 
 ```powershell
-C:\Users\Lenovo\anaconda3\envs\general\python.exe
+.\.codex-runtime\venv\Scripts\python.exe -m pip install -r requirements-v3.txt
+npm --prefix frontend ci
+npm --prefix frontend run build
+.\.codex-runtime\venv\Scripts\python.exe manage.py migrate
+.\.codex-runtime\venv\Scripts\python.exe start.py
 ```
 
-## Environment Variables
+`start.py` 同时运行 Django 和持久化 V3 worker；打开 `http://127.0.0.1:8000/`。可用 `--port 8013 --no-browser` 指定端口。Ctrl+C 收尾子进程；重启后 worker 接管过期租约。启动器只检查待执行迁移，不会自动更改已有数据库。
 
-Secrets live in `.env`, which is ignored by git.
+开发前端时运行 `npm --prefix frontend run dev`，Vite 将 `/api` 代理到本地 Django。Django 入口使用已构建的 `static/v3/`，修改 TS/CSS 后须重新构建。新工作台 `/`、`/workbench/`、`/agent/` 相同；旧页面保留在 `/legacy/` 和 `/legacy/workbench/`。
 
-Required or useful keys:
+## 运行配置
 
-```text
-MAPBOX_TOKEN=...
-DASHSCOPE_API_KEY=...
-DEEPSEEK_API_KEY=...
-AMAP_KEY=...
-TITILER_ENDPOINT=https://titiler.xyz
-FIRMS_MAP_KEY=...        # 可选,NASA FIRMS 火点工具(免费申请);缺失时该工具不可用
-TIANDITU_KEY=...         # 可选,天地图影像底图源;缺失时该源不可用
-```
+应用通过既有环境加载器读取配置；不要将实际密钥写入源码、报告或命令日志。
 
-Sentinel tuning knobs:
+| 变量 | 用途 |
+| --- | --- |
+| `DEEPSEEK_API_KEY` | 主控 `deepseek-flash`，原生工具调用和图像输入 |
+| `DASHSCOPE_API_KEY` | 视觉复核；基线 `qwen3-vl-plus` |
+| `V3_VISION_MODEL` | 经过评测后覆盖视觉角色配置 |
+| `DJANGO_DEBUG` | 本地开发设为 `1`；关闭时启动器先 collectstatic |
+| `COG_READ_MODE=small_ranges` | 对大 Range 响应截断的网络，直接使用严格校验的 64 KiB 原始数据请求 |
+| `V3_COG_PROXY` | COG 分块下载（rasterio 与 range_reader）走指定 HTTP 代理（如 `http://127.0.0.1:7897`），可选 `V3_COG_PROXYUSERPWD` 提供代理认证；默认直连 |
+| `V3_PYTHON_RUNTIME=local` | Python 分析执行环境；可显式设为 `docker` |
+| `V3_DATABASE_ENGINE=postgis` | 启用 PostgreSQL/PostGIS，默认本地 SQLite |
+| `PGHOST`、`PGPORT`、`PGDATABASE`、`PGUSER`、`PGPASSWORD` | PostgreSQL 连接配置 |
 
-```text
-SENTINEL_MIN_COVERAGE_RATIO=0.92
-SENTINEL_MIN_VALID_IMAGE_RATIO=0.88
-SENTINEL_MAX_MOSAIC_CANDIDATES=6
-AGENT_SENTINEL_CANDIDATE_LIMIT=15
-```
+`GET /api/v3/capabilities` 返回模型配置、数据工具和当前执行环境状态；默认 `execution` 为 `local`，同时保留兼容的 `sandbox` 字段。注册数据源不等于服务在线，也不等于当前影像满足质量要求。
 
-Rate limiting (protects paid endpoints; per IP per minute):
+## 数据与执行
 
-```text
-RATELIMIT_API_PER_MINUTE=120
-RATELIMIT_AI_PER_MINUTE=30
-# database 为默认值，多个 Web worker 共享同一令牌桶；本地纯演示可设 memory
-RATELIMIT_BACKEND=database
-# RATELIMIT_DISABLED=1    # demo mode only
-# 生产建议由持久化 worker 执行 Agent，避免 Web 进程重启丢任务：
-AGENT_EXECUTION_MODE=queue
-```
+- 输入支持分块恢复上传，单文件上限 1 GiB。保留原始字节和 SHA-256，后台生成分块 TIFF、预览与金字塔；浏览器只请求视口瓦片。
+- 对话按 owner 隔离，消息、空间附件、观察、运行、证据和产物均可追溯。SSE 支持游标重放；中途补充和 FIFO 队列持久化。
+- 主控自主选择工具；按需加载影像、背景证据和分析能力。概览、原始窗口、位置标注、覆盖检查与引用验证形成空间问答链。
+- 默认每任务 120 分钟、128 次主控、128 次视觉调用，最多 4 个空间工具和 2 个 Python 任务并发。预算耗尽保留检查点，追加预算后继续。
+- 已实现 Sentinel-2/Landsat 光谱指数、Landsat Level-2 ST_B10、DEM 地形、SAR 校准门禁、两期指数差异、同日同源拼接，以及水体/地类/道路/火点/气象背景查询。
+- 大图数值处理逐块执行，原始比例与显示缩放分离。COG 读取失败不会用缩略图伪装数值产品。变化仅在共同有效像元上计算，输出候选与覆盖限制。
+- 工具在分块边界检查时限和租约。底层网络调用另有限时；取消不承诺立即终止已经发出的远程请求。Python 分析默认由项目本地 Python 子进程执行，单次默认 120 秒，结果继续记录代码、输入和产物哈希。
+- 附件原始文件、派生瓦片与观察预览落在 `media/v3-assets/`，**只会增长，目前没有对应的清理命令**（2026-09-14 实测 2.3 GB）。旧链路的 `media/satellite_imgs` 与 `media/reports` 由 `manage.py cleanup_media` 清理。
 
-`queue` 模式下，Agent 调查、Mapbox 影像下载和 Word 报告都会先持久化到数据库，再由
-`run_agent_worker` 执行。Web 进程重启不会丢失任务；报告 worker 被中断后，
-过期租约会被后续 worker 接管。影像先写 worker 专属临时文件，通过所有权
-校验后才原子切换为正式图片，旧 worker 不能覆盖接管者结果。
+## 本地 Python、Docker 与 PostGIS
 
-Defaults are defined in `map_api/sentinel_pipeline.py`, `map_api/orchestrator.py` and `map_api/middleware.py`. Do not commit real API keys.
+Docker 不是启动工作台、聊天、地图、影像处理、数据产品或 Python 分析的前提。默认 `V3_PYTHON_RUNTIME=local`，使用项目本地 Python 子进程，继承本机能够访问的网络与文件权限；Docker 只在需要本地 PostGIS 服务或显式设置 `V3_PYTHON_RUNTIME=docker` 使用容器化分析时使用。
 
-## Run Locally
-
-First-time setup (core dependencies only; RemoteCLIP extras are optional):
+可选的 Docker/PostGIS 环境：
 
 ```powershell
-C:\Users\Lenovo\anaconda3\envs\general\python.exe -m pip install -r requirements.txt
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py migrate
+docker compose -f docker/compose.v3.yml up -d database
+docker compose -f docker/compose.v3.yml --profile build build analysis-image
 ```
 
-Start the dev server:
+本地 compose 的数据库仅绑定 `127.0.0.1:5433`，使用开发 trust 认证；不能把该配置直接用于生产。首次启用设置 `PGPORT=5433` 和 `V3_DATABASE_ENGINE=postgis` 后执行迁移。迁移 0027 创建空间列和 GiST 索引。现有 SQLite 不会被自动导入 PostgreSQL；未启用 PostGIS 时，默认 SQLite 路径仍可运行完整本地工作台。
+
+可选分析镜像使用禁网、只读、CPU/内存/进程限制，并仅挂载已授权输入。它用于可复现的容器化分析，不决定本地功能是否可用。无论执行环境如何，代码、输入引用和产物哈希都会随运行保存。
+
+## 历史迁移
+
+先备份，再进行显式迁移：
 
 ```powershell
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py runserver 127.0.0.1:8000
+.\.codex-runtime\venv\Scripts\python.exe manage.py backup_v3_history
+.\.codex-runtime\venv\Scripts\python.exe manage.py migrate_v3_history
+.\.codex-runtime\venv\Scripts\python.exe manage.py migrate_v3_history --apply
 ```
 
-Open:
+仅采用已有数据库关联；不按相似文本或文件名猜测合并。原记录和原文件保留，迁移映射幂等。具体备份核对、未归属记录和回切说明见 [实施记录](docs/V3_IMPLEMENTATION.md)。
 
-```text
-http://127.0.0.1:8000/             Landing page
-http://127.0.0.1:8000/workbench/   Analysis workbench
-```
-
-UI 迭代注意（2026-09-09 实测）：`.env` 未设 `DJANGO_DEBUG` 时按 false 运行——模板被
-进程内缓存、`/static/` 改由 `STATIC_ROOT`（staticfiles/）提供。因此改模板需重启进程、
-改静态文件需再跑 `collectstatic` 才生效；纯前端截图迭代推荐直接设 `DJANGO_DEBUG=1`
-启动（模板与 static/ 都实时生效），验完再用默认模式复核一遍。
-
-Alternative user-facing launcher:
+## 验证
 
 ```powershell
-C:\Users\Lenovo\anaconda3\envs\general\python.exe start.py
+.\.codex-runtime\venv\Scripts\python.exe manage.py check
+.\.codex-runtime\venv\Scripts\python.exe manage.py makemigrations --check --dry-run
+.\.codex-runtime\venv\Scripts\python.exe manage.py test map_api --noinput
+npm --prefix frontend test
+npm --prefix frontend run build
+.\.codex-runtime\venv\Scripts\python.exe scripts/verify_v3_interactions.py
+.\.codex-runtime\venv\Scripts\python.exe -X utf8 scripts/verify_local_agent.py
+.\.codex-runtime\venv\Scripts\python.exe scripts/validate_real_v3_products.py
 ```
 
-## Deployment Notes
+浏览器验收需要本地 8000 工作台与 worker；脚本检查真实瓦片内容、框选、滑杆、刷新、IME 与窄屏，失败以非零退出。真实产品验收联网读取原始公开 COG，会产生真实网络耗时。
 
-Full deployment steps are in `DEPLOY.md`.
+**2026-09-14 实测基线**（`.codex-runtime/venv`）：`manage.py check` 无问题；`makemigrations --check` No changes detected；后端 `test map_api` → **608 tests OK**（55s）；前端 `npm test` → **24 passed**，`npm run typecheck` 无错误；`smoke_pipeline` → 5 步 ok、0 步 failed。
 
-The current Alibaba Cloud ECS deployment reuses the verified ERP server access
-notes from `D:\Projects\AAAprojects\ERP\README.md`:
+实现细节（模块分工、API 路由全表、环境变量全集、约束与已知限制）见 [CLAUDE.md](CLAUDE.md)；协作约定与前端基线见 [AGENTS.md](AGENTS.md)。
+
+`verify_local_agent.py` 使用真实模型读取港区影像并执行本地 Python，生成统计 JSON 与图表；独立核对原图像元均值、证据引用和产物哈希。它会调用已配置的模型服务并保存测试会话。结果保存在 `output/ui-review/v3-local-agent-results.json`。
+
+模型评测参见 [评测说明](evaluation/v3/README.md)。已存在的 120 题 direct-vision 结果不等于新旧 harness 对照，也不包含定位或多轮真值；未通过晋升条件时保留当前视觉基线。真人可用性测试与生产部署另有明确验收边界，不将代理测试冒充真人结果。
+
+## 工程结构
 
 ```text
-Server: root@101.200.128.20
-SSH key path: D:\Projects\AAAprojects\ERP\.codex-ssh\huixianglian_deploy_ed25519
-SatelliteSense URL: http://101.200.128.20:8083/
-Gunicorn internal bind: 127.0.0.1:8010
-Server project directory: /opt/satellitesense
+frontend/src/                 React 19 / TypeScript / OpenLayers 工作台
+map_api/v3/                   会话 API、harness、工具、原始影像、沙箱
+map_api/management/commands/   worker、迁移、备份与评测命令
+evaluation/v3/                公开题库、来源、评分与逐题结果
+docker/                       PostGIS 本地环境与分析镜像
+scripts/                      浏览器和真实数据验收
+static/v3/                    Vite 构建产物
 ```
 
-Important coexistence rule:
-
-- `http://101.200.128.20/` is the existing ImageFlow site.
-- `http://101.200.128.20/showcase/` is the ERP showcase.
-- Do not overwrite the server root nginx route or the `/showcase/` route.
-- Deploy SatelliteSense on port `8083` or another user-confirmed port greater
-  than or equal to `8083`.
-- Never commit, upload, paste, or print the private SSH key content.
-
-## Verification Commands
-
-Use these before handing off meaningful changes:
-
-```powershell
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py check
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py test map_api
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline
-node --check static\browser.js
-```
-
-Optional live dependency checks:
-
-```powershell
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-mapbox
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-sentinel
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-ai
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --agent
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-sentinel1
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-firms
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-esri
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline --live-tianditu
-```
-
-Default `smoke_pipeline` is mocked and does not call paid/network AI services. Live flags depend on external APIs and quota.
-
-## Main User Flows
-
-### 1. Manual Region Analysis
-
-1. User draws a region on the map.
-2. Frontend chooses image source from the top controls:
-   - `高清底图 / Mapbox`
-   - `近期公开影像 / Sentinel-2`
-3. Backend downloads or renders an image.
-4. Region card appears in the right workspace.
-5. User enters the analysis cabin.
-6. User asks questions.
-7. Backend calls Qwen VL through `/api/ai/query-region/`.
-8. History and report generation reuse the same scene metadata.
-
-### 2. Agent Investigation
-
-User can type something like:
-
-```text
-帮我调查南宁市在2026年四月的水体情况
-```
-
-The controlled Agent flow:
-
-1. Create `AgentSession`.
-2. GLM-5.3-Flash parses goal into structured slots.
-3. Gaode resolves place to administrative bbox.
-4. Agent picks image source.
-5. Sentinel-2 is used for water, vegetation, agriculture, land-use, timeliness, and change-screening tasks.
-6. Mapbox is used for small targets, buildings, roads, and detail-heavy questions.
-7. Sentinel imagery is retrieved and quality-checked.
-8. Water tasks compute lightweight NDWI.
-9. Qwen VL interprets image.
-10. GLM-5.3-Flash reviews the final conclusion; Qwen VL remains the primary specialist interpreter.
-11. User can generate a Word report after completion.
-
-The frontend shows a Codex-like public progress view: current stage, what the Agent is doing, and next step. Do not expose private chain-of-thought.
-
-## Key Routes
-
-Pages:
-
-```text
-GET  /                             Landing page (home.html)
-GET  /workbench/                   Analysis workbench (browser.html)
-GET  /admin/                       Django admin
-```
-
-APIs:
-
-```text
-GET  /api/system/health/
-GET  /api/analysis/indices/
-POST /api/satellite/get-img/
-POST /api/satellite/get-sentinel-img/
-GET  /api/satellite/show-img/?file=...
-GET  /api/satellite/progress/?file=...
-POST /api/satellite/cleanup/
-GET  /api/imagery/search/
-GET/POST /api/imagery/recommend-source/
-GET  /api/imagery/scenes/
-GET  /api/imagery/scenes/<id>/
-GET/POST /api/agent/sessions/
-GET  /api/agent/sessions/<id>/
-POST /api/agent/sessions/<id>/messages/
-POST /api/ai/query-region/
-GET/POST /api/ai/history/
-GET/DELETE /api/ai/history/<id>/
-GET  /api/geo/search/?q=...
-POST /api/report/generate/
-GET  /api/report/download/?file=...
-```
-
-## Sentinel-2 Handling Notes
-
-This part is critical. A recent bug showed large black areas in Sentinel previews. The root cause was not frontend CSS. Sentinel-2 scenes are split into tiles/granules; if a user bbox crosses scene coverage, TiTiler may render uncovered parts as black no-data pixels.
-
-Current hardening:
-
-- Default target coverage is high: `0.92`.
-- Default valid rendered pixel ratio is high: `0.88`.
-- Default candidate pool is `10` for the public endpoint.
-- The Agent uses a larger candidate pool through `AGENT_SENTINEL_CANDIDATE_LIMIT`.
-- Single-scene renders with large edge no-data are rejected.
-- Multi-scene mosaics are attempted when one scene does not cover the bbox.
-- If a mosaic still has large no-data edges, the request fails and tells the user to shrink range, expand dates, or switch to Mapbox.
-- Tiny edge crop is allowed only for small rendering artifacts. Large crop is treated as coverage failure.
-
-Relevant functions (in `map_api/sentinel_pipeline.py` and `map_api/geo_math.py`; all re-exported from `map_api/views.py`):
-
-```text
-select_sentinel_scene_candidates
-greedy_cover_sentinel_candidates
-sentinel_retrieval_result
-compose_sentinel_mosaic
-crop_sentinel_nodata_border
-sentinel_nodata_crop_too_large
-postprocess_cached_sentinel_scene
-```
-
-When debugging Sentinel results, inspect:
-
-```text
-scene.metadata.target_coverage_ratio
-scene.metadata.valid_image_ratio
-scene.metadata.no_data_crop
-scene.metadata.mosaic_candidates
-scene.metadata.render_fallback_errors
-```
-
-## Model Modes
-
-Frontend model selection must stay simple:
-
-```text
-precise -> qwen3-vl-plus
-fast    -> qwen3-vl-flash
-```
-
-Agent controller:
-
-```text
-glm-5.3-flash
-```
-
-If `GLM_API_KEY` is missing, Agent creation should fail clearly. `DEEPSEEK_API_KEY` may be read only for legacy deployments. Do not silently fall back to rule-only planning for Agent mode.
-
-## Frontend Design State
-
-Two server-rendered pages, no build step:
-
-- `/` is a lightweight landing page (`home.html` + `static/home.css` / `home.js`) with a Three.js globe loaded from CDN; it links into the workbench.
-- `/workbench/` is the actual tool (`browser.html` + `static/browser.css` / `browser.js`).
-
-The workbench UI is a dense GIS workbench:
-
-- Left sidebar: Agent console
-- Center: map workspace
-- Right sidebar: selected regions/history/workspace
-- Analysis cabin/modal: image preview + chat + compact metadata
-
-Recent design fixes:
-
-- Removed most emoji controls.
-- Uses local Remix Icon assets.
-- Custom dropdowns replace ugly native selects.
-- Analysis cabin text was reduced.
-- Prompt presets are compact chips.
-- Modal scrollbars are dark and subtle.
-- Sidebar collapse buttons have stable positions.
-- Image previews use `object-fit: contain` where aspect ratio matters.
-- 2026-09-09 基线内极致精修：工作台空状态雷达/准星仪器动画、链路状态 pill、地图边缘电影暗角、历史记录 hover 金条指示、spectral-chip 过渡补全；首页 Hero/章节文字深空投影、能力卡片 hover 斜切扫光、Agent 流程条级联流光。实现见 `static/home.css` 末尾「极致精修层」与 `static/browser.css` 对应区块；截图工具 `scripts/shot_ui.py`。
-
-Before changing UI heavily, verify with browser screenshots or at least reload `http://127.0.0.1:8000/` and check desktop/mobile/modal states.
-
-## Known Constraints
-
-- First Agent version uses administrative bbox screening, not exact polygon clipping.
-- Sentinel-2 is 10 m class imagery. It is not suitable for counting vehicles, small buildings, roof materials, or narrow road details.
-- Mapbox has better visual detail, but lacks traceable acquisition date/cloud/product metadata.
-- Sentinel-2 is traceable and recent, but clouds, no-data edges, spatial resolution, and revisit cycle limit confidence.
-- NDWI is a lightweight screening metric only. It is not a formal water-body mapping product.
-- Sentinel-1 SAR(2026-09-10 新增)是全天候雷达影像:非光学,VL 解译可靠性低,结论限水体/淹没与宏观地物;不支持光谱指数。
-- Cop-DEM(2026-09-10 新增)是静态高程模型(采集基线 2011-2015),只作地形参考,不代表拍摄时相地表状态。
-- 天地图/Esri(2026-09-10 新增)与 Mapbox 同为参考级底图:无拍摄时间与传感器 GSD,不进入物理测量;Esri 免费条款限非营收且需署名,天地图需 key 且有日配额。
-- FIRMS 火点工具需 FIRMS_MAP_KEY;GSW/WorldCover 为历史静态产品,不作近实时判断。
-- Generated Word reports should not contain Markdown-style formulas if future formulas are added.
-
-## Git / Artifact Hygiene
-
-Ignored runtime artifacts:
-
-```text
-media/
-output/
-test-results/
-db.sqlite3
-.env
-design-qa.md
-```
-
-Do not commit:
-
-- API keys
-- downloaded/generated satellite images
-- Word reports
-- Playwright screenshots
-- local QA image comparisons
-- SQLite dev database
-
-Commit code, migrations, local static assets, tests, and docs.
-
-## Recent Verified State
-
-Most recent handoff checks(2026-09-10,数据源扩展 M0-M2 完成后):
-
-```powershell
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py check
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py test map_api    # Ran 449 tests OK
-C:\Users\Lenovo\anaconda3\envs\general\python.exe manage.py smoke_pipeline  # passed (mocked)
-node --check static\browser.js
-```
-
-All passed. `smoke_pipeline --live-esri` 真调通过(瓦片拼接落盘+场景卡片);`--live-sentinel1` 旗标就绪;`--live-firms`/`--live-tianditu` 需配置对应 key 后真调。改动静态文件后已跑 collectstatic。
-
-## Handoff Advice For The Next Agent
-
-1. Read `README.md` first, then `CLAUDE.md` for extra historical implementation detail.
-2. Check `git status --short` before editing.
-3. Use the conda Python absolute path.
-4. If a user reports a visual problem, first decide whether it is frontend display or backend image content. For Sentinel black regions, suspect coverage/mosaic/no-data before CSS.
-5. If touching Sentinel selection, add tests around coverage, valid image ratio, and no-data crop behavior.
-6. If touching Agent, preserve the public observer timeline but do not expose hidden chain-of-thought.
-7. If touching UI, keep it compact and tool-like; this is a remote-sensing workbench, not a landing page.
+旧工作台及服务器维护资料完整保留于 [Legacy 文档](docs/LEGACY_WORKBENCH.md)。[DEPLOY.md](DEPLOY.md) 中的旧服务配置须经过 V3 候选部署验收后再切换；本次未进行生产部署。

@@ -19,8 +19,11 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      # 必须装 requirements-v3.txt（= requirements.txt + rasterio/pyproj/shapely/scipy/psycopg）：
+      # map_api/test_v3_*.py 在模块层 import rasterio，缺它测试发现阶段就报
+      # ModuleNotFoundError、整轮 FAILED (errors=1)。
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-v3.txt
 
       - name: Unit tests
         run: python manage.py test map_api

@@ -120,6 +120,12 @@ class OsmTests(SimpleTestCase):
         headers = post.call_args.kwargs.get("headers") or {}
         assert headers.get("User-Agent")
 
+    def test_partial_or_invalid_overpass_results_do_not_become_zero_counts(self):
+        for payload in ({"remark": "runtime error: Query timed out", "elements": []}, {"elements": []}, {}):
+            with self.subTest(payload=payload), _no_circuit(), patch.object(external_data.requests, "post", return_value=_response(json_data=payload)):
+                with self.assertRaises(ValueError):
+                    query_osm_context(BBOX)
+
 
 class WeatherTests(SimpleTestCase):
     def test_forecast_series_and_code_mapping(self):
@@ -138,6 +144,24 @@ class WeatherTests(SimpleTestCase):
         assert get.call_args.args[0] == external_data.OPENMETEO_ARCHIVE_URL
         assert get.call_args.kwargs["params"]["start_date"] == "2026-08-01"
         assert get.call_args.kwargs["params"]["end_date"] == "2026-08-01"
+        self.assertNotIn("precipitation_probability_max", get.call_args.kwargs["params"]["daily"])
+
+    def test_archive_range_and_missing_days_are_explicit(self):
+        payload = {**OPENMETEO_FORECAST_JSON, "daily": {**OPENMETEO_FORECAST_JSON["daily"], "precipitation_sum": [None, 12.4]}}
+        with _no_circuit(), patch.object(external_data.requests, "get", return_value=_response(json_data=payload)) as get:
+            data = query_weather_context(39.9, 116.4, date_start="2026-09-03", date_end="2026-09-04")
+        self.assertEqual(get.call_args.kwargs["params"]["end_date"], "2026-09-04")
+        self.assertEqual(data["summary"]["day_count"], 2)
+        self.assertEqual(data["summary"]["precipitation_valid_day_count"], 1)
+        self.assertEqual(data["summary"]["precipitation_sum_mm"], 12.4)
+        self.assertIn("bbox 中心点", data["limitations"][0])
+
+    def test_weather_empty_or_misaligned_daily_data_is_rejected(self):
+        bad = {**OPENMETEO_FORECAST_JSON, "daily": {**OPENMETEO_FORECAST_JSON["daily"], "temperature_2m_max": [30.1]}}
+        for payload in ({"daily": {}}, bad):
+            with self.subTest(payload=payload), _no_circuit(), patch.object(external_data.requests, "get", return_value=_response(json_data=payload)):
+                with self.assertRaises(ValueError):
+                    query_weather_context(39.9, 116.4)
 
 
 GSW_PALETTE = {"80": [0, 0, 150, 255], "30": [100, 200, 255, 255], "0": [255, 255, 150, 255]}
@@ -174,7 +198,8 @@ class WaterBaselineTests(SimpleTestCase):
         url = fetch.call_args.args[0]
         assert "occurrence_110E_40Nv1_4_2021.tif" in url
         assert fetch.call_args.kwargs["kind"] == "palette"
-        assert data["tile_partial"] is False
+        assert data["coverage_complete"] is True
+        assert data["tile_count"] == 1
 
     def test_cross_tile_marks_partial(self):
         values = np.full((16, 16), 80, dtype=np.float32)
@@ -182,15 +207,17 @@ class WaterBaselineTests(SimpleTestCase):
         cog_patch, colormap_patch = _palette_mocks(values, GSW_PALETTE)
         with cog_patch, colormap_patch:
             data = query_water_baseline(bbox)
-        assert data["tile_partial"] is True
-        assert "跨 GSW 瓦片" in data["tile_note"]
+        assert data["coverage_complete"] is True
+        assert data["tile_count"] == 4
+        assert "全部 GSW 瓦片" in data["tile_note"]
 
     def test_missing_tile_returns_unavailable(self):
         err = requests.exceptions.HTTPError("404")
         with patch.object(external_data, "fetch_cog_bbox_array", side_effect=err):
             data = query_water_baseline(BBOX)
         assert data["available"] is False
-        assert "无 GSW 覆盖" in data["reason"]
+        assert data["coverage_complete"] is False
+        assert data["failed_tiles"]
 
 
 class LandcoverTests(SimpleTestCase):

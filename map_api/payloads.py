@@ -96,6 +96,15 @@ def imagery_quality_payload(scene):
             "SAR 非光学影像，存在斑点噪声与几何畸变，视觉解译可靠性低于光学影像。",
             "结论限于水体/淹没与宏观地物，不支持光谱指数与细节判读。",
         ])
+    elif source == "landsat":
+        summary = "Landsat Collection 2 Level-2 地表反射率影像，可回溯至 1982 年，经 Microsoft Planetary Computer 匿名签名访问。"
+        best_for = "适合历史回溯、宏观变化筛查和水体/植被长期对比。"
+        spatial_note = f"原始 GSD 约 {float(original_gsd):g} m/像素。" if original_gsd else "约 30m 级公开影像。"
+        cautions.extend([
+            "约 30m 空间分辨率，不适合小建筑、车辆等细节判读。",
+            "重访周期 16 天（双星约 8 天），时效性弱于 Sentinel-2。",
+            "匿名 SAS 签名有速率限制，服务可持续性依赖微软。",
+        ])
     elif source == "copdem":
         summary = "Copernicus DEM GLO-30 静态数字高程模型（采集基线 2011-2015）。"
         best_for = "适合地形、坡度、地势分析和水文背景判断。"
@@ -181,6 +190,14 @@ def analysis_confidence_payload(strategy=None, imagery_quality=None):
         label = "参考级"
         basis.append("Copernicus DEM 为静态地形数据（采集基线 2011-2015），不代表拍摄时相地表状态")
         required_checks.append("涉及时相变化或地表现状的结论需改用可追溯时相影像")
+    elif source == "landsat":
+        level = "screening"
+        label = "筛查级"
+        basis.extend([
+            "Landsat C2 L2 可追溯历史影像（1982 年起），经 Planetary Computer 匿名签名访问",
+            "30m 分辨率限制细节判读，结论限于宏观地物与变化线索",
+        ])
+        required_checks.append("细节目标需切换高清底图复核；重要结论建议结合 Sentinel-2 或现场资料复核")
     elif source == "sentinel2":
         basis.append(f"Sentinel-2 L2A 可追溯公开影像，{cloud}")
         if acquired_days is not None:
@@ -249,6 +266,7 @@ def source_recommendation_payload(strategy=None, imagery_quality=None, question=
     sentinel_macro_tasks = {"land_use", "water", "vegetation", "agriculture", "terrain_hazard"}
     flood_hit = task_key == "flood" or any(word in question_text for word in ("洪水", "洪涝", "淹没", "内涝", "汛情"))
     terrain_hit = task_key == "terrain" or any(word in question_text for word in ("地形", "坡度", "高程", "山地", "地势"))
+    history_hit = any(word in question_text for word in ("历史", "十年前", "五年前", "多年前", "往年", "上世纪", "回溯", "热岛"))
 
     if flood_hit:
         recommended_source = "sentinel1"
@@ -258,6 +276,10 @@ def source_recommendation_payload(strategy=None, imagery_quality=None, question=
         recommended_source = "copdem"
         label = "建议使用 Copernicus DEM 高程数据"
         reason = "问题涉及地形/坡度/高程，静态 DEM 更适合地势分析；注意其不代表拍摄时相地表状态。"
+    elif history_hit:
+        recommended_source = "landsat"
+        label = "建议使用 Landsat 历史回溯影像"
+        reason = "问题涉及历史回溯或多年前对比，Landsat Collection 2 存档可回溯至 1982 年（30m 分辨率，经 Planetary Computer 匿名签名访问），适合宏观变化筛查。"
     elif is_detail or entities & {"building", "road", "infrastructure", "vehicle"}:
         recommended_source = "mapbox"
         label = "建议使用高清底图"
@@ -267,7 +289,7 @@ def source_recommendation_payload(strategy=None, imagery_quality=None, question=
         label = "建议使用近期公开影像"
         reason = "问题偏宏观地类、水体、生态农业、地形灾害或变化筛查，Sentinel-2 的拍摄时间和云量更可追溯。"
     else:
-        recommended_source = source if source in ("mapbox", "tianditu", "esri", "sentinel2", "sentinel1", "copdem") else "mapbox"
+        recommended_source = source if source in ("mapbox", "tianditu", "esri", "sentinel2", "sentinel1", "copdem", "landsat") else "mapbox"
         label = "当前图像源可用于初步分析"
         reason = "问题未表现出强时效或强细节偏好，可先按当前图像源进行初步判读。"
 
@@ -285,6 +307,8 @@ def source_recommendation_payload(strategy=None, imagery_quality=None, question=
         action = "建议切换到 Sentinel-1 SAR 影像，全天候获取水体/淹没线索。"
     elif recommended_source == "copdem":
         action = "建议切换到 Copernicus DEM 高程数据进行地形分析。"
+    elif recommended_source == "landsat":
+        action = "建议切换到 Landsat 历史回溯影像（1982 年起，30m）进行宏观变化筛查。"
     else:
         action = "建议先补充图像源信息。"
 

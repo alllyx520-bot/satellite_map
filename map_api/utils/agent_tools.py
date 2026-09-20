@@ -17,10 +17,10 @@ from .http import request_proxies  # noqa: F401  # 唯一实现；此处保留�
 from ..remote_sensing_indices import ndwi as spectral_ndwi, summarize as summarize_index
 
 
-AGENT_MODEL = "glm-5.3-flash"
+# Agent 控制器默认模型:DeepSeek-V4.1-Flash(2026-09-11 切换);AGENT_PROVIDER=glm 可回退旧 GLM 链路。
+AGENT_MODEL = "deepseek-flash"
+DEEPSEEK_CHAT_URL = "https://api.deepseek.com/v1/chat/completions"
 GLM_CHAT_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-# 保留旧常量名/函数名作为兼容层，实际默认已切换到 GLM。
-DEEPSEEK_CHAT_URL = GLM_CHAT_URL
 NDWI_THRESHOLD = 0.1
 NDWI_MIN_VALID_PIXELS = 1024
 ZH_MONTHS = {
@@ -76,28 +76,66 @@ SEASONS = {
 
 
 def glm_headers():
-    api_key = os.environ.get("GLM_API_KEY", "").strip() or os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    api_key = os.environ.get("GLM_API_KEY", "").strip()
     if not api_key:
-        raise ValueError("缺少 GLM_API_KEY（兼容旧配置名 DEEPSEEK_API_KEY），请先在 .env 中配置")
+        raise ValueError("缺少 GLM_API_KEY（仅 AGENT_PROVIDER=glm 回退链路需要），请先在 .env 中配置")
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
 
-def call_glm(messages, response_format=None, timeout=45):
-    payload = {
+def deepseek_headers():
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("缺少 DEEPSEEK_API_KEY（Agent 控制器默认链路），请先在 .env 中配置")
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def agent_controller_settings():
+    """Agent 控制器的生效配置:url/model/headers/payload 附加参数。
+
+    默认 deepseek(DeepSeek-V4.1-Flash);AGENT_PROVIDER=glm 回退旧 GLM 链路。
+    注意 GLM 专有参数(thinking/reasoning_effort)不能发给 DeepSeek,DeepSeek 只收
+    OpenAI 兼容字段;deepseek-flash 实测支持 response_format json_object(2026-09-11)。
+    """
+    provider = os.environ.get("AGENT_PROVIDER", "deepseek").strip().lower()
+    if provider == "glm":
+        return {
+            "provider": "glm",
+            "label": "GLM",
+            "url": os.environ.get("GLM_CHAT_URL", GLM_CHAT_URL),
+            "model": os.environ.get("AGENT_MODEL", "glm-5.3-flash"),
+            "headers": glm_headers,
+            "payload_extra": {"temperature": 1, "top_p": 0.95,
+                              "reasoning_effort": "max",
+                              "thinking": {"type": "enabled", "clear_thinking": False}},
+        }
+    return {
+        "provider": "deepseek",
+        "label": "DeepSeek",
+        "url": os.environ.get("DEEPSEEK_CHAT_URL", DEEPSEEK_CHAT_URL),
         "model": os.environ.get("AGENT_MODEL", AGENT_MODEL),
+        "headers": deepseek_headers,
+        "payload_extra": {},
+    }
+
+
+def call_glm(messages, response_format=None, timeout=45):
+    """Agent 控制器调用(函数名为历史接缝,大量测试/调用方 patch 此名;实际 provider 由 AGENT_PROVIDER 决定,默认 deepseek)。"""
+    cfg = agent_controller_settings()
+    payload = {
+        "model": cfg["model"],
         "messages": messages,
-        "temperature": 1,
-        "top_p": 0.95,
-        "reasoning_effort": "max",
-        "thinking": {"type": "enabled", "clear_thinking": False},
+        **cfg["payload_extra"],
     }
     if response_format:
         payload["response_format"] = response_format
-    url = os.environ.get("GLM_CHAT_URL", os.environ.get("DEEPSEEK_CHAT_URL", GLM_CHAT_URL))
-    headers = glm_headers()
+    url = cfg["url"]
+    headers = cfg["headers"]()
     # 只对网络瞬断、超时和服务端过载重试一次；鉴权/请求参数错误立即失败，
     # 避免把确定性错误放大成重复计费或更长等待。
     last_error = None
@@ -132,18 +170,18 @@ def call_glm(messages, response_format=None, timeout=45):
                                 text_parts.append(value)
                     content = "\n".join(text_parts)
                 if not isinstance(content, str) or not content.strip():
-                    raise ValueError("GLM 响应缺少公开 content")
+                    raise ValueError(f"{cfg['label']} 响应缺少公开 content")
                 return content
-            last_error = requests.HTTPError(f"GLM HTTP {response.status_code}", response=response)
+            last_error = requests.HTTPError(f"{cfg['label']} HTTP {response.status_code}", response=response)
         if attempt == 0:
             time.sleep(0.35)
     if last_error:
         raise last_error
-    raise RuntimeError("GLM 请求失败")
+    raise RuntimeError(f"{cfg['label']} 请求失败")
 
 
 def call_glm_json(messages, image_urls=None, timeout=45):
-    """GLM-5.3-Flash JSON 调用，支持文本和 image_url 内容块。"""
+    """Agent 控制器 JSON 调用(默认 DeepSeek-flash)，支持文本和 image_url 内容块。"""
     enriched = []
     pending_images = list(image_urls or [])[:3]
     for message in messages:
@@ -182,14 +220,11 @@ def _parse_json_response(text):
             raise ValueError("模型 JSON 必须是对象")
         return value
     except (ValueError, TypeError) as exc:
-        raise ValueError("GLM 未返回有效 JSON") from exc
+        raise ValueError("模型未返回有效 JSON") from exc
 
 
-# 兼容旧调用方；新代码统一使用 GLM 命名，避免把实际 provider 误标成 DeepSeek。
-def deepseek_headers():
-    return glm_headers()
-
-
+# 历史别名(2026-09-11 前 DeepSeek 是旧链路、GLM 是主链路;现已反转:call_glm 是
+# 历史接缝名,deepseek_headers 是真实 DeepSeek 鉴权)。
 def call_deepseek(messages, response_format=None, timeout=45):
     return call_glm(messages, response_format=response_format, timeout=timeout)
 
@@ -312,6 +347,9 @@ def deterministic_extract_slots(goal, today=None):
     # 多云/阴天/夜间等光学受限条件:SAR 全天候兜底,同样不抢 flood/terrain。
     if any(word in text for word in ("多云", "阴天", "夜间成像", "全天候")) and slots["task"] not in ("flood", "terrain"):
         slots["source"] = "sentinel1"
+    # 明确的历史回溯/热岛需求优先于时效覆写:Landsat 存档(1982 年起,30m,热红外潜力)。
+    if any(word in text for word in ("历史", "十年前", "五年前", "多年前", "往年", "上世纪", "回溯", "热岛")) and slots["task"] not in ("flood", "terrain"):
+        slots["source"] = "landsat"
     if "flash" in lower_task or "快速" in text:
         slots["mode"] = "fast"
 
@@ -351,7 +389,7 @@ def merge_agent_slots(model_slots, goal, defaults=None, today=None):
     # “近期/最新/当前”没有明确年月时，以滚动窗口覆盖模型臆测的旧日期，
     # 避免模型返回任意历史月份导致 Sentinel-2 检索偏离用户真实意图。
     explicit_time = bool(re.search(r"\d{4}\s*年|\d{4}[-/]\d{1,2}|(?:春季|春天|夏季|夏天|秋季|秋天|冬季|冬天)", goal or ""))
-    if merged.get("needs_timeliness") and not explicit_time:
+    if merged.get("needs_timeliness") and not explicit_time and merged.get("source") != "landsat":
         merged["date_start"] = (today - timedelta(days=90)).isoformat()
         merged["date_end"] = today.isoformat()
         merged["time_granularity"] = "rolling_90d"
@@ -361,7 +399,7 @@ def merge_agent_slots(model_slots, goal, defaults=None, today=None):
         merged["task"] = rule_slots.get("task") or "land_use"
     if merged.get("source") == "earth_search":
         merged["source"] = "sentinel2"
-    if merged.get("source") not in ("sentinel2", "mapbox", "tianditu", "esri", "sentinel1", "copdem"):
+    if merged.get("source") not in ("sentinel2", "mapbox", "tianditu", "esri", "sentinel1", "copdem", "landsat"):
         task = merged.get("task")
         if task == "flood":
             merged["source"] = "sentinel1"
@@ -382,7 +420,7 @@ def build_agent_plan(goal, mode="precise", today=None):
                 "你是遥感智能调查 Agent 的任务规划器。"
                 "只返回 JSON，不要解释。字段包含 place_name,date_start,date_end,"
                 "time_granularity,task,source,needs_timeliness,mode。"
-                "source 只能是 sentinel2/mapbox/tianditu/esri/sentinel1/copdem：sentinel2 适合近期光学态势，mapbox 适合建筑道路细节；tianditu(天地图)同为高清底图，中国区行政区调查优先选用(合规)；esri(Esri World Imagery)同为高清底图，适合全球范围细节；洪水/淹没/多云/夜间等全天候需求用 sentinel1(SAR)，地形/坡度/高程用 copdem(静态 DEM)；mode 只能是 precise 或 fast。"
+                "source 只能是 sentinel2/mapbox/tianditu/esri/sentinel1/copdem/landsat：sentinel2 适合近期光学态势，mapbox 适合建筑道路细节；tianditu(天地图)同为高清底图，中国区行政区调查优先选用(合规)；esri(Esri World Imagery)同为高清底图，适合全球范围细节；洪水/淹没/多云/夜间等全天候需求用 sentinel1(SAR)，地形/坡度/高程用 copdem(静态 DEM)；历史回溯(1982 年起)/多年前对比/热岛背景用 landsat(30m，L2 地表反射率，热红外潜力)；mode 只能是 precise 或 fast。"
             ),
         },
         {"role": "user", "content": goal},
@@ -391,7 +429,7 @@ def build_agent_plan(goal, mode="precise", today=None):
     # wrapper 内部实际已转发到 GLM provider。
     model_slots = call_deepseek_json(messages)
     slots = merge_agent_slots(model_slots, goal, defaults={"mode": mode}, today=today)
-    task_strategy = build_analysis_strategy(goal, scene=type("Scene", (), {"source": slots["source"], "gsd_m": 10 if slots["source"] == "sentinel2" else 1.2})())
+    task_strategy = build_analysis_strategy(goal, scene=type("Scene", (), {"source": slots["source"], "gsd_m": {"sentinel2": 10, "sentinel1": 10, "copdem": 30, "landsat": 30}.get(slots["source"], 1.2)})())
     return {
         "slots": slots,
         "steps": [step for step in [
@@ -512,7 +550,7 @@ def resolve_district_bbox(place_name, timeout=12):
     }
 
 
-def fetch_cog_bbox_array(asset, bbox, titiler_endpoint, size=256, timeout=60, kind="reflectance", verify_grid=False):
+def fetch_cog_bbox_array(asset, bbox, titiler_endpoint, size=256, timeout=60, kind="reflectance", verify_grid=False, radiometry=None):
     """读取 Sentinel COG bbox，并按资产语义返回数组。
 
     反射率资产使用 STAC raster:bands 的 scale/offset；SCL 是离散分类栅格，
@@ -586,10 +624,15 @@ def fetch_cog_bbox_array(asset, bbox, titiler_endpoint, size=256, timeout=60, ki
     if nodata is not None:
         arr[arr == float(nodata)] = np.nan
     if kind != "scl":
-        if "scale" not in band or "offset" not in band:
-            raise ValueError("反射率资产缺少明确的 scale/offset")
-        scale = float(band["scale"])
-        offset = float(band["offset"])
+        if radiometry is not None:
+            # profile 级覆盖:2026-09-10 实测 Earth Search 部分 collection 的
+            # STAC scale/offset 与桶内实际 DN 语义不符(见 COLLECTION_PROFILES 注释)。
+            scale, offset = float(radiometry[0]), float(radiometry[1])
+        else:
+            if "scale" not in band or "offset" not in band:
+                raise ValueError("反射率资产缺少明确的 scale/offset")
+            scale = float(band["scale"])
+            offset = float(band["offset"])
         if not np.isfinite(scale) or not np.isfinite(offset) or scale <= 0:
             raise ValueError("反射率 scale/offset 无效")
         if scale != 1.0 or offset != 0.0:
@@ -688,30 +731,74 @@ def polygon_mask_for_bbox(polygon, bbox, shape):
     return mask
 
 
+def _radiometry_for(profile):
+    """profile 的 radiometry_override → (scale, offset) 元组;无覆盖返回 None(用资产元数据)。"""
+    override = (profile or {}).get("radiometry_override")
+    if override:
+        return float(override["scale"]), float(override["offset"])
+    return None
+
+
+def _qa_mask_source(candidate):
+    """按 collection profile 给出 QA 掩膜来源标识(写入结果 mask_source)。"""
+    from ..imagery_sources.earth_search import get_collection_profile
+    profile = get_collection_profile(getattr(candidate, "collection", None) or "sentinel-2-l2a")
+    return "qa_pixel_bitmask" if profile.get("qa_kind") == "bitmask" else "sentinel-2-scl"
+
+
+def _qa_valid_mask(qa_array, profile):
+    """qa_kind=="bitmask" 时按位剔除(任一 qa_bad_bits 置位即无效),否则按 SCL 类别。"""
+    if profile.get("qa_kind") == "bitmask":
+        bad_bits = 0
+        for bit in profile.get("qa_bad_bits") or []:
+            bad_bits |= 1 << int(bit)
+        filled = np.nan_to_num(qa_array, nan=0).astype(np.uint16)
+        return np.isfinite(qa_array) & (np.bitwise_and(filled, bad_bits) == 0)
+    return np.isfinite(qa_array) & np.isin(qa_array, [4, 5, 6, 7])
+
+
+def _sign_asset_for_collection(asset, profile):
+    """Planetary Computer 资产 href 需先经匿名 SAS 签名再交给 titiler 读取。"""
+    if profile.get("provider") == "planetary_computer":
+        from ..imagery_sources import get_provider
+        return get_provider("planetary_computer").sign_asset(asset)
+    return asset
+
+
 def _read_ndwi_inputs(candidate, bbox, titiler_endpoint):
-    # 无 SCL 的 collection(如 sentinel-2-l1c 兜底)显式拒绝,不做无掩膜 NDWI。
+    # 无 QA 波段的 collection(如 sentinel-2-l1c 兜底)显式拒绝,不做无掩膜 NDWI。
     from ..imagery_sources.earth_search import get_collection_profile
     collection = getattr(candidate, "collection", None) or "sentinel-2-l2a"
-    if get_collection_profile(collection).get("qa_band") is None:
+    profile = get_collection_profile(collection)
+    qa_band = profile.get("qa_band")
+    if qa_band is None:
         raise ValueError(f"{collection} 无 SCL 云掩膜，光谱指数不可用，请改用 L2A 影像")
     assets = candidate.assets or {}
-    missing = [name for name in ("green", "nir", "scl") if not (assets.get(name) or {}).get("href")]
+    band_aliases = profile.get("band_aliases") or {}
+    nir_key = band_aliases.get("nir", "nir")
+    picked = {
+        "green": assets.get("green") or {},
+        nir_key: assets.get(nir_key) or {},
+        qa_band: assets.get(qa_band) or {},
+    }
+    missing = [name for name, asset in picked.items() if not asset.get("href")]
     if missing:
         raise ValueError("候选影像缺少 " + ", ".join("SCL" if name == "scl" else name for name in missing) + " 资产")
-    green = fetch_cog_bbox_array(assets["green"], bbox, titiler_endpoint)
-    nir = fetch_cog_bbox_array(assets["nir"], bbox, titiler_endpoint)
-    scl = fetch_cog_bbox_array(assets["scl"], bbox, titiler_endpoint, kind="scl")
-    if scl.shape != green.shape or nir.shape != green.shape:
+    radiometry = _radiometry_for(profile)
+    green = fetch_cog_bbox_array(_sign_asset_for_collection(picked["green"], profile), bbox, titiler_endpoint, radiometry=radiometry)
+    nir = fetch_cog_bbox_array(_sign_asset_for_collection(picked[nir_key], profile), bbox, titiler_endpoint, radiometry=radiometry)
+    qa = fetch_cog_bbox_array(_sign_asset_for_collection(picked[qa_band], profile), bbox, titiler_endpoint, kind="scl")
+    if qa.shape != green.shape or nir.shape != green.shape:
         raise ValueError("波段与 SCL 网格尺寸不一致")
-    return green, nir, np.isfinite(scl) & np.isin(scl, [4, 5, 6, 7])
+    return green, nir, _qa_valid_mask(qa, profile)
 
 
-def _ndwi_product(green, nir, qa, bbox, polygon, threshold):
+def _ndwi_product(green, nir, qa, bbox, polygon, threshold, mask_source="sentinel-2-scl"):
     polygon_mask = polygon_mask_for_bbox(polygon, bbox, green.shape) if polygon else None
     valid_mask = qa.copy()
     if polygon_mask is not None:
         valid_mask &= polygon_mask
-    calibrated = np.isfinite(green) & np.isfinite(nir) & (green >= 0) & (nir >= 0) & (green <= 1) & (nir <= 1)
+    calibrated = np.isfinite(green) & np.isfinite(nir) & (green >= -1e-6) & (nir >= -1e-6) & (green <= 1 + 1e-6) & (nir <= 1 + 1e-6)
     reflectance_rejected = int((valid_mask & ~calibrated).sum())
     valid_mask &= calibrated
     aoi_count = int(polygon_mask.sum()) if polygon_mask is not None else green.size
@@ -720,7 +807,7 @@ def _ndwi_product(green, nir, qa, bbox, polygon, threshold):
         raise ValueError("AOI 内有效像元低于 60%，不能输出水体比例")
     result = compute_ndwi_from_arrays(green, nir, threshold=threshold, valid_mask=valid_mask)
     result.update({
-        "mask_source": "sentinel-2-scl+aoi+nodata" if polygon_mask is not None else "sentinel-2-scl+nodata",
+        "mask_source": f"{mask_source}+aoi+nodata" if polygon_mask is not None else f"{mask_source}+nodata",
         "masked_pixel_count": int((~usable).sum()), "aoi_pixel_count": aoi_count,
         "invalid_reflectance_pixel_count": reflectance_rejected,
         "valid_pixel_ratio": round(int(usable.sum()) / aoi_count, 4),
@@ -746,7 +833,7 @@ def _ndwi_error(exc):
 
 def compute_ndwi_summary(candidate, bbox, titiler_endpoint=None, threshold=NDWI_THRESHOLD, polygon=None):
     try:
-        return _ndwi_product(*_read_ndwi_inputs(candidate, bbox, titiler_endpoint), bbox, polygon, threshold)
+        return _ndwi_product(*_read_ndwi_inputs(candidate, bbox, titiler_endpoint), bbox, polygon, threshold, mask_source=_qa_mask_source(candidate))
     except Exception as exc:
         return _ndwi_error(exc)
 
@@ -776,7 +863,7 @@ def compute_ndwi_mosaic_summary(candidates, bbox, titiler_endpoint=None, thresho
             green[new], nir[new] = g[new], n[new]
             covered |= new
             contributions.append({"product_id": getattr(candidate, "product_id", ""), "contributed_pixels": int(new.sum())})
-        result = _ndwi_product(green, nir, covered, bbox, polygon, threshold)
+        result = _ndwi_product(green, nir, covered, bbox, polygon, threshold, mask_source=_qa_mask_source(candidates[0]))
         result.update({"aggregation": "同一目标网格逐像元合成，重叠像元只统计一次",
                        "candidate_count": len(candidates), "candidate_summaries": contributions,
                        "acquisition_dates": date_ids, "temporal_consistency": "same_date",

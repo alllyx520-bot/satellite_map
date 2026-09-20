@@ -18,8 +18,8 @@
   --void-3: #171C2B;
 
   /* 光谱语义色（日珥金体系）：每种颜色都有物理出处 */
-  --gold: #E4B36A;        /* 太阳辐射 → 交互/选中/主色 */
-  --gold-hi: #F2CD90;     /* 日珥高光 → 亮部强调 */
+  --gold: #d1b885;        /* 太阳辐射 → 交互/选中/主色（与新工作台暖金统一） */
+  --gold-hi: #ead3a4;     /* 日珥高光 → 亮部强调 */
   --glacier: #8FB4E8;     /* 水体指数 → 信息 */
   --sage: #8FBC9B;        /* 植被指数 → 成功/健康 */
   --ember: #E08A5A;       /* 热红外 → 处理中/警告 */
@@ -99,12 +99,12 @@ body {
   overflow-x: clip;
 }
 
-::selection { background: rgba(228, 179, 106, .3); color: #FFF8EA; }
+::selection { background: rgba(209, 184, 133, .3); color: #FFF8EA; }
 
 /* 不覆写 border-radius：现代浏览器 outline 自动贴合元素自身圆角，
    原先固定 4px 会把 .btn 等胶囊控件在聚焦时切成方角 */
 :focus-visible {
-  outline: 2px solid rgba(228, 179, 106, .55);
+  outline: 2px solid rgba(209, 184, 133, .55);
   outline-offset: 2px;
 }
 
@@ -119,7 +119,7 @@ body {
   min-height: 32px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(228, 179, 106, .4);
+  background: rgba(209, 184, 133, .4);
   background-clip: content-box;
 }
 
@@ -152,7 +152,7 @@ body {
     inset 0 1px 0 rgba(255, 255, 255, .08),
     inset 0 -1px 0 rgba(0, 0, 0, .22),
     0 24px 60px -16px rgba(0, 0, 0, .55),
-    0 0 90px -24px rgba(228, 179, 106, .08);
+    0 0 90px -24px rgba(209, 184, 133, .08);
 }
 
 /* 镜面高光：热点随 --mx 移动 */
@@ -182,7 +182,7 @@ body {
 }
 
 /* 焦散流光选中环 */
-.glass.is-selected { border-color: rgba(228, 179, 106, .35); }
+.glass.is-selected { border-color: rgba(209, 184, 133, .35); }
 
 .glass.is-selected::after {
   content: "";
@@ -194,13 +194,13 @@ body {
   pointer-events: none;
   background: conic-gradient(from var(--caustic-angle),
       transparent 0 30%,
-      rgba(228, 179, 106, .85) 42%,
+      rgba(209, 184, 133, .85) 42%,
       rgba(183, 165, 232, .55) 50%,
       transparent 62% 100%);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
   mask-composite: exclude;
-  filter: drop-shadow(0 0 6px rgba(228, 179, 106, .35));
+  filter: drop-shadow(0 0 6px rgba(209, 184, 133, .35));
   animation: caustic-spin 5s linear infinite;
 }
 
@@ -227,7 +227,7 @@ body {
 
 .aurora i:nth-child(1) {
   width: 52vw; height: 52vw; left: -14vw; top: -18vw;
-  background: radial-gradient(circle, rgba(228, 179, 106, .13), transparent 65%);
+  background: radial-gradient(circle, rgba(209, 184, 133, .13), transparent 65%);
   animation: drift-a 56s ease-in-out infinite alternate;
 }
 .aurora i:nth-child(2) {
@@ -283,9 +283,9 @@ body {
 }
 
 .btn:hover {
-  border-color: rgba(228, 179, 106, .42);
-  background: rgba(228, 179, 106, .09);
-  box-shadow: 0 0 24px -6px rgba(228, 179, 106, .35), inset 0 0 12px rgba(228, 179, 106, .06);
+  border-color: rgba(209, 184, 133, .42);
+  background: rgba(209, 184, 133, .09);
+  box-shadow: 0 0 24px -6px rgba(209, 184, 133, .35), inset 0 0 12px rgba(209, 184, 133, .06);
   transform: translateY(-1px);
 }
 
@@ -295,13 +295,13 @@ body {
 .btn [class^="ri-"], .btn [class*=" ri-"] { font-size: 15px; }
 
 .btn-primary {
-  background: linear-gradient(135deg, rgba(228, 179, 106, .2), rgba(224, 138, 90, .12));
-  border-color: rgba(228, 179, 106, .48);
-  box-shadow: 0 0 28px -8px rgba(228, 179, 106, .45), inset 0 1px 0 rgba(255, 255, 255, .12);
+  background: linear-gradient(135deg, rgba(209, 184, 133, .2), rgba(224, 138, 90, .12));
+  border-color: rgba(209, 184, 133, .48);
+  box-shadow: 0 0 28px -8px rgba(209, 184, 133, .45), inset 0 1px 0 rgba(255, 255, 255, .12);
 }
 
 .btn-primary:hover {
-  box-shadow: 0 0 44px -6px rgba(228, 179, 106, .65), inset 0 1px 0 rgba(255, 255, 255, .16);
+  box-shadow: 0 0 44px -6px rgba(209, 184, 133, .65), inset 0 1px 0 rgba(255, 255, 255, .16);
 }
 
 .btn-danger:hover {
@@ -319,8 +319,8 @@ body {
   border-radius: var(--r-pill);
   text-decoration: none;
   background: conic-gradient(from var(--caustic-angle),
-      rgba(228, 179, 106, .85), rgba(183, 165, 232, .5),
-      rgba(224, 138, 90, .8), rgba(228, 179, 106, .85));
+      rgba(209, 184, 133, .85), rgba(183, 165, 232, .5),
+      rgba(224, 138, 90, .8), rgba(209, 184, 133, .85));
   animation: caustic-spin 6s linear infinite;
   cursor: pointer;
   transition: transform var(--dur-ui) var(--ease-orbital),
@@ -344,7 +344,7 @@ body {
 .btn-portal:hover {
   transform: translateY(-2px);
   filter: brightness(1.15);
-  box-shadow: 0 10px 34px -8px rgba(228, 179, 106, .55);
+  box-shadow: 0 10px 34px -8px rgba(209, 184, 133, .55);
 }
 
 .btn-portal:hover > span { background: rgba(20, 20, 30, .78); }
@@ -384,9 +384,9 @@ body {
   top: 4px;
   bottom: 4px;
   border-radius: var(--r-pill);
-  background: linear-gradient(135deg, rgba(228, 179, 106, .24), rgba(224, 138, 90, .15));
-  border: 1px solid rgba(228, 179, 106, .42);
-  box-shadow: 0 0 18px -4px rgba(228, 179, 106, .5);
+  background: linear-gradient(135deg, rgba(209, 184, 133, .24), rgba(224, 138, 90, .15));
+  border: 1px solid rgba(209, 184, 133, .42);
+  box-shadow: 0 0 18px -4px rgba(209, 184, 133, .5);
   transition: left var(--dur-ui) var(--ease-spring), width var(--dur-ui) var(--ease-spring);
 }
 
@@ -407,8 +407,8 @@ body {
 }
 
 .field:focus-within {
-  border-color: rgba(228, 179, 106, .45);
-  box-shadow: 0 0 0 3px rgba(228, 179, 106, .08), 0 0 24px -8px rgba(228, 179, 106, .35);
+  border-color: rgba(209, 184, 133, .45);
+  box-shadow: 0 0 0 3px rgba(209, 184, 133, .08), 0 0 24px -8px rgba(209, 184, 133, .35);
 }
 
 .field [class^="ri-"], .field [class*=" ri-"] { color: var(--ink-low); font-size: 15px; }
@@ -444,7 +444,7 @@ body {
   transition: all var(--dur-ui);
 }
 
-.dropdown-trigger:hover { border-color: rgba(228, 179, 106, .35); }
+.dropdown-trigger:hover { border-color: rgba(209, 184, 133, .35); }
 
 .dropdown-trigger [class^="ri-"], .dropdown-trigger [class*=" ri-"] { color: var(--ink-low); transition: transform var(--dur-ui); }
 
@@ -487,7 +487,7 @@ body {
 }
 
 .menu button:hover {
-  background: rgba(228, 179, 106, .1);
+  background: rgba(209, 184, 133, .1);
   color: var(--ink-hi);
   transform: translateX(3px);
 }
@@ -524,15 +524,15 @@ body {
 }
 
 .switch[aria-checked="true"] {
-  background: rgba(228, 179, 106, .18);
-  border-color: rgba(228, 179, 106, .5);
-  box-shadow: 0 0 16px -2px rgba(228, 179, 106, .45);
+  background: rgba(209, 184, 133, .18);
+  border-color: rgba(209, 184, 133, .5);
+  box-shadow: 0 0 16px -2px rgba(209, 184, 133, .45);
 }
 
 .switch[aria-checked="true"]::after {
   left: 22px;
-  background: linear-gradient(180deg, #F5DDAF, #E4B36A);
-  box-shadow: 0 0 10px rgba(228, 179, 106, .7);
+  background: linear-gradient(180deg, #F5DDAF, #d1b885);
+  box-shadow: 0 0 10px rgba(209, 184, 133, .7);
 }
 
 /* --------------------------------------------------------------------------
@@ -556,7 +556,7 @@ body {
   border-radius: 50%;
   background: #FBF3E2;
   border: 2px solid var(--gold);
-  box-shadow: 0 0 12px rgba(228, 179, 106, .6);
+  box-shadow: 0 0 12px rgba(209, 184, 133, .6);
   transition: transform var(--dur-micro);
 }
 
@@ -579,11 +579,17 @@ body {
   border-radius: 50%;
   background: #FBF3E2;
   border: 2px solid var(--gold);
-  box-shadow: 0 0 12px rgba(228, 179, 106, .6);
+  box-shadow: 0 0 12px rgba(209, 184, 133, .6);
   transition: transform var(--dur-micro);
 }
 
 .slider::-webkit-slider-thumb:hover { transform: scale(1.2); }
+
+/* .slider 的 outline:none 会按源码顺序压过全局 :focus-visible，显式补回焦点环 */
+.slider:focus-visible {
+  outline: 2px solid rgba(209, 184, 133, .55);
+  outline-offset: 3px;
+}
 
 /* --------------------------------------------------------------------------
    组件：标签 chips（等宽字体 + 波段色）
@@ -601,7 +607,7 @@ body {
   white-space: nowrap;
 }
 
-.chip-gold { color: var(--gold); border-color: rgba(228, 179, 106, .38); background: rgba(228, 179, 106, .09); }
+.chip-gold { color: var(--gold); border-color: rgba(209, 184, 133, .38); background: rgba(209, 184, 133, .09); }
 .chip-glacier { color: var(--glacier); border-color: rgba(143, 180, 232, .35); background: rgba(143, 180, 232, .08); }
 .chip-sage { color: var(--sage); border-color: rgba(143, 188, 155, .35); background: rgba(143, 188, 155, .08); }
 .chip-ember { color: var(--ember); border-color: rgba(224, 138, 90, .38); background: rgba(224, 138, 90, .09); }

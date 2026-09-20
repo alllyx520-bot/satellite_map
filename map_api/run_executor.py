@@ -14,7 +14,8 @@ from jsonschema import Draft202012Validator
 
 from .agent.providers import ProviderError, configured_provider
 from .data_contract import SOURCE_CAPABILITIES, build_data_requirements
-from .imagery_sources.earth_search import EarthSearchProvider, get_collection_profile
+from .imagery_sources import get_provider_for_collection
+from .imagery_sources.earth_search import get_collection_profile
 from .models import AgentRun, AgentSession, AnalysisRun, Evidence, Finding
 from .remote_sensing_indices import INDEX_DEFINITIONS
 from .run_journal import append_locked, load_checkpoint, lock_run
@@ -58,7 +59,7 @@ SLOT_SCHEMA = {
     "required": ["task", "source", "place_name", "indices", "two_dates", "physical_measurement", "area_ratio"],
     "properties": {
         "task": {"enum": ["water", "vegetation", "agriculture", "land_use", "built_up", "small_target"]},
-        "source": {"enum": ["sentinel2", "mapbox", "tianditu", "esri", "sentinel1", "copdem"]}, "place_name": {"type": ["string", "null"]},
+        "source": {"enum": ["sentinel2", "mapbox", "tianditu", "esri", "sentinel1", "copdem", "landsat"]}, "place_name": {"type": ["string", "null"]},
         "indices": {"type": "array", "uniqueItems": True, "items": {"enum": ["ndwi", "ndvi", "mndwi"]}},
         "two_dates": {"type": "boolean"}, "physical_measurement": {"type": "boolean"},
         "area_ratio": {"type": "boolean"}, "recent_acquisition": {"type": "boolean"},
@@ -79,6 +80,7 @@ SOURCE_TO_COLLECTION = {
     "sentinel2": "sentinel-2-l2a",
     "sentinel1": "sentinel-1-grd",
     "copdem": "cop-dem-glo-30",
+    "landsat": "landsat-c2-l2",
 }
 
 
@@ -135,7 +137,7 @@ class SatelliteHandlers:
             slots["indices"].append("ndwi")
         if slots["task"] in {"vegetation", "agriculture"} and "ndvi" not in slots["indices"]:
             slots["indices"].append("ndvi")
-        if slots["source"] in ("sentinel2", "sentinel1"):
+        if slots["source"] in ("sentinel2", "sentinel1", "landsat"):
             slots["date_end"] = slots.get("date_end") or date.today().isoformat()
             slots["date_start"] = slots.get("date_start") or (date.today() - timedelta(days=30)).isoformat()
         for key in ("date_start", "date_end", "before_date_start", "before_date_end"):
@@ -205,7 +207,7 @@ class SatelliteHandlers:
         candidates = []
         for start, end in periods:
             self.before_request()
-            results = EarthSearchProvider().search(aoi["bbox"], start_date=start, end_date=end, max_cloud=30, limit=30, collection=collection)
+            results = get_provider_for_collection(collection).search(aoi["bbox"], start_date=start, end_date=end, max_cloud=30, limit=30, collection=collection)
             candidates.append([candidate.as_dict() for candidate in results])
         return {"candidates": candidates}
 
@@ -222,8 +224,16 @@ class SatelliteHandlers:
         slots = self.context["slots"]
         collection = SOURCE_TO_COLLECTION.get(slots["source"], "sentinel-2-l2a")
         profile = get_collection_profile(collection)
-        # 必需资产按 profile 生成:S2 保持原波段+SCL;SAR 只要求 vv;DEM 只要求 data。
-        if profile.get("cloud_property"):
+        # 必需资产按 profile 生成:S2 保持原波段+SCL;landsat 用 qa_pixel 位掩膜;
+        # SAR 只要求 vv;DEM 只要求 data。
+        band_aliases = profile.get("band_aliases") or {}
+        def _band_asset(band):
+            return band_aliases.get(band, "swir16" if band == "swir" else band)
+        if profile.get("cloud_property") and profile.get("qa_kind") == "bitmask":
+            required = {"red", "green", "blue", "nir08", "qa_pixel"}
+            for index in self.context["requirements"]["required_indices"]:
+                required.update(_band_asset(band) for band in INDEX_DEFINITIONS[index]["bands"])
+        elif profile.get("cloud_property"):
             required = {"visual", "scl", "red", "green", "blue"}
             for index in self.context["requirements"]["required_indices"]:
                 required.update("swir16" if band == "swir" else band for band in INDEX_DEFINITIONS[index]["bands"])
@@ -278,7 +288,8 @@ class SatelliteHandlers:
             product = write_product(self.claim, "jpg", Path(path).read_bytes())
             self.save_file(product, "高清底图视觉参考", "imagery", "image/jpeg")
             return {"assets": product, "visual_file": product, "grid_contract": {"source": self.context["slots"]["source"], "temporal": "unknown"}}
-        arrays, contract = read_scene_assets(self.context["periods"], self.context["aoi"]["bbox"], self.context["requirements"]["required_indices"], before_request=self.before_request)
+        collection = SOURCE_TO_COLLECTION.get(self.context["slots"]["source"], "sentinel-2-l2a")
+        arrays, contract = read_scene_assets(self.context["periods"], self.context["aoi"]["bbox"], self.context["requirements"]["required_indices"], before_request=self.before_request, collection=collection)
         product = save_arrays(self.claim, arrays)
         self.save_file(product, "校准波段", "raster_bundle", "application/octet-stream")
         return {"assets": product, "grid_contract": contract}

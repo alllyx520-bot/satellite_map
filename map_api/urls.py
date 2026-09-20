@@ -1,8 +1,9 @@
-from django.urls import path
+from django.urls import path, include
 from . import views
 from . import run_api
 
 urlpatterns = [
+    path('v3/', include('map_api.v3.urls')),
     path('v2/agent/runs/', run_api.run_list, name='v2_agent_runs'),
     path('v2/agent/runs/<int:run_id>/actions/', run_api.run_actions, name='v2_agent_run_actions'),
     path('v2/agent/runs/<int:run_id>/replan/', run_api.run_replan, name='v2_agent_run_replan'),

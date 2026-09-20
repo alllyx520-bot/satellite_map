@@ -34,7 +34,7 @@ from .models import AgentSession, ChatHistory, DownloadTask, ImageryScene, Exter
 from .imagery_sources.mapbox import MapboxProvider
 from .imagery_sources.earth_search import EarthSearchProvider, COLLECTION_PROFILES, get_collection_profile
 # M0 数据源扩展:provider 实例化统一走注册表;上面的类名 import 保留作 patch 兼容锚点。
-from .imagery_sources import get_provider
+from .imagery_sources import get_provider, get_provider_for_collection
 from .utils.agent_tools import (
     AGENT_MODEL,
     build_agent_plan,
@@ -154,6 +154,7 @@ IMAGERY_STRATEGY = {
         "sentinel2": "近期公开可追溯影像，适合宏观地类、水体、植被、农业和变化线索筛查。",
         "sentinel1": "Sentinel-1 SAR 全天候影像，适合洪水/淹没、多云/夜间等光学受限场景的水体与宏观地物筛查。",
         "copdem": "Copernicus DEM GLO-30 静态高程数据（采集基线 2011-2015），适合地形/坡度/地势分析。",
+        "landsat": "Landsat Collection 2 Level-2 历史回溯影像（1982 年起，30m，经 Microsoft Planetary Computer 提供），适合宏观变化与历史对比筛查。",
     },
 }
 SMART_PIPELINE_PROFILE = [
@@ -343,9 +344,10 @@ def system_health(request):
         "mapbox_token": bool(os.environ.get("MAPBOX_TOKEN")),
         "tianditu_key": bool(os.environ.get("TIANDITU_KEY")),
         "dashscope_api_key": bool(os.environ.get("DASHSCOPE_API_KEY")),
-        "deepseek_api_key": bool(os.environ.get("GLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")),
+        "deepseek_api_key": bool(os.environ.get("DEEPSEEK_API_KEY")),
         "glm_api_key": bool(os.environ.get("GLM_API_KEY")),
-        "legacy_config": bool(os.environ.get("DEEPSEEK_API_KEY") and not os.environ.get("GLM_API_KEY")),
+        # legacy_config=只配了旧 GLM 链路(控制器默认走 DeepSeek)
+        "legacy_config": bool(os.environ.get("GLM_API_KEY") and not os.environ.get("DEEPSEEK_API_KEY")),
         "glm_chat_url": os.environ.get("GLM_CHAT_URL") or "",
         "deepseek_chat_url": os.environ.get("DEEPSEEK_CHAT_URL") or "",
         "agent_model": os.environ.get("AGENT_MODEL", AGENT_MODEL),
@@ -432,6 +434,15 @@ def system_health(request):
                     "recommended_for": ["地形地势", "坡度分析", "水文背景"],
                     "limitations": ["静态 DEM（采集基线 2011-2015），不代表拍摄时相地表状态", "不能用于变化监测或执法证据"],
                 },
+                "landsat": {
+                    "role": "optional_historical_archive",
+                    "available": True,
+                    "label": "Landsat Collection 2 Level-2 历史回溯影像",
+                    "provider": "Microsoft Planetary Computer / USGS Landsat C2 L2（匿名 SAS 签名）",
+                    "renderer": config["titiler_endpoint"],
+                    "recommended_for": ["历史回溯（1982 年起）", "宏观变化筛查", "植被水体长期对比"],
+                    "limitations": ["约 30m 空间分辨率，不适合细节判读", "匿名签名有速率限制，服务可持续性依赖微软", "重访周期 16 天（双星约 8 天）"],
+                },
             },
             "analysis_modes": {
                 mode: {
@@ -463,7 +474,7 @@ def system_health(request):
                     "质量检查",
                     "NDWI 轻量量化",
                     "VL 解译",
-                    "GLM 复核",
+                    "DeepSeek 复核",
                 ],
             },
             "errors": errors,
@@ -479,7 +490,8 @@ def system_dependencies(request):
         "earth_search": True,
         "titiler": True,
         "amap": bool(os.environ.get("AMAP_KEY")),
-        "glm": bool(os.environ.get("GLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")),
+        "deepseek": bool(os.environ.get("DEEPSEEK_API_KEY")),
+        "glm": bool(os.environ.get("GLM_API_KEY")),
         "dashscope": bool(os.environ.get("DASHSCOPE_API_KEY")),
         "firms": bool(os.environ.get("FIRMS_MAP_KEY")),
         "overpass": True,
@@ -760,7 +772,7 @@ def get_sentinel_img_api(request):
             return JsonResponse({"code": 400, "msg": f"不支持的影像 collection: {collection}", "data": None}, status=400)
         bbox = {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat}
         plan = compute_image_plan(min_lng, min_lat, max_lng, max_lat, resolution)
-        provider = get_provider("earth_search", titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
+        provider = get_provider_for_collection(collection, titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
         try:
             candidates = provider.search(
                 bbox,
@@ -774,7 +786,9 @@ def get_sentinel_img_api(request):
             logger.warning("sentinel image search failed: %s", e)
             return JsonResponse({"code": 502, "msg": SENTINEL_FALLBACK_MSG, "data": None}, status=502)
         if not candidates:
-            return JsonResponse({"code": 404, "msg": "未找到符合条件的 Sentinel-2 影像，可切回高清底图继续分析", "data": None}, status=404)
+            from .imagery_sources.earth_search import get_collection_profile as _gcp
+            _label = _gcp(collection).get("source_label") or collection
+            return JsonResponse({"code": 404, "msg": f"未找到符合条件的{_label}影像，可切回高清底图继续分析", "data": None}, status=404)
 
         try:
             # 按 collection profile 标注源身份，SAR/DEM 场景不再误挂 sentinel2。
@@ -785,7 +799,7 @@ def get_sentinel_img_api(request):
                 bbox,
                 plan,
                 resolution,
-                file_prefix="sentinel",
+                file_prefix="landsat" if _profile["source"] == "landsat" else "sentinel",
                 source=_profile["source"],
                 source_label=_profile["source_label"],
                 source_label_mosaic=_profile["source_label_mosaic"],
@@ -878,7 +892,7 @@ def agent_session_list(request):
             return JsonResponse({"code": 400, "msg": "调查目标不能为空", "data": None}, status=400)
         if len(goal) > MAX_AGENT_GOAL_CHARS:
             return JsonResponse({"code": 400, "msg": f"调查目标不能超过 {MAX_AGENT_GOAL_CHARS} 个字符", "data": None}, status=400)
-        has_deepseek_key = bool((os.environ.get("GLM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY", "")).strip())
+        has_controller_key = bool((os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("GLM_API_KEY", "")).strip())
         mode = data.get("mode", "precise")
         if mode not in AGENT_MODES:
             mode = "precise"
@@ -924,8 +938,8 @@ def agent_session_list(request):
                         session = existing
                         created = False
                     else:
-                        if not has_deepseek_key and not getattr(request, "agent_queue_only", False):
-                            return JsonResponse({"code": 500, "msg": "缺少 GLM_API_KEY（兼容旧配置名 DEEPSEEK_API_KEY），请先在 .env 中配置", "data": None}, status=500)
+                        if not has_controller_key and not getattr(request, "agent_queue_only", False):
+                            return JsonResponse({"code": 500, "msg": "缺少 Agent 控制器密钥（请配置 DEEPSEEK_API_KEY；旧链路 GLM_API_KEY 仅作回退），请先在 .env 中配置", "data": None}, status=500)
                         session = AgentSession.objects.create(
                             request_id=request_id,
                             owner_session_key=owner_key,
@@ -936,8 +950,8 @@ def agent_session_list(request):
                             artifacts={"entry": "agent", "context": {k: v for k, v in context.items() if v}},
                         )
                 else:
-                    if not has_deepseek_key and not getattr(request, "agent_queue_only", False):
-                        return JsonResponse({"code": 500, "msg": "缺少 GLM_API_KEY（兼容旧配置名 DEEPSEEK_API_KEY），请先在 .env 中配置", "data": None}, status=500)
+                    if not has_controller_key and not getattr(request, "agent_queue_only", False):
+                        return JsonResponse({"code": 500, "msg": "缺少 Agent 控制器密钥（请配置 DEEPSEEK_API_KEY；旧链路 GLM_API_KEY 仅作回退），请先在 .env 中配置", "data": None}, status=500)
                     session = AgentSession.objects.create(
                         owner_session_key=owner_key,
                         goal=goal,
@@ -947,14 +961,15 @@ def agent_session_list(request):
                         artifacts={"entry": "agent", "context": {k: v for k, v in context.items() if v}},
                     )
                 if created:
-                    run = AgentRun.objects.create(goal=goal, run_key=f"session:{uuid.uuid4().hex}", status=AgentRun.STATUS_QUEUED if getattr(request, "agent_queue_only", False) else AgentRun.STATUS_PLANNING, mode=mode, provider="GLM", model=AGENT_MODEL)
+                    run = AgentRun.objects.create(goal=goal, run_key=f"session:{uuid.uuid4().hex}", status=AgentRun.STATUS_QUEUED if getattr(request, "agent_queue_only", False) else AgentRun.STATUS_PLANNING, mode=mode, provider=os.environ.get("AGENT_PROVIDER", "deepseek").upper(), model=os.environ.get("AGENT_MODEL", AGENT_MODEL))
                     steps = [("understand_goal", "understand", "理解调查目标", []), ("resolve_aoi", "locate", "定位调查范围", ["understand_goal"]), ("declare_data_requirements", "data_requirements", "声明数据需求", ["resolve_aoi"]), ("match_source_capabilities", "match_source", "匹配数据源能力", ["declare_data_requirements"]), ("search_scenes", "retrieve", "检索影像场景", ["match_source_capabilities"]), ("quality_gate", "quality", "执行质量门禁", ["search_scenes"]), ("select_product", "select", "选择合格产品", ["quality_gate"]), ("read_assets", "read_assets", "读取影像资产", ["select_product"]), ("apply_aoi_and_qa_mask", "mask", "应用 AOI 与 QA 掩膜", ["read_assets"]), ("compute_metric", "metric", "计算遥感指标", ["apply_aoi_and_qa_mask"]), ("compare_temporal_scenes", "change", "比较时序场景", ["compute_metric"]), ("visual_review", "visual_review", "视觉复核", ["compute_metric"]), ("evidence_compilation", "evidence", "整理证据", ["visual_review", "compare_temporal_scenes"]), ("final_review", "review", "最终复核", ["evidence_compilation"]), ("publish_artifacts", "publish", "发布分析产物", ["final_review"])]
                     if getattr(request, "agent_queue_only", False):
                         from .run_executor import default_plan
                         run.execution_engine = "dag"
-                        run.provider = os.environ.get("AGENT_PROVIDER", "glm").lower()
-                        model_env = {"glm": "AGENT_MODEL", "qwen": "QWEN_AGENT_MODEL", "openai-compatible": "OPENAI_AGENT_MODEL"}.get(run.provider)
-                        run.model = os.environ.get(model_env, AGENT_MODEL if run.provider == "glm" else "") if model_env else ""
+                        run.provider = os.environ.get("AGENT_PROVIDER", "deepseek").lower()
+                        model_env = {"deepseek": "AGENT_MODEL", "glm": "AGENT_MODEL", "qwen": "QWEN_AGENT_MODEL", "openai-compatible": "OPENAI_AGENT_MODEL"}.get(run.provider)
+                        model_default = {"glm": "glm-5.3-flash"}.get(run.provider, AGENT_MODEL)
+                        run.model = os.environ.get(model_env, model_default) if model_env else ""
                         run.save(update_fields=["execution_engine", "provider", "model"])
                         RunStep.objects.bulk_create([RunStep(run=run, **step) for step in default_plan()])
                     else:
@@ -2076,7 +2091,7 @@ def imagery_search(request):
             return JsonResponse({"code": 400, "msg": f"unsupported collection: {collection}"}, status=400)
 
         bbox = {"min_lng": min_lng, "min_lat": min_lat, "max_lng": max_lng, "max_lat": max_lat}
-        candidates = get_provider("earth_search").search(
+        candidates = get_provider_for_collection(collection).search(
             bbox,
             start_date=start_date,
             end_date=end_date,
@@ -2113,11 +2128,11 @@ def imagery_recommend_source(request):
         current_source = (data.get("current_source") or data.get("source") or "mapbox").strip().lower()
         if current_source == "earth_search":
             current_source = "sentinel2"
-        if current_source not in ("mapbox", "tianditu", "esri", "sentinel2", "sentinel1", "copdem"):
+        if current_source not in ("mapbox", "tianditu", "esri", "sentinel2", "sentinel1", "copdem", "landsat"):
             current_source = "unknown"
 
         # 伪 Scene 只承载源身份与分辨率假设,供任务画像判断细节能力。
-        assumed_gsd = {"sentinel2": 10, "sentinel1": 10, "copdem": 30, "tianditu": 1.2, "esri": 1.2}.get(current_source, 1.2)
+        assumed_gsd = {"sentinel2": 10, "sentinel1": 10, "copdem": 30, "landsat": 30, "tianditu": 1.2, "esri": 1.2}.get(current_source, 1.2)
         scene = type("Scene", (), {
             "source": current_source,
             "gsd_m": assumed_gsd,

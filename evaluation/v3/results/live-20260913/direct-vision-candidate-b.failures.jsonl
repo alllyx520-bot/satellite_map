@@ -1,0 +1,1 @@
+{"attempt_failures": [{"attempt": 1, "code": "timeout", "retryable": true}, {"attempt": 2, "code": "timeout", "retryable": true}, {"attempt": 3, "code": "timeout", "retryable": true}], "id": "rsvqa-hr-2k-r0066", "model": "qwen3.7-plus", "variant": "direct-vision-candidate-b"}

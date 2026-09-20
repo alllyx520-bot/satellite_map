@@ -2,7 +2,7 @@
 
 受控而非全自主的调查流水线:槽位/计划解析 → 行政区定位 → 源选择 →
 影像检索(Sentinel-2 多景拼接/Mapbox 高清)→ 质量门控(时相/云量,可等待用户确认)→
-NDWI 轻量量化 → Qwen VL 专业解译 → GLM-5.3-Flash 复核 → 结果整理与历史落库。
+NDWI 轻量量化 → Qwen VL 专业解译 → DeepSeek-flash 复核 → 结果整理与历史落库。
 observer 只给公开推理摘要(current_label/public_thought/doing/next/plan_steps),
 私有思维链一律不外泄。
 
@@ -33,7 +33,7 @@ class _ViewsProxy:
 
 _views = _ViewsProxy()
 from .geo_math import compute_image_plan, bbox_intersection_ratio, bbox_union_coverage_ratio, crop_sentinel_nodata_border, image_valid_ratio
-from .imagery_sources import get_provider
+from .imagery_sources import get_provider, get_provider_for_collection
 from .imagery_sources.earth_search import EarthSearchProvider, get_collection_profile
 from .imagery_sources.mapbox import MapboxProvider
 from .media_paths import SAVE_DIR
@@ -63,7 +63,7 @@ AGENT_STAGE_PUBLIC_THOUGHTS = {
     "quality_check": "我会先检查时相、云量、分辨率和证据等级，防止用不合适的影像做过度结论。",
     "ndwi": "水体任务需要一个轻量定量线索，所以我会计算 NDWI，但只把它作为筛查指标。",
     "vl_analysis": "我把影像和上下文交给视觉模型解译，让它给出可见地物、空间格局和风险线索。",
-    "review": "我用 GLM 对视觉结论做复核，重点检查证据边界、时效性和是否夸大。",
+    "review": "我用 DeepSeek 对视觉结论做复核，重点检查证据边界、时效性和是否夸大。",
     "complete": "我正在把影像、量化结果、模型结论和限制条件整理成可保存、可报告的结果。",
     "failed": "我已经停止当前调查，并把失败原因保留下来，方便继续排查。",
 }
@@ -74,7 +74,7 @@ AGENT_OBSERVER_DEFAULT_STEPS = [
     {"id": "retrieve_imagery", "label": "检索并生成影像"},
     {"id": "quality_check", "label": "检查影像质量"},
     {"id": "vl_analysis", "label": "视觉模型解译"},
-    {"id": "review", "label": "GLM 结论复核"},
+    {"id": "review", "label": "DeepSeek 结论复核"},
     {"id": "complete", "label": "整理结果"},
 ]
 
@@ -406,7 +406,7 @@ def _rank_sentinel_grid_candidates(candidates, tile):
 def _agent_fetch_sentinel(bbox, slots, force_grid=False, collection="sentinel-2-l2a"):
     resolution = 1024
     plan = compute_image_plan(bbox["min_lng"], bbox["min_lat"], bbox["max_lng"], bbox["max_lat"], resolution)
-    provider = get_provider("earth_search", titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
+    provider = get_provider_for_collection(collection, titiler_endpoint=os.environ.get("TITILER_ENDPOINT", None) or None)
     candidates = provider.search(
         bbox,
         start_date=slots.get("date_start"),
@@ -457,7 +457,7 @@ def _agent_fetch_sentinel(bbox, slots, force_grid=False, collection="sentinel-2-
             bbox,
             plan,
             resolution,
-            file_prefix="agent_sentinel",
+            file_prefix="agent_landsat" if source == "landsat" else "agent_sentinel",
             # 大范围 bbox 不能用单景 60% 覆盖就算成功：那会把城市北/南侧
             # 直接裁掉，再错误降级成 Mapbox。优先要求多景拼接达到 98% 覆盖。
             min_coverage=0.98 if large_area else 0.85,

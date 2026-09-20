@@ -1,3 +1,5 @@
+import uuid
+
 from django.db import models
 
 
@@ -120,6 +122,12 @@ class AgentRun(models.Model):
     STATUS_EXTERNAL_UNAVAILABLE = "external_service_unavailable"
 
     goal = models.TextField()
+    conversation = models.ForeignKey("Conversation", null=True, blank=True, on_delete=models.SET_NULL, related_name="runs")
+    trigger_message = models.ForeignKey("ConversationMessage", null=True, blank=True, on_delete=models.SET_NULL, related_name="triggered_runs")
+    worker_claim = models.CharField(max_length=64, blank=True, default="")
+    lease_until = models.DateTimeField(null=True, blank=True)
+    budget = models.JSONField(default=dict, blank=True)
+    usage = models.JSONField(default=dict, blank=True)
     run_key = models.CharField(max_length=120, unique=True)
     status = models.CharField(max_length=40, default=STATUS_QUEUED)
     mode = models.CharField(max_length=30, default="precise")
@@ -394,3 +402,136 @@ class ApiRateLimitBucket(models.Model):
 
     class Meta:
         ordering = ["bucket_key"]
+
+
+class Conversation(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner_session_key = models.CharField(max_length=64, db_index=True)
+    title = models.CharField(max_length=200, default="新的影像问答")
+    event_sequence = models.PositiveIntegerField(default=0)
+    context_version = models.PositiveIntegerField(default=1)
+    active_run = models.ForeignKey(AgentRun, null=True, blank=True, on_delete=models.SET_NULL, related_name="active_in_conversations")
+    workspace = models.JSONField(default=dict, blank=True)
+    summary = models.JSONField(default=dict, blank=True)
+    archived = models.BooleanField(default=False)
+    starred = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+
+
+class SpatialAttachment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner_session_key = models.CharField(max_length=64, db_index=True)
+    conversation = models.ForeignKey(Conversation, null=True, blank=True, on_delete=models.SET_NULL, related_name="attachments")
+    scene = models.ForeignKey(ImageryScene, null=True, blank=True, on_delete=models.SET_NULL, related_name="attachments_v3")
+    parent = models.ForeignKey("self", null=True, blank=True, on_delete=models.SET_NULL, related_name="revisions")
+    name = models.CharField(max_length=240)
+    kind = models.CharField(max_length=30, default="image")
+    status = models.CharField(max_length=30, default="uploading")
+    coordinate_space = models.CharField(max_length=30, default="image_pixels")
+    file_path = models.CharField(max_length=500, blank=True, default="")
+    preview_path = models.CharField(max_length=500, blank=True, default="")
+    sha256 = models.CharField(max_length=64, blank=True, default="")
+    size_bytes = models.BigIntegerField(default=0)
+    width = models.PositiveIntegerField(default=0)
+    height = models.PositiveIntegerField(default=0)
+    bbox = models.JSONField(null=True, blank=True)
+    geometry = models.JSONField(null=True, blank=True)
+    crs = models.CharField(max_length=120, blank=True, default="")
+    transform = models.JSONField(default=list, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    error = models.TextField(blank=True, default="")
+    processing_claim = models.CharField(max_length=64, blank=True, default="")
+    processing_lease_until = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class ConversationMessage(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name="messages")
+    run = models.ForeignKey(AgentRun, null=True, blank=True, on_delete=models.SET_NULL, related_name="conversation_messages")
+    role = models.CharField(max_length=20)
+    content = models.TextField(blank=True, default="")
+    parts = models.JSONField(default=list, blank=True)
+    attachments = models.ManyToManyField(SpatialAttachment, related_name="messages", blank=True)
+    status = models.CharField(max_length=30, default="queued")
+    delivery = models.CharField(max_length=20, default="steer")
+    sequence = models.PositiveIntegerField()
+    request_id = models.CharField(max_length=120)
+    request_digest = models.CharField(max_length=64)
+    context_version = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sequence"]
+        constraints = [models.UniqueConstraint(fields=["conversation", "request_id"], name="v3_message_request"), models.UniqueConstraint(fields=["conversation", "sequence"], name="v3_message_sequence")]
+
+
+class ConversationEvent(models.Model):
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name="events")
+    sequence = models.PositiveIntegerField()
+    type = models.CharField(max_length=80)
+    payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sequence"]
+        constraints = [models.UniqueConstraint(fields=["conversation", "sequence"], name="v3_event_sequence")]
+
+
+class AgentTurn(models.Model):
+    run = models.ForeignKey(AgentRun, on_delete=models.CASCADE, related_name="turns")
+    number = models.PositiveIntegerField()
+    context_version = models.PositiveIntegerField(default=1)
+    status = models.CharField(max_length=30, default="started")
+    decision = models.JSONField(default=dict)
+    usage = models.JSONField(default=dict)
+    error = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["run", "number"], name="v3_turn_number")]
+
+
+class SpatialObservation(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation = models.ForeignKey(Conversation, null=True, blank=True, on_delete=models.SET_NULL, related_name="observations")
+    attachment = models.ForeignKey(SpatialAttachment, on_delete=models.CASCADE, related_name="observations")
+    run = models.ForeignKey(AgentRun, null=True, blank=True, on_delete=models.SET_NULL, related_name="observations")
+    label = models.CharField(max_length=200)
+    kind = models.CharField(max_length=40, default="window")
+    window = models.JSONField(default=list)
+    geometry = models.JSONField(null=True, blank=True)
+    summary = models.TextField(blank=True, default="")
+    confidence = models.FloatField(null=True, blank=True)
+    evidence_refs = models.JSONField(default=list, blank=True)
+    preview_path = models.CharField(max_length=500, blank=True, default="")
+    metadata = models.JSONField(default=dict, blank=True)
+    context_version = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class AttachmentUpload(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    attachment = models.OneToOneField(SpatialAttachment, on_delete=models.CASCADE, related_name="upload")
+    size_bytes = models.BigIntegerField()
+    chunk_size = models.PositiveIntegerField(default=1024 * 1024)
+    received_chunks = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=30, default="uploading")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class LegacyConversationLink(models.Model):
+    source_model = models.CharField(max_length=40)
+    source_pk = models.PositiveIntegerField()
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name="legacy_links")
+    migrated_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["source_model", "source_pk"], name="v3_legacy_link")]

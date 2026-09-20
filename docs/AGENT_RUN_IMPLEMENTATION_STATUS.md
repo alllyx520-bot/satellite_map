@@ -1,5 +1,23 @@
 # AgentRun 重构验收状态
 
+> **状态：时点记录（V2 DAG 时期），不是当前状态。**
+> 本文记录把 Agent 执行从"固定八阶段状态机"改成**持久化 DAG**（`AgentRun` + checkpoint + 事件游标）
+> 那一轮工作的验收过程与当时**尚未达标**的门禁。正文的"尚未完成"清单未逐条复核，标为**待核验**；
+> 当前入口见 [CLAUDE.md](../CLAUDE.md) 与 [V3_IMPLEMENTATION.md](V3_IMPLEMENTATION.md)。
+>
+> **此后已落地的事实**（2026-09-14 核对代码，非本文原内容）：
+> - 该 DAG 实现已入库：`map_api/run_kernel.py`/`run_scheduler.py`/`run_executor.py`/`run_journal.py`/
+>   `run_api.py`/`run_products.py`/`run_acceptance.py` + `map_api/agent/`（`loop.py` 1074 行、
+>   `decision.py`、`durable_tools.py`、`events.py`、`waiting.py`），迁移 0022–0025，路由前缀
+>   `/api/v2/agent/runs/*` 已在 `map_api/urls.py` 生效。
+> - 后端测试从本文记录的 373 项增至 **608 项**（2026-09-14 实测 OK）。
+> - `observer`/前端展示的"固定阶段"已被 V3 的真实事件流取代；V3 见 `map_api/v3/`。
+> - 本文"远端部署仍是旧版本"的判断**仍待核验**：`deploy/` 里 V2 的
+>   `satellitesense-agent-worker.service` 执行 `run_agent_worker`（2026-09-14 已补上 V3 的
+>   `satellitesense-v3-worker.service` / `run_v3_worker`，但尚未在真实服务器启用）。
+>
+> 正文（以下）原样保留。
+
 当前实现尚未达到目标文件的发布条件。数据库表存在和旧测试通过不能证明完整主链路已完成。
 
 ## 已有实现与覆盖

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SPECTRA · 光谱设计系统</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23E4B36A' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23E4B36A'/%3E%3C/svg%3E">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23d1b885' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23d1b885'/%3E%3C/svg%3E">
     <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/unbounded@5/600.css">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/fraunces@5/500.css">
@@ -20,6 +20,7 @@
     <link rel="stylesheet" href="/static/design.css?v=5">
 </head>
 <body>
+    <a class="legacy-banner" href="/">经典版界面 · 本页为设计语言历史存档 · 返回新工作台 ↗</a>
     <!-- 环境层：极光光场 / 星点 / 暗角 / 噪点 -->
     <div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
     <canvas id="stars" aria-hidden="true"></canvas>
@@ -31,18 +32,19 @@
         <a class="mark" href="/">
             <i class="ri-radar-line" aria-hidden="true"></i>
             <b>SPECTRA</b>
+            <span class="archive-badge">历史存档</span>
         </a>
         <span class="chip chip-gold">DESIGN SYSTEM</span>
         <span class="chip chip-iris">方向 B · 平流层玻璃</span>
         <span class="spacer"></span>
-        <a class="back" href="/"><i class="ri-arrow-left-line" aria-hidden="true"></i>返回首页</a>
+        <a class="back" href="/"><i class="ri-arrow-left-line" aria-hidden="true"></i>返回新工作台</a>
     </nav>
 
     <main class="page">
         <!-- Hero -->
         <header class="hero">
             <p class="kicker">Satellite Sense Design Language</p>
-            <h1>SPECTRA<span class="cn">光 谱 设 计 系 统</span></h1>
+            <h1>SPECTRA<span class="archive-badge">历史存档</span><span class="cn">光 谱 设 计 系 统</span></h1>
             <p class="sub">以卫星多光谱的物理特性为基因的设计语言：彩色只属于数据与状态，光以玻璃为载体，动效遵循轨道力学。悬浮于平流层之上的仪器舱。</p>
             <div class="meta">
                 <span class="chip chip-gold">三级玻璃材质</span>
@@ -62,9 +64,9 @@
             <p class="sec-desc">每种功能色对应一个真实遥感波段的物理含义——彩色只属于数据与状态，界面 90% 是无彩色仪器灰蓝。</p>
             <div class="swatch-grid">
                 <div class="swatch glass glass-thin">
-                    <div class="bar" style="background:linear-gradient(135deg,#F2CD90,#B8863B);box-shadow:0 8px 28px -8px rgba(228,179,106,.55)"></div>
+                    <div class="bar" style="background:linear-gradient(135deg,#ead3a4,#8a744c);box-shadow:0 8px 28px -8px rgba(209,184,133,.55)"></div>
                     <div class="name">日珥金</div>
-                    <div class="hex">#E4B36A</div>
+                    <div class="hex">#d1b885</div>
                     <div class="mean">太阳辐射 · 交互 / 选中</div>
                 </div>
                 <div class="swatch glass glass-thin">
@@ -182,7 +184,7 @@
                 <div class="proto-panel glass">
                     <span class="spec">BREATHING / 呼吸状态光</span>
                     <div class="comp-row">
-                        <div class="t-step active" style="flex:none">
+                        <div class="t-step active u-none">
                             <span class="t-dot"><i class="ri-scan-2-line" aria-hidden="true"></i></span>
                         </div>
                         <p class="proto-note">2 秒周期的呼吸脉冲表示处理中，不催促、不打扰。</p>
@@ -227,24 +229,24 @@
                     <span class="spec">DROPDOWN / 分析模式</span>
                     <div class="dropdown">
                         <button class="dropdown-trigger" aria-haspopup="listbox" aria-expanded="false">
-                            <span>qwen3-vl-plus · 精确模式</span>
+                            <span>DeepSeek Flash</span>
                             <i class="ri-arrow-down-s-line" aria-hidden="true"></i>
                         </button>
                         <div class="menu glass glass-thick" role="listbox" aria-label="分析模式">
-                            <button role="option" aria-selected="true" data-value="qwen3-vl-plus · 精确模式">qwen3-vl-plus · 精确模式<i class="ri-check-line" aria-hidden="true"></i></button>
-                            <button role="option" aria-selected="false" data-value="qwen3-vl-flash · 快速模式">qwen3-vl-flash · 快速模式<i class="ri-check-line" aria-hidden="true"></i></button>
+                            <button role="option" aria-selected="true" data-value="DeepSeek Flash">DeepSeek Flash<i class="ri-check-line" aria-hidden="true"></i></button>
+                            <button role="option" aria-selected="false" data-value="DeepSeek 精准">DeepSeek 精准<i class="ri-check-line" aria-hidden="true"></i></button>
                         </div>
                     </div>
                 </div>
                 <div class="comp-panel glass">
                     <span class="spec">SWITCH + SLIDER / 开关与滑杆</span>
                     <div class="comp-row">
-                        <span class="switch" aria-checked="true" role="switch" tabindex="0"></span>
-                        <span style="font-size:13px;color:var(--ink-mid)">主动感知放大</span>
+                        <span class="switch" aria-checked="true" role="switch" tabindex="0" aria-label="主动感知放大"></span>
+                        <span class="switch-label">主动感知放大</span>
                     </div>
-                    <div class="comp-row" style="margin-top:16px">
-                        <input type="range" class="slider" id="sl-cloud" min="0" max="100" value="20" style="flex:1" aria-label="云量上限百分比">
-                        <span class="mono" data-slider-out="sl-cloud" style="color:var(--glacier)">20</span>
+                    <div class="comp-row">
+                        <input type="range" class="slider u-grow" id="sl-cloud" min="0" max="100" value="20" aria-label="云量上限百分比">
+                        <span class="mono slider-val" data-slider-out="sl-cloud">20</span>
                         <span class="spec">云量上限 %</span>
                     </div>
                 </div>
@@ -253,7 +255,7 @@
                     <div class="comp-row">
                         <span class="chip chip-gold">SENTINEL-2</span>
                         <span class="chip chip-ember">L2A</span>
-                        <button class="btn" data-tip="Element84 Earth Search + TiTiler" data-tip-pos="bottom" aria-label="影像数据源溯源信息"><i class="ri-information-line" aria-hidden="true"></i>溯源</button>
+                        <button class="btn" data-tip="Element84 Earth Search + TiTiler" aria-label="影像数据源溯源信息"><i class="ri-information-line" aria-hidden="true"></i>溯源</button>
                         <button class="btn" data-toast="影像场景已缓存，可直接进入分析"><i class="ri-notification-3-line" aria-hidden="true"></i>模拟通知</button>
                     </div>
                 </div>
@@ -275,7 +277,7 @@
                 <span class="stage-readout mono" id="scan-readout">SWATH SCAN · 0%</span>
                 <span class="stage-caption spec">推扫扫描 · 影像获取 / AI 分析加载态</span>
             </div>
-            <div class="comp-row" style="margin-top:20px">
+            <div class="comp-row motion-actions">
                 <button class="btn" id="cascade-btn"><i class="ri-play-line" aria-hidden="true"></i>播放级联入场</button>
                 <a class="btn-portal" href="/workbench/"><span><i class="ri-rocket-2-line" aria-hidden="true"></i>进入工作台</span></a>
             </div>
@@ -329,7 +331,7 @@
                         <div class="t-step"><span class="t-dot">06</span><span class="t-label">解译</span></div>
                         <div class="t-step"><span class="t-dot">07</span><span class="t-label">复核</span></div>
                     </div>
-                    <p style="margin:22px 0 0;font-size:12.5px;color:var(--ink-low)">时间线自动推进演示：公开可观察的进度，不暴露内部推理。</p>
+                    <p class="tl-note">时间线自动推进演示：公开可观察的进度，不暴露内部推理。</p>
                 </div>
                 <div class="proto-panel glass">
                     <span class="spec">ANALYSIS CHAT / 分析对话</span>
@@ -355,7 +357,7 @@
         <footer class="footer">
             <div class="rule" aria-hidden="true"></div>
             <p class="spec">SPECTRA · SatelliteSense Design System · Direction B 平流层玻璃</p>
-            <p>本系统已上线，正施加于 / 落地页与 /workbench/ 工作台</p>
+            <p>本页为 2026-09 前 Legacy 界面设计语言的历史存档，仅供回溯参考；现行工作台以 / 的 React 版为准。</p>
         </footer>
     </main>
 

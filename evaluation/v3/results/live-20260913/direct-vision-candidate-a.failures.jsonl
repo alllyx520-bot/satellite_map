@@ -1,0 +1,2 @@
+{"attempt_failures": [{"attempt": 1, "code": "timeout", "retryable": true}, {"attempt": 2, "code": "timeout", "retryable": true}, {"attempt": 3, "code": "timeout", "retryable": true}], "id": "rsvqa-hr-2k-r0007", "model": "qwen3.8-max-0902", "variant": "direct-vision-candidate-a"}
+{"attempt_failures": [{"attempt": 1, "code": "timeout", "retryable": true}, {"attempt": 2, "code": "timeout", "retryable": true}, {"attempt": 3, "code": "timeout", "retryable": true}], "id": "rsvqa-hr-2k-r0007", "model": "qwen3.8-max-0902", "variant": "direct-vision-candidate-a"}

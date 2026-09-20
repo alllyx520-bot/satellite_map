@@ -1,5 +1,14 @@
 # SatelliteSense 审查-优化计划(Review & Optimization Plan)
 
+> **状态：已完成的时点记录（2026-07-21 那一轮），不是当前计划。** 该轮 Phase 0–10 已全部执行，
+> 执行结果见文末「执行状态」表。正文对代码的描述（`views.py` 3463/1541 行、`start.py --noreload`、
+> 测试 60+/120/162 项、前端三张无构建页面、conda Python 路径等）**均已过时**：
+> 现在 `views.py` 为 2471 行，`start.py` 不再用 `--noreload`，后端测试 608 项，前端是 React+Vite
+> 构建产物，运行环境为 `.codex-runtime/venv/`。当前入口见 [CLAUDE.md](CLAUDE.md)。
+> 正文与附录原样保留，仅作为当时的检查清单与方法参考。
+>
+> 注：本文档正文里的行号锚点已全部失效；需要定位代码请用 `grep`。
+
 - **制定日期**:2026-07-21(全部基线数据为当日实测,非推测)
 - **适用范围**:本仓库全部后端 / 前端 / 部署配置 / 文档 / 测试体系
 - **使用方法**:按 Phase 顺序执行;每个 Phase 自带验收标准;每轮闭环 = `test` + `smoke_pipeline` 双绿 + `REVIEW_FINDINGS.md` 更新。对 AI 助手下指令时直接说"按 REVIEW_PLAN.md 执行第 N 轮 / Phase N"即可。

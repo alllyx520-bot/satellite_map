@@ -181,15 +181,17 @@ class NonVisualRenderTests(SimpleTestCase):
             )
         self.assertEqual(set(captured["params"]), {"url"})
 
-    def test_requester_pays_render_error_reaches_render_errors_channel(self):
+    def test_landsat_render_requires_rgb_compose_provider(self):
+        # M3-3a:landsat 渲染策略改为 rgb_compose,只有 PlanetaryComputerProvider 支持;
+        # 直接用 EarthSearchProvider 渲染 landsat 候选会在缺 visual 资产处显式报错。
         candidate = EarthSearchProvider().candidate_from_item({
             "id": "LC08_SMOKE",
             "collection": "landsat-c2-l2",
             "bbox": [108.1, 22.1, 108.12, 22.12],
             "properties": {"datetime": "2026-09-01T03:00:00Z", "eo:cloud_cover": 5},
-            "assets": {"red": {"href": "s3://usgs-landsat/collection02/level-2/x_B4.TIF", "gsd": 30}},
+            "assets": {"red": {"href": "https://landsateuwest.blob.core.windows.net/x_B4.TIF", "gsd": 30}},
         })
-        with self.assertRaisesRegex(ValueError, "需要自带凭证"):
+        with self.assertRaisesRegex(ValueError, "缺少可渲染"):
             EarthSearchProvider().render_candidate_jpeg(candidate, self.bbox, 256, 256)
 
 
@@ -249,12 +251,13 @@ class ProviderRegistryTests(SimpleTestCase):
 
     def test_default_profile_is_not_experimental(self):
         self.assertFalse(COLLECTION_PROFILES[DEFAULT_COLLECTION]["experimental"])
-        # M1 起 SAR/DEM 转正式源;landsat 仍是占位;L1C 只作兜底保持 experimental。
+        # M1 起 SAR/DEM 转正式源;M3-3a 起 landsat 经 Planetary Computer 转正式源;
+        # L1C 只作兜底保持 experimental。
         self.assertFalse(COLLECTION_PROFILES["sentinel-1-grd"]["experimental"])
         self.assertFalse(COLLECTION_PROFILES["cop-dem-glo-30"]["experimental"])
         self.assertFalse(COLLECTION_PROFILES["sentinel-2-c1-l2a"]["experimental"])
         self.assertTrue(COLLECTION_PROFILES["sentinel-2-l1c"]["experimental"])
-        self.assertTrue(COLLECTION_PROFILES["landsat-c2-l2"]["experimental"])
+        self.assertFalse(COLLECTION_PROFILES["landsat-c2-l2"]["experimental"])
 
 
 class CollectionValidationTests(TestCase):

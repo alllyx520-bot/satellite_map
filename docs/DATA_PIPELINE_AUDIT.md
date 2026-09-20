@@ -1,5 +1,28 @@
 # SatelliteSense 数据链审计
 
+> **状态：时点审计记录。** 审计对象是当时的 V2 legacy 链路（`utils/agent_tools.py`、
+> `sentinel_pipeline.py`、`views.py` 等）。正文保留原样；下方状态表是 **2026-09-14 按代码复核**
+> 的结果，两者冲突时以状态表和代码为准。当前入口见 [CLAUDE.md](../CLAUDE.md)。
+> 文末"2026-09-11 全量实测"增补节记录的是另一次真实源契合度审计，仍未过期。
+
+## 复核状态（2026-09-14）
+
+| 条目 | 状态 | 证据 / 说明 |
+|---|---|---|
+| P0-1 SCL 被错误 rescale | **已修** | `utils/agent_tools.py:557,575` 明确禁止对 SCL 使用连续值 rescale，反射率保留源 dtype 后本地按 scale/offset 转换；V3 路径 `v3/raster_products.py:343,467` 对 `scl`/`qa_pixel` 用 `Resampling.nearest`，`:496` 按整数类别掩膜（`[4,5,6,7]`） |
+| P0-2 多景拼接不是物理一致合成 | **已修（含默认拒绝）** | 跨日期覆盖拼接默认禁止，需显式 `SENTINEL_ALLOW_CROSS_DATE_MOSAIC=1`（`sentinel_pipeline.py:559`）。仍是**覆盖拼接**，非辐射一致合成——这一性质保留在场景 `limitations` |
+| P0-3 Mapbox `gsd_m` 语义 | **部分** | 数据结构已区分：`data_contract.SceneDataContract.spatial` 同时给 `native_resolution_m` 与 `pixel_spacing_m`，不再混为一个 `gsd_m`。**未见**"Mapbox 禁止进入物理测量"的强制门禁；审计建议的 `pixel_ground_spacing_m`/`source_gsd_m` 命名未采用 |
+| P0-4 行政区 bbox 仍主导检索 | **部分** | 已引入统一 AOI/契约对象（`data_contract.SceneDataContract` 的 `requested_aoi`/`requested_bbox`/`effective_bbox`/`polygon`/`projection`），polygon 掩膜经 `polygon_mask_for_bbox` 进入光谱统计。检索侧仍以 bbox 为主（与 CLAUDE.md"已知限制"一致） |
+| P1-5 指标目录不是可用能力 | **部分** | 已从"只有 NDWI"扩展为可计算 ndwi/ndvi/mndwi/ndbi/bsi/ndsi/nbr（`spectral_products.compute_spectral_summary`，含 QA 网格与波段要求），并有 `/api/analysis/change/`。但 `available_indices()` 仍返回全部定义、不携带"当前源是否已实现"字段 |
+| P1-6 固定阈值 NDWI 被当成水体比例 | **已修** | 阈值可传入（`compute_spectral_summary(..., threshold=)`），输出改名 `thresholded_pixel_ratio`/`thresholded_percent`，并附 `alternative_thresholds`（±0.02/0.05）敏感性区间与 `threshold_method` |
+| P1-7 反射率契约不显式 | **已修** | `COLLECTION_PROFILES` 的 `radiometry_override` + `_radiometry_for` 显式声明各 collection 的 scale/offset（见文末 2026-09-11 增补第 1 条） |
+| P1-8 RemoteCLIP 命名误导 | **未改** | 仍是 `clip_retriever.score_tiles` / `smart_query_analyzer.rank_tiles`，未降级命名为 `tile_retrieval_hint`。回退到颜色/边缘启发式的行为与审计描述一致 |
+| P2-9 主动感知放大无源能力门禁 | **未修（待核验）** | 主动感知仍只由模式/请求参数控制（`views.py:141-142,1650`），未按数据源能力（Sentinel 只允许宏观定位）设门禁 |
+| P2-10 源选择缺数据可用性闭环 | **已修（V2 DAG 路径）** | `DataRequirements` 与能力匹配已进入 `data_contract.py` + `run_scheduler.py`/`run_executor.py`/`views.py`；V3 路径另有一套数据源能力描述（`v3/data_adapter.source_capabilities`，见 `/api/v3/capabilities`） |
+
+"推荐重构顺序"第 1 条（先建 `SceneDataContract`）已落地；第 2、3、4、6 条部分落地；
+第 5 条（同日覆盖拼接与跨时相变化分成两个产品）已按"跨日期默认拒绝 + 两期变化独立产品"实现。
+
 审计范围：Mapbox 静态底图、Sentinel-2 L2A/STAC、TiTiler 渲染、影像预处理、NDWI、VL/Agent 以及结果可信度标注。
 
 ## 结论
@@ -125,3 +148,17 @@ RemoteCLIP 是整块图文相似度排序；缺少模型时退化到颜色、边
 4. 关闭或隐藏未接通的指标目录执行入口，补齐逐指标资产与重采样策略后再开放。
 5. 重做多景逻辑：同日覆盖拼接与跨时相变化分析分成两个产品。
 6. 最后再优化 RemoteCLIP、主动感知和 Agent 计划；这些属于输入选择和交互优化，不能替代数据质量链。
+
+---
+
+## 增补:2026-09-11 全量实测(新数据源接入后)
+
+对全部影像源(Mapbox/天地图/Esri/Sentinel-2/Sentinel-1 SAR/Cop-DEM/Landsat)走了真实 API 链路并逐张视觉评审,对 5 个证据工具(FIRMS/Overpass/Open-Meteo/GSW/WorldCover)做了真实数据评审。发现并修复 5 处"源契合度"缺陷:
+
+1. **sentinel-2-l2a 辐射元数据与实际数据不符(实测两景复证)**。STAC `raster:bands` 标称 scale=0.0001/offset=-0.1,但 Earth Search 该 collection(Element84 自产 Sen2Cor)的 COG DN 未含 ESA 基线≥4 的 +1000 谐波偏移:绿光 DN mean 616/791,强行应用 offset 会使绿光反射率 78% 为负、植被 NDVI 爆 inf(均值 1.485),反射率范围过滤误杀 80% 像元,NDVI/NDWI/MNDWI 全链不可用。`sentinel-2-c1-l2a`(ESA 官方重处理)实测 DN 带偏移(绿光 mean 1726),元数据正确。修复:`COLLECTION_PROFILES["sentinel-2-l2a"]["radiometry_override"]={"scale":0.0001,"offset":0.0}`,在 `fetch_cog_bbox_array` 的 `radiometry` 参数处应用。修复后实测:NDVI mean 0.62、植被区 0.71(教科书合理),NDWI 水体比例 0.82%、MNDWI 1.63%(与邕江量级一致)。
+2. **无云量属性的 collection 被云量过滤误杀**。SAR/DEM 没有 `eo:cloud_cover` 属性,STAC 带该过滤即零候选。修复:`search()` 按 profile `cloud_property` 决定是否附加云量过滤。
+3. **静态数据集被日期过滤误杀**。Cop-DEM 在 Earth Search 的 `datetime` 是 2021-04 生产发布日期,任何采集日期范围都会零候选。修复:profile `static: True` 时检索跳过 datetime。
+4. **SAR/DEM 暗区被亮度启发式误杀**。SAR 水体/光滑地表、DEM 低海拔在渲染图上接近黑色,`image_valid_ratio`(亮度阈值)把真实信号误判为 no-data(实测 SAR 场景亮度 valid 0.62 被拒);亮度驱动的 no-data 裁边会误裁真实内容。修复:profile `valid_check: "alpha"`,渲染走 TiTiler PNG alpha(真实 nodata 掩膜),`auto_crop: False` 关闭亮度裁边;`min_valid_ratio` 由 profile 提供默认。
+5. **DEM 固定拉伸区间对低起伏地区失效**。rescale=0,2000 把南宁(88~558m)压进 terrain 色带低端,视觉上几乎全蓝。修复:profile `adaptive_rescale: True`,按 bbox 内 p2~p98 自适应拉伸(实测 87.93~558.47,山河纹理立刻可读)。
+
+**遗留(已记录,未修)**:Sentinel-1 GRD 条带是旋转四边形,候选覆盖率用矩形 bbox 交集会高估(实测某场景矩形覆盖 1.0、alpha 真实 0.62);结论:场景元数据的 valid_image_ratio 是真实 nodata 口径,可信;但"覆盖率"字段对 SAR 偏乐观,精确化需改用 geometry 多边形交集(后续项)。

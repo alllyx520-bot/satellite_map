@@ -81,7 +81,7 @@ function warpToWorkbench(e) {
   if (warping) return;
   warping = true;
   const warp = document.getElementById("warp");
-  const go = () => { location.href = "/workbench/"; };
+  const go = () => { location.href = "/legacy/workbench/"; };
   if (typeof gsap === "undefined" || reduced || !warp) { go(); return; }
   if (camera) gsap.to(camera.position, { z: 1.9, duration: 1.1, ease: "power2.in" });
   gsap.to(warp, { opacity: 1, duration: 1.0, ease: "power2.in", onComplete: go });
@@ -258,15 +258,15 @@ function init3D(THREE) {
       if (!document.hidden) renderer.render(scene, camera);
     })();
   } catch (err) {
-    console.warn("WebGL 初始化失败，退化为静态背景:", err);
+    console.warn("WebGL 初始化失败，退化为静态兜底背景:", err);
     renderer = null;
     camera = null;
     globe = null;
-    canvas?.remove();
+    document.body.classList.add("earth-fallback");
   }
 }
 
 import("three").then(init3D).catch((err) => {
-  console.warn("three.js 加载失败，3D 背景停用:", err);
-  canvas?.remove();
+  console.warn("three.js 加载失败，3D 背景停用，保留 CSS 兜底背景:", err);
+  document.body.classList.add("earth-fallback");
 });

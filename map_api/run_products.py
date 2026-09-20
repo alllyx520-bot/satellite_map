@@ -9,7 +9,11 @@ from django.conf import settings
 from PIL import Image
 
 from .remote_sensing_indices import INDEX_DEFINITIONS, compute_index, summarize, change_summary
-from .utils.agent_tools import fetch_cog_bbox_array, polygon_mask_for_bbox
+from .imagery_sources.earth_search import get_collection_profile
+from .utils.agent_tools import (
+    _qa_valid_mask, _radiometry_for, _sign_asset_for_collection,
+    fetch_cog_bbox_array, polygon_mask_for_bbox,
+)
 
 
 def product_path(run_id, name):
@@ -48,8 +52,19 @@ def load_arrays(run_id, product):
         return {key: arrays[key] for key in arrays.files}
 
 
-def read_scene_assets(periods, bbox, indices, *, before_request, size=256):
-    required = {"red", "green", "blue", "scl"}
+def read_scene_assets(periods, bbox, indices, *, before_request, size=256, collection="sentinel-2-l2a"):
+    # profile 驱动(2026-09-11):QA 波段、波段别名、辐射校准覆盖、PC 资产签名全部按 collection 解析,
+    # 与 legacy agent 路径(spectral_products/agent_tools)保持同一语义;landsat 的 nir→nir08、
+    # qa_pixel 位掩膜、SAS 签名都在这里生效。
+    profile = get_collection_profile(collection)
+    qa_band = profile.get("qa_band") or "scl"
+    aliases = profile.get("band_aliases") or {}
+    radiometry = _radiometry_for(profile)
+
+    def resolve(band):
+        return aliases.get(band) or {"swir": "swir16", "swir2": "swir22"}.get(band, band)
+
+    required = {"red", "green", "blue", qa_band}
     for index in indices:
         required.update(INDEX_DEFINITIONS[index]["bands"])
     result = {}
@@ -59,19 +74,22 @@ def read_scene_assets(periods, bbox, indices, *, before_request, size=256):
         if len(dates) != 1:
             raise ValueError("同一时相不能包含跨日期拼接场景")
         for position, candidate in enumerate(candidates):
-            selected = {band: candidate["assets"].get("swir16" if band == "swir" else band) for band in required}
+            selected = {band: candidate["assets"].get(resolve(band)) for band in required}
             missing = [band for band, asset in selected.items() if not asset or not asset.get("href")]
             if missing:
                 raise ValueError("场景缺少必需资产：" + ", ".join(sorted(missing)))
             for band, asset in sorted(selected.items()):
                 before_request()
-                array = fetch_cog_bbox_array(asset, bbox, None, size=size, kind="scl" if band == "scl" else "reflectance", verify_grid=True)
+                array = fetch_cog_bbox_array(_sign_asset_for_collection(asset, profile), bbox, None,
+                                             size=size, kind="scl" if band == qa_band else "reflectance",
+                                             verify_grid=True, radiometry=radiometry)
                 if array.shape != (size, size):
                     raise ValueError("场景输出网格尺寸不一致")
                 result[f"p{period}_s{position}_{band}"] = array
             contracts.append({"period": period, "position": position, "scene_id": candidate["product_id"],
                               "acquired_at": candidate["acquired_at"], "assets": selected})
     return result, {"projection": "EPSG:4326", "shape": [size, size], "bbox": bbox,
+                    "collection": collection, "qa_band": qa_band,
                     "qa_resampling": "nearest", "spectral_resampling": "bilinear", "scenes": contracts}
 
 
@@ -83,18 +101,21 @@ def apply_masks(arrays, contract, polygon):
     output = {"aoi": aoi}
     stats = []
     periods = sorted({scene["period"] for scene in contract["scenes"]})
+    qa_band = contract.get("qa_band") or "scl"
+    qa_profile = get_collection_profile(contract.get("collection") or "")
     for period in periods:
         valid = np.zeros(shape, dtype=bool)
         scenes = [scene for scene in contract["scenes"] if scene["period"] == period]
-        bands = set(scenes[0]["assets"]) - {"scl"}
+        bands = set(scenes[0]["assets"]) - {qa_band}
         combined = {band: np.full(shape, np.nan, dtype=np.float32) for band in bands}
         for scene in scenes:
             prefix = f"p{period}_s{scene['position']}_"
-            scl = arrays[prefix + "scl"]
-            mask = aoi & np.isfinite(scl) & np.isin(scl, [4, 5, 6, 7])
+            scl = arrays[prefix + qa_band]
+            mask = aoi & _qa_valid_mask(scl, qa_profile)
             for band in bands:
                 values = arrays[prefix + band]
-                mask &= np.isfinite(values) & (values >= 0) & (values <= 1)
+                # float32 边界容差:校准后 0/1 边界可能落在 -1e-9 量级,不应剔除
+                mask &= np.isfinite(values) & (values >= -1e-6) & (values <= 1 + 1e-6)
             take = mask & ~valid
             for band in bands:
                 combined[band][take] = arrays[prefix + band][take]
@@ -121,7 +142,7 @@ def calculate_products(arrays, indices, periods):
             count = int(valid.sum())
             if count < 1024 or count / aoi_count < 0.6:
                 raise ValueError("指数计算后的有效像元不足")
-            threshold = 0.3 if index == "ndvi" else 0.1
+            threshold = 0.3 if index == "ndvi" else -0.1 if index == "nbr" else 0.1
             stats = summarize(values, valid_mask=valid, threshold=threshold)
             sensitivity = [{"threshold": round(threshold + delta, 4), "ratio": round(float(np.mean(values[valid] > threshold + delta)), 4)}
                            for delta in (-0.05, -0.02, 0.02, 0.05)]

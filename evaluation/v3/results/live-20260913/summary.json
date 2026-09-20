@@ -1,0 +1,39 @@
+{
+  "status": "incomplete",
+  "suite": "direct-vision-identical-input",
+  "samples": 120,
+  "variants": {
+    "direct-vision-baseline": {
+      "scored": 120,
+      "answer_exact": 59.17,
+      "localization": {
+        "status": "unavailable",
+        "reason": "RSVQA-HR-2k 行不含对象坐标；不伪造定位真值"
+      },
+      "task_completion": {
+        "status": "unavailable",
+        "reason": "固定公开 VQA 没有真实长任务完成标注"
+      },
+      "multi_turn_reference": {
+        "status": "not_run",
+        "reason": "固定公开 VQA 是单轮标注；长任务协议另列且不计分"
+      }
+    }
+  },
+  "incomplete": {
+    "direct-vision-candidate-a": {
+      "completed_samples": 7,
+      "required_samples": 120,
+      "status": "incomplete"
+    },
+    "direct-vision-candidate-b": {
+      "completed_samples": 66,
+      "required_samples": 120,
+      "status": "incomplete"
+    }
+  },
+  "failures": {},
+  "promotion": {},
+  "reference_answers_exported": false,
+  "note": "三组仅比较视觉模型；这不是 V3 harness 对照。harness 另以 --harness-smoke 真实执行。"
+}

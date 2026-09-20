@@ -95,7 +95,7 @@ class SlotPlanningTests(SimpleTestCase):
     def test_slot_schema_source_enum_extended(self):
         self.assertEqual(
             set(SLOT_SCHEMA["properties"]["source"]["enum"]),
-            {"sentinel2", "mapbox", "tianditu", "esri", "sentinel1", "copdem"},
+            {"sentinel2", "mapbox", "tianditu", "esri", "sentinel1", "copdem", "landsat"},
         )
 
 
@@ -105,7 +105,7 @@ class AgentToolSchemaTests(SimpleTestCase):
         collection = schema["properties"]["collection"]
         self.assertEqual(
             set(collection["enum"]),
-            {"sentinel-2-l2a", "sentinel-2-c1-l2a", "sentinel-2-l1c", "sentinel-1-grd", "cop-dem-glo-30"},
+            {"sentinel-2-l2a", "sentinel-2-c1-l2a", "sentinel-2-l1c", "sentinel-1-grd", "cop-dem-glo-30", "landsat-c2-l2"},
         )
         self.assertEqual(collection["default"], "sentinel-2-l2a")
 

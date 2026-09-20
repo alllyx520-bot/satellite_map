@@ -1,0 +1,27 @@
+name: satellitesense-v3-local
+services:
+  database:
+    image: postgis/postgis:17-3.5
+    environment:
+      POSTGRES_DB: satellitesense
+      POSTGRES_USER: satellitesense
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - v3_database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U satellitesense -d satellitesense"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  analysis-image:
+    profiles: ["build"]
+    image: satellitesense-analysis:local
+    build:
+      context: ./analysis
+    network_mode: none
+    read_only: true
+    command: ["python", "-c", "import rasterio, pyproj, shapely; print('analysis dependencies ready')"]
+volumes:
+  v3_database:

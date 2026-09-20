@@ -569,7 +569,7 @@ REGISTRY = {
     },
     "search_sentinel_imagery": {
         "name": "search_sentinel_imagery",
-        "description": "检索公开卫星影像并渲染。collection 默认 sentinel-2-l2a(Sentinel-2 光学，适合水体/植被/农业/宏观土地利用/时效变化)；sentinel-2-c1-l2a 为新版基线等价产品；L2A 无覆盖时可试 sentinel-2-l1c(无 SCL 云掩膜，指数不可用)；洪水/淹没/多云/夜间等全天候需求用 sentinel-1-grd(SAR)；地形/坡度/高程用 cop-dem-glo-30(静态 DEM)。内含云量与时相质量门控，可能需要用户确认。",
+        "description": "检索公开卫星影像并渲染。collection 默认 sentinel-2-l2a(Sentinel-2 光学，适合水体/植被/农业/宏观土地利用/时效变化)；sentinel-2-c1-l2a 为新版基线等价产品；L2A 无覆盖时可试 sentinel-2-l1c(无 SCL 云掩膜，指数不可用)；洪水/淹没/多云/夜间等全天候需求用 sentinel-1-grd(SAR)；地形/坡度/高程用 cop-dem-glo-30(静态 DEM)；历史回溯(1982 年起)/多年前对比/热岛背景用 landsat-c2-l2(Landsat C2 L2，30m)。内含云量与时相质量门控，可能需要用户确认。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -578,8 +578,8 @@ REGISTRY = {
                 "date_end": {"type": "string", "description": "ISO 日期，可选"},
                 "max_cloud": {"type": "number", "description": "云量上限百分比，默认 60"},
                 "collection": {"type": "string", "default": "sentinel-2-l2a",
-                               "enum": ["sentinel-2-l2a", "sentinel-2-c1-l2a", "sentinel-2-l1c", "sentinel-1-grd", "cop-dem-glo-30"],
-                               "description": "影像 collection；洪水/全天候→sentinel-1-grd，地形→cop-dem-glo-30，L2A 无覆盖→sentinel-2-l1c"},
+                               "enum": ["sentinel-2-l2a", "sentinel-2-c1-l2a", "sentinel-2-l1c", "sentinel-1-grd", "cop-dem-glo-30", "landsat-c2-l2"],
+                               "description": "影像 collection；洪水/全天候→sentinel-1-grd，地形→cop-dem-glo-30，历史回溯→landsat-c2-l2，L2A 无覆盖→sentinel-2-l1c"},
             },
             "required": [],
         },

@@ -3,7 +3,7 @@
 核心范式（对齐 Codex/Claude Code/OpenCode）：模型在工具注册表里自主选工具 ->
 观察结果 -> 必要时重规划 -> 直到给出最终复核结论。护栏约束成本与 runaway。
 
-- agent_step：唯一 GLM 决策拦截点，测试经 patch("map_api.agent.loop.agent_step",
+- agent_step：唯一控制器决策拦截点(默认 DeepSeek-flash)，测试经 patch("map_api.agent.loop.agent_step",
   side_effect=[...]) 脚本化，无需 patch 底层 call_deepseek。
 - run_agent_loop：替换 run_agent_session。
 - resume_waiting_agent_session：替换 orchestrator 同名；结构化 action code 路由 +
@@ -84,19 +84,19 @@ SYSTEM_PROMPT = """你是 SatelliteSense 遥感调查 Agent。基于用户目标
 - 收集到足够信息后 tool_call=null，final_answer 给出复核结论。
 - 最终结论必须含"复核结论"三字，区分可见事实/模型推断/数据限制，不要夸大 bbox 筛查与 NDWI 的精度。
 - 最终回答必须从当前上下文列出的 evidence_id 中引用当前场景的指标与视觉复核证据，并提供非空 limitations；不能编造引用。
-- water/vegetation/agriculture/land_use 任务优先 Sentinel-2；small_target/built_up 优先 Mapbox 高清底图（fetch_mapbox_imagery 可用 basemap_source 切换天地图/Esri：中国区行政区调查优先 tianditu，全球细节可用 esri）；洪水/淹没/多云/夜间等全天候需求优先 Sentinel-1 SAR；地形/坡度/高程需求用 Copernicus DEM。
+- water/vegetation/agriculture/land_use 任务优先 Sentinel-2；small_target/built_up 优先 Mapbox 高清底图（fetch_mapbox_imagery 可用 basemap_source 切换天地图/Esri：中国区行政区调查优先 tianditu，全球细节可用 esri）；洪水/淹没/多云/夜间等全天候需求优先 Sentinel-1 SAR；地形/坡度/高程需求用 Copernicus DEM；历史回溯（1982 年起）/多年前对比/热岛背景用 Landsat（30m，经 Planetary Computer）。
 - 不要重复调用已成功的工具；复用工具返回的结果。
 - 工具失败时先判断失败类型：瞬时网络问题可有限重试，权限/参数问题要换方案或请求用户；不要盲目重复同一调用。
 - 计划不是固定流水线。可根据证据删减、插入或重排步骤，plan 中只保留当前真正需要的步骤。
-- 典型流程：geocode_place -> search_sentinel_imagery / fetch_mapbox_imagery -> (water 任务) compute_ndwi -> analyze_imagery -> final_answer。search_sentinel_imagery 支持 collection 参数：默认 sentinel-2-l2a；洪水/全天候用 sentinel-1-grd，地形用 cop-dem-glo-30，L2A 无覆盖可试 sentinel-2-l1c。
+- 典型流程：geocode_place -> search_sentinel_imagery / fetch_mapbox_imagery -> (water 任务) compute_ndwi -> analyze_imagery -> final_answer。search_sentinel_imagery 支持 collection 参数：默认 sentinel-2-l2a；洪水/全天候用 sentinel-1-grd，地形用 cop-dem-glo-30，历史回溯/多年前对比用 landsat-c2-l2，L2A 无覆盖可试 sentinel-2-l1c。
 - vegetation/agriculture 任务必须先调用 compute_spectral_index(index="ndvi")，current_step="compute_metric"，不能用视觉解译代替指标计算。
 - 若工具返回 status=waiting，说明已暂停征求用户确认，本轮不要重复调用该工具。"""
 
 
 def agent_step(messages, tools_spec, session_ctx):
-    """唯一 GLM 决策点；关键节点可附带当前影像。
+    """唯一控制器决策点(默认 DeepSeek-flash)；关键节点可附带当前影像。
 
-    生产：调 GLM JSON 模式，解析为 step dict。
+    生产：调控制器 JSON 模式，解析为 step dict。
     测试：经 patch("map_api.agent.loop.agent_step", side_effect=[...]) 脚本化。
     """
     from ..utils.agent_tools import call_glm_json, image_file_to_data_url
@@ -144,7 +144,7 @@ def agent_step(messages, tools_spec, session_ctx):
     # 但只有模型明确输出的观察才进入 visual_observation。
     if not result["thought"] and not result["tool_call"] and not result["final_answer"]:
         # HTTP 200 但没有可执行决策属于无效模型输出，不能伪装成正常思考。
-        raise ValueError("GLM 返回空决策")
+        raise ValueError("控制器返回空决策")
     return result
 
 
@@ -354,6 +354,8 @@ def _deterministic_next_call(ctx):
             return {"name": "search_sentinel_imagery", "args": {"collection": "sentinel-1-grd"}, "step": "retrieve_imagery"}
         if source == "copdem":
             return {"name": "search_sentinel_imagery", "args": {"collection": "cop-dem-glo-30"}, "step": "retrieve_imagery"}
+        if source == "landsat":
+            return {"name": "search_sentinel_imagery", "args": {"collection": "landsat-c2-l2"}, "step": "retrieve_imagery"}
         return {"name": "search_sentinel_imagery", "args": {}, "step": "retrieve_imagery"}
     if slots.get("task") == "water" and slots.get("source") == "sentinel2" and ctx.get("ndwi") is None:
         return {"name": "compute_ndwi", "args": {}, "step": "ndwi"}
@@ -693,8 +695,8 @@ def _run_loop(session, ctx, tool_history, context):
                      ["基于当前任务目标、已完成工具结果和质量门控"])),
             "tool_call": tool_call,
             "has_final_answer": bool(final_answer),
-            "provider": "bigmodel",
-            "model": os.environ.get("AGENT_MODEL", "glm-5.3-flash"),
+            "provider": os.environ.get("AGENT_PROVIDER", "deepseek"),
+            "model": os.environ.get("AGENT_MODEL", "deepseek-flash"),
             "vision_used": bool(step.get("vision_used")),
             "vision_trigger": step.get("vision_trigger"),
             "image_ref": ({
@@ -711,8 +713,8 @@ def _run_loop(session, ctx, tool_history, context):
             "next": step.get("next_action") or ("继续执行下一步工具" if tool_call else "整理最终复核结论"),
             "decision_confidence": step.get("decision_confidence"),
             "primary_interpreter": "qwen" if ctx.get("vision_answer") else None,
-            "decision_reviewer": "glm" if step.get("vision_used") else None,
-            "vision_reviewer": "glm" if step.get("vision_used") else None,
+            "decision_reviewer": os.environ.get("AGENT_PROVIDER", "deepseek") if step.get("vision_used") else None,
+            "vision_reviewer": os.environ.get("AGENT_PROVIDER", "deepseek") if step.get("vision_used") else None,
             "evidence_refs": [f"scene:{ctx.get('scene_id')}"] if step.get("vision_used") and ctx.get("scene_id") else [],
         }, expected_claim=expected_claim)
 

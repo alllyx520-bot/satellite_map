@@ -17,7 +17,7 @@ class SpectralAssetTests(SimpleTestCase):
 
     def setUp(self):
         self.assets = {name: {"href": f"https://example.test/{name}.tif", "raster:bands": [{"scale": 0.0001, "offset": -0.1, "nodata": 0}]} for name in ["green", "nir", "scl"]}
-        self.candidate = SimpleNamespace(assets=self.assets)
+        self.candidate = SimpleNamespace(assets=self.assets, collection="sentinel-2-c1-l2a")
         self.arrays = {"green": np.full((64, 64), 6000, dtype=np.uint16), "nir": np.full((64, 64), 2000, dtype=np.uint16), "scl": np.full((64, 64), 6, dtype=np.uint16)}
 
     def response(self, url, *, params, **kwargs):
@@ -108,7 +108,7 @@ class SpectralAssetTests(SimpleTestCase):
             assets=deepcopy(self.assets)
             for name,asset in assets.items():
                 asset["href"]=f"https://example.test/{identifier}/{name}.tif"
-            candidates.append(SimpleNamespace(assets=assets,product_id=identifier,acquired_at=datetime(2026,4,1,tzinfo=timezone.utc)))
+            candidates.append(SimpleNamespace(assets=assets,collection="sentinel-2-c1-l2a",product_id=identifier,acquired_at=datetime(2026,4,1,tzinfo=timezone.utc)))
         return candidates
 
     def test_same_date_mosaic_counts_overlapping_pixels_once(self):

@@ -1,0 +1,6 @@
+-r requirements.txt
+rasterio==1.4.4
+pyproj==3.7.2
+shapely==2.1.2
+scipy==1.17.1
+psycopg[binary]==3.3.5

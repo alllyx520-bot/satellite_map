@@ -1,0 +1,122 @@
+[
+ {
+  "date": "2026-03-05",
+  "water_corridor_km2": 1.2,
+  "water_corridor_clear_km2": 1.2,
+  "corridor_clear_pct": 77.0,
+  "water_corridor_est_km2": 1.5,
+  "ice_corridor_km2": 186.9,
+  "water_outside_km2": 1.5,
+  "total_water_km2": 2.7
+ },
+ {
+  "date": "2026-03-20",
+  "water_corridor_km2": 47.5,
+  "water_corridor_clear_km2": 47.5,
+  "corridor_clear_pct": 99.3,
+  "water_corridor_est_km2": 47.8,
+  "ice_corridor_km2": 110.0,
+  "water_outside_km2": 25.3,
+  "total_water_km2": 72.8
+ },
+ {
+  "date": "2026-03-23",
+  "water_corridor_km2": 37.9,
+  "water_corridor_clear_km2": 37.9,
+  "corridor_clear_pct": 99.0,
+  "water_corridor_est_km2": 38.3,
+  "ice_corridor_km2": 144.9,
+  "water_outside_km2": 34.7,
+  "total_water_km2": 72.7
+ },
+ {
+  "date": "2026-03-28",
+  "water_corridor_km2": 55.2,
+  "water_corridor_clear_km2": 55.2,
+  "corridor_clear_pct": 99.4,
+  "water_corridor_est_km2": 55.6,
+  "ice_corridor_km2": 110.8,
+  "water_outside_km2": 78.1,
+  "total_water_km2": 133.3
+ },
+ {
+  "date": "2026-04-07",
+  "water_corridor_km2": 41.6,
+  "water_corridor_clear_km2": 41.6,
+  "corridor_clear_pct": 93.8,
+  "water_corridor_est_km2": 44.3,
+  "ice_corridor_km2": 112.8,
+  "water_outside_km2": 2.9,
+  "total_water_km2": 44.4
+ },
+ {
+  "date": "2026-04-14",
+  "water_corridor_km2": 95.3,
+  "water_corridor_clear_km2": 95.3,
+  "corridor_clear_pct": 82.4,
+  "water_corridor_est_km2": 115.7,
+  "ice_corridor_km2": 14.1,
+  "water_outside_km2": 1.8,
+  "total_water_km2": 97.1
+ },
+ {
+  "date": "2026-04-24",
+  "water_corridor_km2": 56.4,
+  "water_corridor_clear_km2": 56.4,
+  "corridor_clear_pct": 45.9,
+  "water_corridor_est_km2": 122.9,
+  "ice_corridor_km2": 0.0,
+  "water_outside_km2": 3.5,
+  "total_water_km2": 59.9
+ },
+ {
+  "date": "2026-04-29",
+  "water_corridor_km2": 130.3,
+  "water_corridor_clear_km2": 130.3,
+  "corridor_clear_pct": 99.8,
+  "water_corridor_est_km2": 130.5,
+  "ice_corridor_km2": 0.0,
+  "water_outside_km2": 4.1,
+  "total_water_km2": 134.4
+ },
+ {
+  "date": "2026-05-09",
+  "water_corridor_km2": 113.7,
+  "water_corridor_clear_km2": 113.7,
+  "corridor_clear_pct": 91.9,
+  "water_corridor_est_km2": 123.7,
+  "ice_corridor_km2": 0.0,
+  "water_outside_km2": 6.2,
+  "total_water_km2": 119.8
+ },
+ {
+  "date": "2026-05-11",
+  "water_corridor_km2": 80.3,
+  "water_corridor_clear_km2": 80.3,
+  "corridor_clear_pct": 99.0,
+  "water_corridor_est_km2": 81.1,
+  "ice_corridor_km2": 0.0,
+  "water_outside_km2": 0.6,
+  "total_water_km2": 80.9
+ },
+ {
+  "date": "2026-05-14",
+  "water_corridor_km2": 79.9,
+  "water_corridor_clear_km2": 79.9,
+  "corridor_clear_pct": 99.0,
+  "water_corridor_est_km2": 80.7,
+  "ice_corridor_km2": 0.0,
+  "water_outside_km2": 0.5,
+  "total_water_km2": 80.4
+ },
+ {
+  "date": "2026-05-31",
+  "water_corridor_km2": 37.7,
+  "water_corridor_clear_km2": 37.7,
+  "corridor_clear_pct": 98.8,
+  "water_corridor_est_km2": 38.1,
+  "ice_corridor_km2": 0.0,
+  "water_outside_km2": 0.3,
+  "total_water_km2": 38.0
+ }
+]

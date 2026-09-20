@@ -71,7 +71,7 @@ def sync_session(session_id, *, snapshot=None, error="", expected_claim=None):
     if not run_id:
         return None
     existing = AgentRun.objects.select_for_update().get(pk=run_id)
-    if existing.execution_engine == "dag":
+    if existing.execution_engine in {"dag", "harness"}:
         # New runs are authoritative. Legacy views/workers cannot overwrite them.
         return existing
     target = session.status

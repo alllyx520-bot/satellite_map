@@ -8,7 +8,10 @@ import requests
 from jsonschema import Draft202012Validator, ValidationError
 
 from .decision import DECISION_SCHEMA, validate_decision
-from ..utils.agent_tools import AGENT_MODEL, GLM_CHAT_URL, _parse_json_response, request_proxies
+from ..utils.agent_tools import (
+    AGENT_MODEL, DEEPSEEK_CHAT_URL, GLM_CHAT_URL,
+    _parse_json_response, deepseek_headers, glm_headers, request_proxies,
+)
 
 
 @dataclass
@@ -177,6 +180,12 @@ class OpenAICompatibleProvider:
                             "usage": usage, "image_count": 0, "error": error.as_dict() if error else None})
 
 
+class DeepSeekProvider(OpenAICompatibleProvider):
+    """DeepSeek(OpenAI 兼容)——当前默认 Agent 控制器;不发 GLM 专有参数。"""
+
+    name = "deepseek"
+
+
 class GLMProvider(OpenAICompatibleProvider):
     name = "glm"
 
@@ -191,10 +200,13 @@ class QwenProvider(OpenAICompatibleProvider):
 
 
 def configured_provider(*, name=None, model=None, **kwargs):
-    provider = (name or os.environ.get("AGENT_PROVIDER", "glm")).lower()
-    from ..utils.agent_tools import glm_headers
+    provider = (name or os.environ.get("AGENT_PROVIDER", "deepseek")).lower()
+    if provider == "deepseek":
+        return DeepSeekProvider(model=model or os.environ.get("AGENT_MODEL", AGENT_MODEL),
+                                endpoint=os.environ.get("DEEPSEEK_CHAT_URL", DEEPSEEK_CHAT_URL),
+                                headers=deepseek_headers, **kwargs)
     if provider == "glm":
-        return GLMProvider(model=model or os.environ.get("AGENT_MODEL", AGENT_MODEL),
+        return GLMProvider(model=model or os.environ.get("AGENT_MODEL", "glm-5.3-flash"),
                            endpoint=os.environ.get("GLM_CHAT_URL", GLM_CHAT_URL), headers=glm_headers, **kwargs)
     options = {
         "qwen": (QwenProvider, "DASHSCOPE_API_KEY", "QWEN_CHAT_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "QWEN_AGENT_MODEL"),

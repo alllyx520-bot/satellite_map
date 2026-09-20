@@ -78,7 +78,7 @@ LEGACY_DECISION_SCHEMA = {
 
 def validate_legacy_decision(value, definitions):
     if not value:
-        raise ValueError("GLM 返回空决策")
+        raise ValueError("控制器返回空决策")
     try:
         Draft202012Validator(LEGACY_DECISION_SCHEMA).validate(value)
     except ValidationError as exc:

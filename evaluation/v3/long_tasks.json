@@ -1,0 +1,22 @@
+[
+  {"id":"lt-01","status":"not_run","protocol":"给定两期带官方元数据的同一 AOI 影像，提出变化结论并引用每期窗口。","required_evidence":["两期影像 ID","窗口坐标","日期与覆盖限制"]},
+  {"id":"lt-02","status":"not_run","protocol":"从全图到局部检查农业地块，区分可见事实与推测。","required_evidence":["概览","至少两处局部观察","不确定性"]},
+  {"id":"lt-03","status":"not_run","protocol":"识别水体线索，报告证据窗口与不能确认的边界。","required_evidence":["观察 ID","窗口坐标","限制"]},
+  {"id":"lt-04","status":"not_run","protocol":"核查道路施工线索，禁止将低分辨率纹理报告为事实。","required_evidence":["局部观察","置信度","限制"]},
+  {"id":"lt-05","status":"not_run","protocol":"比较同源配准影像的土地覆盖变化。","required_evidence":["配准说明","两期窗口","变化限制"]},
+  {"id":"lt-06","status":"not_run","protocol":"回答建筑密度问题并说明计数口径。","required_evidence":["窗口","计数口径","覆盖范围"]},
+  {"id":"lt-07","status":"not_run","protocol":"调查港区船只线索，要求多窗口引用。","required_evidence":["至少两窗口","可见性限制","结论"]},
+  {"id":"lt-08","status":"not_run","protocol":"判断疑似火烧痕迹，只报告影像可见内容。","required_evidence":["局部观察","日期来源","替代解释"]},
+  {"id":"lt-09","status":"not_run","protocol":"给出城市扩张证据链并保留历史问答引用。","required_evidence":["历史消息序号","影像 ID","窗口"]},
+  {"id":"lt-10","status":"not_run","protocol":"提出洪涝初判与所需外部数据缺口。","required_evidence":["水体窗口","时相","限制"]},
+  {"id":"lt-11","status":"not_run","protocol":"比较两个疑似目标的空间关系。","required_evidence":["两个观察 ID","空间关系","坐标系"]},
+  {"id":"lt-12","status":"not_run","protocol":"核查农田长势问题，区分视觉现象和指数结论。","required_evidence":["视觉窗口","数据产品","限制"]},
+  {"id":"lt-13","status":"not_run","protocol":"在大 AOI 中计划分块检查并说明覆盖率。","required_evidence":["计划","窗口清单","覆盖限制"]},
+  {"id":"lt-14","status":"not_run","protocol":"回答机场设施变化问题并引用两期证据。","required_evidence":["两期证据","日期","配准状态"]},
+  {"id":"lt-15","status":"not_run","protocol":"判断矿区扰动线索，提出可复核结论。","required_evidence":["局部证据","不确定性","下一步"]},
+  {"id":"lt-16","status":"not_run","protocol":"检查森林破碎化并说明像素分辨率限制。","required_evidence":["窗口","分辨率","限制"]},
+  {"id":"lt-17","status":"not_run","protocol":"多轮追问后复述前一轮证据而不新增未观察事实。","required_evidence":["历史引用","观察 ID","限制"]},
+  {"id":"lt-18","status":"not_run","protocol":"要求模型拒绝不存在的图像定位引用。","required_evidence":["拒绝理由","有效 ID 范围","安全替代"]},
+  {"id":"lt-19","status":"not_run","protocol":"在缺少日期元数据时明确停留在视觉描述。","required_evidence":["缺失字段","视觉事实","限制"]},
+  {"id":"lt-20","status":"not_run","protocol":"对视觉模型复核结果进行交叉引用并陈述分歧。","required_evidence":["初始观察","复核 ID","分歧处理"]}
+]

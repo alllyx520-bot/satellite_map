@@ -18,6 +18,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_project_env(BASE_DIR)
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')  # 卫星图保存的本地绝对路径
 MEDIA_URL = '/media/'  # 前端访问图片的URL前缀
+# Local development executes analysis with this project's Python interpreter.
+# Docker remains an explicit alternative, never a startup dependency.
+V3_PYTHON_RUNTIME = os.environ.get("V3_PYTHON_RUNTIME", "local").strip().lower()
 LOG_DIR = os.path.join(MEDIA_ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -118,6 +121,21 @@ DATABASES = {
         "OPTIONS": {"timeout": 30, "transaction_mode": "IMMEDIATE"},
     }
 }
+
+# Production V3 uses PostgreSQL/PostGIS. SQLite remains a supported local
+# development/rollback backend; no existing database is implicitly migrated.
+if os.environ.get("V3_DATABASE_ENGINE") == "postgis":
+    DATABASES["default"] = {
+        # Spatial columns/indexes are maintained by migration 0027. The normal
+        # psycopg backend avoids requiring a second host GDAL runtime for ORM IO.
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("PGDATABASE", "satellitesense"),
+        "USER": os.environ.get("PGUSER", "satellitesense"),
+        "PASSWORD": os.environ.get("PGPASSWORD", ""),
+        "HOST": os.environ.get("PGHOST", "127.0.0.1"),
+        "PORT": os.environ.get("PGPORT", "5432"),
+        "CONN_MAX_AGE": 60,
+    }
 
 
 # SQLite 并发硬化(P-4):Web 读 + 后台下载/Agent 线程写共用一个库,

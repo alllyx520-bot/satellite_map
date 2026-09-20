@@ -50,6 +50,14 @@ SOURCE_CAPABILITIES = {
         "change_detection": False,
         "small_target_detection": False,
     },
+    # Landsat C2 L2(30m 筛查级):L2 反射率支持光谱指数;变化检测仍受两期一致性门控。
+    "landsat": {
+        "visual_interpretation": True,
+        "spectral_index": True,
+        "physical_measurement": False,
+        "change_detection": True,
+        "small_target_detection": False,
+    },
 }
 
 
@@ -73,7 +81,7 @@ class SceneDataContract:
 
 def capabilities_for(source, *, temporal_consistency="single_scene", has_common_mask=False):
     result = dict(SOURCE_CAPABILITIES.get(source, {}))
-    if source == "sentinel2":
+    if source in ("sentinel2", "landsat"):
         # 单景/同日拼接本身不是变化检测输入；只有显式完成两期共同掩膜后才开放。
         result["change_detection"] = temporal_consistency == "two_date_aligned" and has_common_mask
     else:
@@ -94,7 +102,7 @@ def build_scene_contract(scene, *, assets=None, polygon=None):
     limitations = list(metadata.get("limitations") or [])
     if source in ("mapbox", "tianditu", "esri"):
         limitations.extend(["拍摄时间未知", "原生传感器 GSD 未知", "不可用于光谱指数、正式变化检测或物理测量"])
-    elif source in ("sentinel1", "copdem"):
+    elif source in ("sentinel1", "copdem", "landsat"):
         profile_limitations = get_collection_profile(metadata.get("collection")).get("limitations")
         if profile_limitations:
             limitations.append(profile_limitations)

@@ -174,7 +174,7 @@ def run_replan(request, run_id):
                 date.fromisoformat(conditions[field])
         if conditions.get("date_start") and conditions.get("date_end") and conditions["date_start"] > conditions["date_end"]:
             raise ValueError("起始日期不能晚于结束日期")
-        if "source" in conditions and conditions["source"] not in {"sentinel2", "mapbox", "tianditu", "esri", "sentinel1", "copdem"}:
+        if "source" in conditions and conditions["source"] not in {"sentinel2", "mapbox", "tianditu", "esri", "sentinel1", "copdem", "landsat"}:
             raise ValueError("不支持的数据源")
         if "place_name" in conditions and (not isinstance(conditions["place_name"], str) or not 1 <= len(conditions["place_name"]) <= 200):
             raise ValueError("地点名称无效")

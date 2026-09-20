@@ -578,6 +578,14 @@ document.addEventListener('DOMContentLoaded', () => {
             collection: 'cop-dem-glo-30',
             skipTileProgress: true,
             badge: 'DEM'
+        },
+        landsat: {
+            label: '历史回溯·Landsat',
+            historyPrefix: '历史回溯·Landsat',
+            endpoint: '/api/satellite/get-sentinel-img/',
+            collection: 'landsat-c2-l2',
+            skipTileProgress: true,
+            badge: 'LS'
         }
     };
 
@@ -729,7 +737,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (event?.kind === 'model_decision') {
             if (payload.vision_used) {
                 return {
-                    title: 'GLM-5.3-Flash 视觉辅助判断',
+                    title: 'DeepSeek-V4.1-Flash 视觉辅助判断',
                     body: [payload.summary || '已查看当前影像并生成公开决策摘要', payload.visual_observation ? `观察：${payload.visual_observation}` : '未提供独立视觉观察'].filter(Boolean).join(' · '),
                     why: (payload.why || []).join('；') || '结合影像、覆盖率和质量证据进行判断',
                 };
@@ -1459,7 +1467,7 @@ document.addEventListener('DOMContentLoaded', () => {
         div._mapBounds = [[mapBbox.min_lat, mapBbox.min_lng], [mapBbox.max_lat, mapBbox.max_lng]];
         div._dataBbox = dataBbox;
         div.innerHTML = `
-            <button class="delete-btn" title="删除此项"><i class="ri-close-line" aria-hidden="true"></i></button>
+            <button class="delete-btn" title="删除此项" aria-label="删除此项"><i class="ri-close-line" aria-hidden="true"></i></button>
             <input type="checkbox" class="select-cb" aria-label="选择区域 #${c}">
             <div class="coord-title-row">
                 <strong><i class="ri-focus-3-line" aria-hidden="true"></i> 区域 #${c}</strong>
@@ -1882,6 +1890,8 @@ document.addEventListener('DOMContentLoaded', () => {
             sourceChip = `<span title="极化 / 合成孔径雷达"><i class="ri-radar-line" aria-hidden="true"></i>${escapeHtml(String(instruments))}</span>`;
         } else if (scene.source === 'copdem') {
             sourceChip = `<span title="静态 DEM"><i class="ri-mountain-line" aria-hidden="true"></i>静态 DEM · 采集基线 2011-2015</span>`;
+        } else if (scene.source === 'landsat') {
+            sourceChip = `<span title="Landsat Collection 2 Level-2 · 经 Planetary Computer 匿名签名"><i class="ri-history-line" aria-hidden="true"></i>Landsat · 30m · 可回溯 1982+</span>`;
         } else if (scene.source === 'tianditu' || scene.source === 'esri') {
             const basemapLabel = scene.source === 'tianditu' ? '天地图影像' : 'Esri World Imagery';
             sourceChip = `<span title="高清底图，无拍摄时间，仅视觉参考"><i class="ri-map-2-line" aria-hidden="true"></i>${basemapLabel} · 无拍摄时间</span>`;
@@ -2651,6 +2661,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 delBtn.className = 'history-delete';
                 delBtn.type = 'button';
                 delBtn.title = '删除历史';
+                delBtn.setAttribute('aria-label', '删除历史记录');
                 delBtn.innerHTML = '<i class="ri-close-line" aria-hidden="true"></i>';
                 delBtn.addEventListener('click', async (e) => {
                     e.stopPropagation();

@@ -1,5 +1,16 @@
 # REVIEW_FINDINGS — SatelliteSense 审查问题清单
 
+> **状态：已收口的时点记录（2026-07-21 那一轮），不是当前缺陷列表。**
+> 配对计划见 [REVIEW_PLAN.md](REVIEW_PLAN.md)（其文末「执行状态」为最终结论：Phase 0–10 全部完成），
+> 当时的问题均已 closed 或 wontfix。当前实现与已知限制见 [CLAUDE.md](CLAUDE.md)。
+>
+> **关于本文档内部的重复与冲突**：R7、R10、R11 各出现两条，且状态互相矛盾
+> （R7：:42 记 closed、:95 记 open；R10：:126 记 closed、:145 记 open；R11：:119 记 closed、:150 记 open）。
+> 这是逐轮追加留下的痕迹，**以配对计划表的"全部完成"为准**——重复条目的最终状态都是 closed。
+> 另：本文所有行号锚点基于当时的 `views.py`（3463 行），现已失效（当前 2471 行），定位请用 `grep`。
+>
+> 正文（以下）原样保留。
+
 - **开审日期**:2026-07-21
 - **基线**:git HEAD `ddac7d4` | Python 3.11.15 | Django 5.2.13
 - **基线验证**(2026-07-21):`manage.py test map_api` → **120 tests OK**;`manage.py smoke_pipeline` → 全 ok;`smoke_pipeline --agent` → 全 ok

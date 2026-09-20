@@ -40,6 +40,11 @@ class Command(BaseCommand):
             help="Also call the public Sentinel-2 search/render service. This depends on external network availability.",
         )
         parser.add_argument(
+            "--live-landsat",
+            action="store_true",
+            help="真调 Landsat C2 L2(经 Planetary Computer 匿名 SAS 签名)检索/渲染链路。依赖外部网络。",
+        )
+        parser.add_argument(
             "--live-sentinel1",
             action="store_true",
             help="真调 Sentinel-1 GRD(SAR) 检索/渲染链路，验证一等影像源注册。依赖外部网络。",
@@ -84,6 +89,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         keep_artifacts = options["keep_artifacts"]
         live_sentinel = options["live_sentinel"]
+        live_landsat = options["live_landsat"]
         live_sentinel1 = options["live_sentinel1"]
         live_agent_grid = options["live_agent_grid"]
         live_mapbox = options["live_mapbox"]
@@ -99,6 +105,7 @@ class Command(BaseCommand):
         report_name = ""
         live_sentinel_file = ""
         live_sentinel1_file = ""
+        live_landsat_file = ""
         live_agent_grid_file = ""
         live_mapbox_file = ""
         live_esri_file = ""
@@ -187,6 +194,17 @@ class Command(BaseCommand):
                     s1_scene.delete()
                 DownloadTask.objects.filter(file_name=live_sentinel1_file).delete()
                 _download_progress.pop(live_sentinel1_file, None)
+            if live_landsat_file:
+                ls_path = os.path.join(save_dir, live_landsat_file)
+                if os.path.exists(ls_path):
+                    os.remove(ls_path)
+                ls_scene = ImageryScene.objects.filter(file_name=live_landsat_file).first()
+                if ls_scene:
+                    DownloadTask.objects.filter(scene=ls_scene).delete()
+                    ChatHistory.objects.filter(scene=ls_scene).delete()
+                    ls_scene.delete()
+                DownloadTask.objects.filter(file_name=live_landsat_file).delete()
+                _download_progress.pop(live_landsat_file, None)
             if live_agent_grid_file:
                 grid_path = os.path.join(save_dir, live_agent_grid_file)
                 if os.path.exists(grid_path):
@@ -306,6 +324,8 @@ class Command(BaseCommand):
                     steps.append(("live_sentinel", lambda: self._check_live_sentinel(client, require, response_json)))
                 if live_sentinel1:
                     steps.append(("live_sentinel1", lambda: self._check_live_sentinel1(client, require, response_json)))
+                if live_landsat:
+                    steps.append(("live_landsat", lambda: self._check_live_landsat(client, require, response_json)))
                 if live_agent_grid:
                     steps.append(("live_agent_grid", lambda: self._check_live_agent_grid(require)))
                 if run_agent:
@@ -327,6 +347,8 @@ class Command(BaseCommand):
                         live_sentinel_file = results[-1]["data"]["file_name"]
                     if step_id == "live_sentinel1":
                         live_sentinel1_file = results[-1]["data"]["file_name"]
+                    if step_id == "live_landsat":
+                        live_landsat_file = results[-1]["data"]["file_name"]
                     if step_id == "live_agent_grid":
                         live_agent_grid_file = results[-1]["data"]["file_name"]
                     if step_id == "live_mapbox":
@@ -339,7 +361,7 @@ class Command(BaseCommand):
                         agent_session_id = results[-1]["data"]["session_id"]
                         agent_file = results[-1]["data"].get("file_name", "")
 
-            expected_steps = 5 + int(live_mapbox) + int(live_esri) + int(live_tianditu) + int(live_sentinel) + int(live_sentinel1) + int(live_agent_grid) + int(run_agent) + int(contract_change) + int(live_firms)
+            expected_steps = 5 + int(live_mapbox) + int(live_esri) + int(live_tianditu) + int(live_sentinel) + int(live_sentinel1) + int(live_landsat) + int(live_agent_grid) + int(run_agent) + int(contract_change) + int(live_firms)
             status = "passed" if all(item["ok"] for item in results) and len(results) == expected_steps else "failed"
             output = {
                 "status": status,
@@ -529,6 +551,38 @@ class Command(BaseCommand):
             "file_name": file_name,
             "candidate_count": payload.get("candidate_count"),
             "source": payload["scene"]["source"],
+        }
+
+    def _check_live_landsat(self, client, require, response_json):
+        # 南宁小 bbox + 2024 年日期范围:验证 PC STAC 检索、SAS 签名与 rgb_compose 渲染。
+        resp = client.post(
+            "/api/satellite/get-sentinel-img/",
+            data={
+                "min_lng": 108.30,
+                "min_lat": 22.75,
+                "max_lng": 108.35,
+                "max_lat": 22.80,
+                "target_resolution": 256,
+                "candidate_limit": 3,
+                "max_cloud": 60,
+                "start": "2024-01-01",
+                "end": "2024-12-31",
+                "collection": "landsat-c2-l2",
+            },
+            content_type="application/json",
+        )
+        data = response_json(resp)
+        require(resp.status_code == 200 and data.get("code") == 200, data.get("msg", "Landsat 真实链路失败"))
+        payload = data["data"]
+        file_name = payload["file_name"]
+        image_path = os.path.join(settings.MEDIA_ROOT, "satellite_imgs", file_name)
+        require(os.path.exists(image_path), "Landsat 影像未落盘")
+        require(payload["scene"]["source"] == "landsat", "Landsat scene source 不正确")
+        return {
+            "file_name": file_name,
+            "candidate_count": payload.get("candidate_count"),
+            "source": payload["scene"]["source"],
+            "bytes": os.path.getsize(image_path),
         }
 
     def _check_live_agent_grid(self, require):

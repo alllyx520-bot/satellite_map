@@ -15,6 +15,7 @@ import numpy as np
 import requests
 from PIL import Image
 
+from .imagery_sources.earth_search import get_collection_profile
 from .geo_math import (
     bbox_intersection_ratio, bbox_union_coverage_ratio,
     image_valid_ratio, crop_sentinel_nodata_border, sentinel_nodata_crop_too_large,
@@ -31,6 +32,9 @@ SENTINEL_DEFAULT_MIN_VALID_IMAGE_RATIO = 0.88
 
 
 def postprocess_cached_sentinel_scene(scene):
+    if scene.source != "sentinel2":
+        # SAR/DEM/Landsat 的暗区是有效信号,亮度驱动的 no-data 裁边会误裁(2026-09-10 实测)
+        return scene
     metadata = dict(scene.metadata or {})
     crop_meta = metadata.get("no_data_crop") or {}
     if crop_meta.get("applied"):
@@ -529,9 +533,16 @@ def sentinel_retrieval_result(
     source="sentinel2",
     source_label="Sentinel-2 L2A",
     source_label_mosaic="Sentinel-2 L2A 多景拼接",
+    auto_crop=None,
 ):
     if not candidates:
         return None
+    # profile 驱动的默认值:亮度启发式对 SAR/DEM 不适用,由 profile 放宽/关闭
+    profile = get_collection_profile(getattr(candidates[0], "collection", "") or "")
+    if auto_crop is None:
+        auto_crop = bool(profile.get("auto_crop", True))
+    if min_valid_ratio is None and profile.get("min_valid_ratio") is not None:
+        min_valid_ratio = float(profile["min_valid_ratio"])
     min_coverage = min_coverage if min_coverage is not None else float(
         os.environ.get("SENTINEL_MIN_COVERAGE_RATIO", str(SENTINEL_DEFAULT_MIN_COVERAGE_RATIO))
     )
@@ -592,17 +603,26 @@ def sentinel_retrieval_result(
                     "render_errors": metadata.get("render_fallback_errors") or [],
                 }
             try:
-                image_bytes = provider.render_candidate_jpeg(candidate, bbox, plan["total_w"], plan["total_h"])
+                _render_v = getattr(provider, "render_candidate_with_validity", None)
+                if _render_v is not None:
+                    image_bytes, detected_valid_ratio = _render_v(candidate, bbox, plan["total_w"], plan["total_h"])
+                else:
+                    image_bytes = provider.render_candidate_jpeg(candidate, bbox, plan["total_w"], plan["total_h"])
+                    detected_valid_ratio = None
             except (requests.RequestException, ValueError) as exc:
                 render_errors.append(f"{candidate.product_id or candidate.item_id}: {str(exc)[:120]}")
                 continue
-            valid_ratio = image_valid_ratio(image_bytes)
+            valid_ratio = detected_valid_ratio if detected_valid_ratio is not None else image_valid_ratio(image_bytes)
             if valid_ratio < min_valid_ratio:
                 render_errors.append(
                     f"{candidate.product_id or candidate.item_id}: 有效像素率 {valid_ratio:.1%} 低于 {min_valid_ratio:.0%}"
                 )
                 continue
-            processed = crop_sentinel_nodata_border(image_bytes, bbox)
+            if auto_crop:
+                processed = crop_sentinel_nodata_border(image_bytes, bbox)
+            else:
+                processed = {"image_bytes": image_bytes, "bbox": bbox, "plan": plan,
+                             "metadata": {"applied": False, "skipped": "profile_auto_crop_off"}}
             image_bytes = processed["image_bytes"]
             effective_bbox = processed["bbox"]
             effective_plan = processed["plan"]
@@ -696,11 +716,16 @@ def sentinel_retrieval_result(
     rendered_items = []
     for candidate in selected:
         try:
-            image_bytes = provider.render_candidate_jpeg(candidate, bbox, plan["total_w"], plan["total_h"])
+            _render_v = getattr(provider, "render_candidate_with_validity", None)
+            if _render_v is not None:
+                image_bytes, detected_valid_ratio = _render_v(candidate, bbox, plan["total_w"], plan["total_h"])
+            else:
+                image_bytes = provider.render_candidate_jpeg(candidate, bbox, plan["total_w"], plan["total_h"])
+                detected_valid_ratio = None
         except (requests.RequestException, ValueError) as exc:
             render_errors.append(f"{candidate.product_id or candidate.item_id}: {str(exc)[:120]}")
             continue
-        valid_ratio = image_valid_ratio(image_bytes)
+        valid_ratio = detected_valid_ratio if detected_valid_ratio is not None else image_valid_ratio(image_bytes)
         if valid_ratio <= 0:
             render_errors.append(f"{candidate.product_id or candidate.item_id}: 渲染结果无有效像素")
             continue
@@ -721,7 +746,11 @@ def sentinel_retrieval_result(
             f"Sentinel-2 多景拼接后有效像素率 {valid_ratio:.1%}，低于 {min_valid_ratio:.0%}；"
             "请缩小范围、扩大时间范围，或切换高清底图。"
         )
-    processed = crop_sentinel_nodata_border(mosaic_bytes, bbox)
+    if auto_crop:
+        processed = crop_sentinel_nodata_border(mosaic_bytes, bbox)
+    else:
+        processed = {"image_bytes": mosaic_bytes, "bbox": bbox, "plan": plan,
+                     "metadata": {"applied": False, "skipped": "profile_auto_crop_off"}}
     mosaic_bytes = processed["image_bytes"]
     effective_bbox = processed["bbox"]
     effective_plan = processed["plan"]

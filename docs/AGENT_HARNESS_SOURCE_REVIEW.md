@@ -1,5 +1,26 @@
 # SatelliteSense 专用 Agent Harness 源码对照
 
+> **状态：时点记录（V3 动手之前的设计研究）。** 本文对照 `xai-org/grok-build` 与 `sst/opencode`
+> 的 harness 设计，论证"SatelliteSense 当前是领域状态机、不是通用 harness"，并给出移植边界与
+> 第一阶段验收标准。正文里的"SatelliteSense 当前……"描述的是**当时的 V2 legacy 实现**
+> （`run_agent_loop` 固定阶段 + 只有 description/parameters 的 `REGISTRY`），**已不反映现状**。
+> 当前入口见 [CLAUDE.md](../CLAUDE.md)；V3 实施过程与验收见 [V3_IMPLEMENTATION.md](V3_IMPLEMENTATION.md)。
+>
+> **此后已落地的对应实现**（2026-09-14 核对代码位置，非本文原内容）：
+>
+> | 本文主张 | V3 对应实现 |
+> |---|---|
+> | Runner 不等于业务流程，业务能力经工具注册提供 | `map_api/v3/harness.py` 主循环 + `map_api/v3/tools.py` 的 `Tool`/`registry()`（工具分组 `imagery`/`context`/`analysis` 按需加载） |
+> | Tool 是带契约的 capability（输入校验、调用身份、输出边界） | `Tool(name, description, schema, handler, timeout, recovery, parallel)`，执行前 `jsonschema` 校验；`RunToolCall` 保存调用身份与结果 |
+> | Durable event 是事实来源，UI 是 projection | `ConversationEvent`（连续 `sequence` + SSE 游标重放）、`RunCheckpoint`、`RunEvent`；前端按事件渲染而非固定阶段 |
+> | 输入队列与执行协调独立 | `map_api/v3/conversations.py`：单一协调者、durable `steer`/FIFO 队列、幂等 `request_id` |
+> | 中断/失败/暂停/预算区分终态 | harness 区分 completed / cancelled / budget_exhausted / external_service_unavailable 等，且工具错误码可重试与不可重试分开（如 `ingest_interrupted` retryable） |
+>
+> 本文"第一阶段验收标准"6 条**未逐条重新评分**，标为待核验；其中"固定八阶段→不同工具路径"
+> 与"前端展示真实事件、无伪造阶段"两条在 V3 中已被实现取代。
+>
+> 正文（以下）原样保留。
+
 ## 研究对象
 
 - `xai-org/grok-build`：Apache-2.0。重点阅读 `xai-grok-shell`、`xai-grok-tools`、`xai-grok-workspace`、`xai-workflow`。

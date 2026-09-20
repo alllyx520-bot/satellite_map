@@ -4227,7 +4227,7 @@ class FaultMatrixTests(TestCase):
         with patch("map_api.utils.agent_tools.call_deepseek", return_value="这不是 JSON {"):
             with self.assertRaises(ValueError) as ctx:
                 call_deepseek_json([{"role": "user", "content": "解析槽位"}])
-        self.assertIn("GLM 未返回有效 JSON", str(ctx.exception))
+        self.assertIn("模型未返回有效 JSON", str(ctx.exception))
 
     def test_deepseek_retries_transient_server_error_once(self):
         from map_api.utils.agent_tools import call_deepseek
@@ -4262,7 +4262,7 @@ class FaultMatrixTests(TestCase):
         def fake_post(url, **kwargs):
             captured.update(kwargs)
             return response
-        with patch.dict(os.environ, {"GLM_API_KEY": "test-key", "AGENT_MODEL": "glm-5.3-flash"}, clear=False), \
+        with patch.dict(os.environ, {"AGENT_PROVIDER": "glm", "GLM_API_KEY": "test-key", "AGENT_MODEL": "glm-5.3-flash"}, clear=False), \
                 patch("map_api.utils.agent_tools.requests.post", side_effect=fake_post):
             result = call_glm_json([{"role": "user", "content": "检查影像"}], image_urls=["data:image/jpeg;base64,abc"])
         self.assertEqual(result["current_step"], "quality_check")
@@ -4282,7 +4282,7 @@ class FaultMatrixTests(TestCase):
                 "content": [{"type": "text", "text": '{"ok":true}'}, {"type": "thinking", "text": "hidden"}],
             }}]},
         )
-        with patch.dict(os.environ, {"GLM_API_KEY": "test-key"}, clear=False), \
+        with patch.dict(os.environ, {"AGENT_PROVIDER": "glm", "GLM_API_KEY": "test-key"}, clear=False), \
                 patch("map_api.utils.agent_tools.requests.post", return_value=response):
             result = call_deepseek([{"role": "user", "content": "test"}])
         self.assertEqual(result, '{"ok":true}')
@@ -4292,7 +4292,7 @@ class FaultMatrixTests(TestCase):
     def test_agent_step_rejects_empty_glm_decision(self):
         from map_api.agent.loop import agent_step
         with patch("map_api.utils.agent_tools.call_glm_json", return_value={}):
-            with self.assertRaisesRegex(ValueError, "GLM 返回空决策"):
+            with self.assertRaisesRegex(ValueError, "控制器返回空决策"):
                 agent_step([{"role": "user", "content": "继续"}], [], {"vision_trigger": ""})
 
     def test_complete_preserves_geocode_root_cause_when_scene_missing(self):

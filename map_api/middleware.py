@@ -14,6 +14,7 @@ import hmac
 import logging
 import math
 import os
+import re
 import threading
 import time
 from datetime import timedelta
@@ -46,6 +47,8 @@ def _is_expensive_request(request):
     Agent 状态 GET 会被前端周期性轮询，属于只读轻请求，不应消耗模型调用额度。
     """
     path = request.path
+    if path.startswith('/api/v3/'):
+        return request.method == 'POST' and bool(re.search(r'/(messages|actions)/?$', path))
     if any(path.startswith(prefix) for prefix in _AI_PATH_PREFIXES):
         return request.method in ("POST", "PUT", "PATCH")
     if path.startswith("/api/agent/sessions"):
@@ -60,6 +63,12 @@ def _truthy(value):
 def _limit_for(scope):
     if scope == "ai":
         raw = os.environ.get("RATELIMIT_AI_PER_MINUTE", "30")
+    elif scope == 'v3_raster':
+        raw = os.environ.get('RATELIMIT_RASTER_PER_MINUTE', '3000')
+    elif scope == 'v3_upload':
+        raw = os.environ.get('RATELIMIT_UPLOAD_PER_MINUTE', '1200')
+    elif scope == 'v3_read':
+        raw = os.environ.get('RATELIMIT_V3_READ_PER_MINUTE', '360')
     else:
         raw = os.environ.get("RATELIMIT_API_PER_MINUTE", "120")
     try:
@@ -185,6 +194,13 @@ class RateLimitMiddleware:
             return self.get_response(request)
 
         scope = "ai" if _is_expensive_request(request) else "api"
+        if path.startswith('/api/v3/') and scope != 'ai':
+            if request.method == 'GET' and ('/tiles/' in path or path.endswith('/preview')):
+                scope = 'v3_raster'
+            elif request.method == 'PUT' and '/chunks/' in path:
+                scope = 'v3_upload'
+            elif request.method == 'GET':
+                scope = 'v3_read'
         limit = _limit_for(scope)
         if limit <= 0:
             return self.get_response(request)
@@ -192,7 +208,8 @@ class RateLimitMiddleware:
         allowed, retry_after = consume_rate_limit(scope, _client_ip(request), limit)
         if not allowed:
             response = JsonResponse(
-                {"ok": False, "code": 429, "msg": "请求过于频繁,请稍后再试"},
+                {"ok": False, "code": 429, "msg": "请求过于频繁,请稍后再试",
+                 "error": {"code": "rate_limited", "message": "请求过于频繁，稍后自动重试"}},
                 status=429,
             )
             response["Retry-After"] = str(retry_after)

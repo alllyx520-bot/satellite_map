@@ -1,0 +1,20 @@
+[Unit]
+Description=SatelliteSense V3 Conversation Worker
+After=network.target satellitesense.service
+Wants=satellitesense.service
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/satellitesense
+EnvironmentFile=/opt/satellitesense/.env
+# 消费 /api/v3/ 创建的 AgentRun（execution_engine="harness"）：处理附件瓦片并执行会话运行。
+# 默认 2 个会话并发 + 2 个附件并发；资源紧张时加 --conversations 1 降并发。
+ExecStart=/opt/satellitesense/.venv/bin/python manage.py run_v3_worker
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
